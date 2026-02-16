@@ -30,6 +30,14 @@ enum Command {
         /// Path to the .weir source file
         file: PathBuf,
     },
+    /// Compile a .weir file to a standalone native binary
+    Build {
+        /// Path to the .weir source file
+        file: PathBuf,
+        /// Output binary path (defaults to source file stem)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
 }
 
 fn main() {
@@ -149,6 +157,57 @@ fn main() {
                 Ok(output) => print!("{}", output),
                 Err(e) => {
                     eprintln!("{}: codegen error: {}", file.display(), e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Command::Build { file, output } => {
+            let source = match std::fs::read_to_string(&file) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: could not read {}: {}", file.display(), e);
+                    std::process::exit(1);
+                }
+            };
+
+            let (module, parse_errors) = weir_parser::parse(&source);
+
+            if !parse_errors.is_empty() {
+                for error in &parse_errors {
+                    eprintln!(
+                        "{}:{}:{}: parse error: {}",
+                        file.display(),
+                        error.span.start,
+                        error.span.end,
+                        error.message
+                    );
+                }
+                std::process::exit(1);
+            }
+
+            let type_info = weir_typeck::check(&module);
+
+            if !type_info.errors.is_empty() {
+                for error in &type_info.errors {
+                    eprintln!(
+                        "{}:{}:{}: type error: {}",
+                        file.display(),
+                        error.span.start,
+                        error.span.end,
+                        error.message
+                    );
+                }
+                std::process::exit(1);
+            }
+
+            let output_path = output.unwrap_or_else(|| {
+                PathBuf::from(file.file_stem().unwrap_or_default())
+            });
+
+            match weir_codegen::build_executable(&module, &type_info, &output_path) {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("{}: build error: {}", file.display(), e);
                     std::process::exit(1);
                 }
             }

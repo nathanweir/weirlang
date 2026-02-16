@@ -29,6 +29,7 @@ When processing a new transcript, ingest it into the existing design documents i
 ## Development Environment
 
 - **Dependencies**: Managed via `flake.nix` with `direnv` — entering the project directory automatically activates the Nix environment
+- **Shell commands**: Use `nix develop --command <cmd>` to run commands (e.g. `nix develop --command cargo test --workspace`). Do NOT use `direnv export bash` — it does not work in this context.
 - **Task runner**: Uses `just` (Justfile) for dev commands — run `just` to list available recipes
 
 ## Repository Structure

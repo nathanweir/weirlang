@@ -7,9 +7,11 @@ use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
+use cranelift_object::{ObjectBuilder, ObjectModule};
 use smol_str::SmolStr;
 use std::collections::HashMap;
 use std::fmt;
+use std::path::Path;
 use weir_ast::*;
 use weir_typeck::{Ty, TypeCheckResult};
 
@@ -36,9 +38,9 @@ impl fmt::Display for CodegenError {
 
 impl std::error::Error for CodegenError {}
 
-// ── Runtime print helpers ────────────────────────────────────────
+// ── Runtime print helpers (JIT in-process) ───────────────────────
 //
-// These are extern "C" functions that compiled code calls to print.
+// These are extern "C" functions that JIT-compiled code calls to print.
 // They write to a thread-local String buffer for testability.
 
 std::thread_local! {
@@ -89,6 +91,26 @@ extern "C" fn weir_print_newline() {
     OUTPUT_BUF.with(|buf| buf.borrow_mut().push('\n'));
 }
 
+// ── C runtime for AOT binaries ──────────────────────────────────
+
+const AOT_RUNTIME_C: &str = r#"
+#include <stdio.h>
+#include <stdint.h>
+
+extern void weir_main(void);
+
+void weir_print_i64(int64_t val) { printf("%lld", (long long)val); }
+void weir_print_f64(double val) {
+    if (val == (double)(long long)val) printf("%.1f", val);
+    else printf("%g", val);
+}
+void weir_print_bool(int8_t val) { printf("%s", val ? "true" : "false"); }
+void weir_print_unit(void) { printf("()"); }
+void weir_print_newline(void) { printf("\n"); }
+
+int main(void) { weir_main(); return 0; }
+"#;
+
 // ── Type mapping ─────────────────────────────────────────────────
 
 fn ty_to_cl(ty: &Ty) -> Option<Type> {
@@ -112,119 +134,190 @@ fn is_signed(ty: &Ty) -> bool {
     matches!(ty, Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64)
 }
 
-// ── Compiler ─────────────────────────────────────────────────────
+// ── ISA construction (shared between JIT and AOT) ───────────────
+
+fn make_isa(pic: bool) -> Result<std::sync::Arc<dyn cranelift_codegen::isa::TargetIsa>, CodegenError> {
+    let mut flag_builder = settings::builder();
+    flag_builder
+        .set("opt_level", "speed")
+        .map_err(|e| CodegenError::new(format!("setting opt_level: {}", e)))?;
+    if pic {
+        flag_builder
+            .set("is_pic", "true")
+            .map_err(|e| CodegenError::new(format!("setting is_pic: {}", e)))?;
+    }
+
+    let isa_builder = cranelift_native::builder()
+        .map_err(|e| CodegenError::new(format!("native ISA: {}", e)))?;
+
+    isa_builder
+        .finish(settings::Flags::new(flag_builder))
+        .map_err(|e| CodegenError::new(format!("ISA finish: {}", e)))
+}
+
+// ── Compiler (generic over Module) ──────────────────────────────
 
 pub fn compile_and_run(
     module: &weir_ast::Module,
     type_info: &TypeCheckResult,
 ) -> Result<String, CodegenError> {
-    let mut compiler = Compiler::new(module, type_info)?;
-    compiler.compile()?;
+    let isa = make_isa(false)?;
+
+    let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+
+    // Register runtime print helpers as in-process function pointers
+    builder.symbol("weir_print_i64", weir_print_i64 as *const u8);
+    builder.symbol("weir_print_f64", weir_print_f64 as *const u8);
+    builder.symbol("weir_print_bool", weir_print_bool as *const u8);
+    builder.symbol("weir_print_unit", weir_print_unit as *const u8);
+    builder.symbol("weir_print_newline", weir_print_newline as *const u8);
+
+    let jit_module = JITModule::new(builder);
+
+    let mut compiler = Compiler::new(module, type_info, jit_module);
+    compiler.declare_runtime_helpers()?;
+    compiler.declare_user_functions(Linkage::Local)?;
+    compiler.compile_user_functions()?;
+    compiler.module.finalize_definitions()
+        .map_err(|e| CodegenError::new(format!("finalize: {}", e)))?;
     compiler.run_main()
 }
 
-struct Compiler<'a> {
+pub fn compile_to_object(
+    module: &weir_ast::Module,
+    type_info: &TypeCheckResult,
+) -> Result<Vec<u8>, CodegenError> {
+    let isa = make_isa(true)?;
+
+    let obj_builder = ObjectBuilder::new(
+        isa,
+        "weir_output",
+        cranelift_module::default_libcall_names(),
+    )
+    .map_err(|e| CodegenError::new(format!("ObjectBuilder: {}", e)))?;
+
+    let obj_module = ObjectModule::new(obj_builder);
+
+    let mut compiler = Compiler::new(module, type_info, obj_module);
+    compiler.declare_runtime_helpers()?;
+    // Export main as weir_main so C runtime can call it; others are local
+    compiler.declare_user_functions_aot()?;
+    compiler.compile_user_functions()?;
+
+    let product = compiler.module.finish();
+    product.emit().map_err(|e| CodegenError::new(format!("emit object: {}", e)))
+}
+
+pub fn build_executable(
+    module: &weir_ast::Module,
+    type_info: &TypeCheckResult,
+    output_path: &Path,
+) -> Result<(), CodegenError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let obj_bytes = compile_to_object(module, type_info)?;
+
+    let unique = format!("{}_{}", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed));
+    let tmp_dir = std::env::temp_dir();
+    let obj_path = tmp_dir.join(format!("weir_output_{}.o", unique));
+    let runtime_path = tmp_dir.join(format!("weir_runtime_{}.c", unique));
+
+    std::fs::write(&obj_path, &obj_bytes)
+        .map_err(|e| CodegenError::new(format!("write object file: {}", e)))?;
+    std::fs::write(&runtime_path, AOT_RUNTIME_C)
+        .map_err(|e| CodegenError::new(format!("write runtime: {}", e)))?;
+
+    let status = std::process::Command::new("cc")
+        .arg("-o")
+        .arg(output_path)
+        .arg(&obj_path)
+        .arg(&runtime_path)
+        .status()
+        .map_err(|e| CodegenError::new(format!("run cc: {}", e)))?;
+
+    // Clean up temp files (best-effort)
+    let _ = std::fs::remove_file(&obj_path);
+    let _ = std::fs::remove_file(&runtime_path);
+
+    if !status.success() {
+        return Err(CodegenError::new(format!(
+            "linker failed with exit code: {}",
+            status.code().unwrap_or(-1)
+        )));
+    }
+
+    Ok(())
+}
+
+struct Compiler<'a, M: Module> {
     ast_module: &'a weir_ast::Module,
     type_info: &'a TypeCheckResult,
-    jit_module: JITModule,
+    module: M,
 
-    /// Maps user function name → (FuncId, param types, return type)
+    /// Maps user function name -> (FuncId, param types, return type)
     user_fns: HashMap<SmolStr, (FuncId, Vec<Ty>, Ty)>,
-    /// Maps runtime helper name → FuncId
+    /// Maps runtime helper name -> FuncId
     runtime_fns: HashMap<&'static str, FuncId>,
 }
 
-impl<'a> Compiler<'a> {
+impl<'a, M: Module> Compiler<'a, M> {
     fn new(
         ast_module: &'a weir_ast::Module,
         type_info: &'a TypeCheckResult,
-    ) -> Result<Self, CodegenError> {
-        let mut flag_builder = settings::builder();
-        flag_builder
-            .set("opt_level", "speed")
-            .map_err(|e| CodegenError::new(format!("setting opt_level: {}", e)))?;
-
-        let isa_builder = cranelift_native::builder()
-            .map_err(|e| CodegenError::new(format!("native ISA: {}", e)))?;
-
-        let isa = isa_builder
-            .finish(settings::Flags::new(flag_builder))
-            .map_err(|e| CodegenError::new(format!("ISA finish: {}", e)))?;
-
-        let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-
-        // Register runtime print helpers
-        builder.symbol("weir_print_i64", weir_print_i64 as *const u8);
-        builder.symbol("weir_print_f64", weir_print_f64 as *const u8);
-        builder.symbol("weir_print_bool", weir_print_bool as *const u8);
-        builder.symbol("weir_print_unit", weir_print_unit as *const u8);
-        builder.symbol("weir_print_newline", weir_print_newline as *const u8);
-
-        let jit_module = JITModule::new(builder);
-
-        Ok(Self {
+        module: M,
+    ) -> Self {
+        Self {
             ast_module,
             type_info,
-            jit_module,
+            module,
             user_fns: HashMap::new(),
             runtime_fns: HashMap::new(),
-        })
-    }
-
-    fn compile(&mut self) -> Result<(), CodegenError> {
-        self.declare_runtime_helpers()?;
-        self.declare_user_functions()?;
-        self.compile_user_functions()?;
-        self.jit_module.finalize_definitions()
-            .map_err(|e| CodegenError::new(format!("finalize: {}", e)))?;
-        Ok(())
+        }
     }
 
     // ── Runtime helper declarations ─────────────────────────────
 
     fn declare_runtime_helpers(&mut self) -> Result<(), CodegenError> {
-        let ptr_ty = self.jit_module.target_config().pointer_type();
-        let _ = ptr_ty;
-
         // weir_print_i64(i64) -> void
-        let mut sig = self.jit_module.make_signature();
+        let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(types::I64));
         sig.call_conv = CallConv::SystemV;
-        let id = self.jit_module
+        let id = self.module
             .declare_function("weir_print_i64", Linkage::Import, &sig)
             .map_err(|e| CodegenError::new(format!("declare weir_print_i64: {}", e)))?;
         self.runtime_fns.insert("print_i64", id);
 
         // weir_print_f64(f64) -> void
-        let mut sig = self.jit_module.make_signature();
+        let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(types::F64));
         sig.call_conv = CallConv::SystemV;
-        let id = self.jit_module
+        let id = self.module
             .declare_function("weir_print_f64", Linkage::Import, &sig)
             .map_err(|e| CodegenError::new(format!("declare weir_print_f64: {}", e)))?;
         self.runtime_fns.insert("print_f64", id);
 
         // weir_print_bool(i8) -> void
-        let mut sig = self.jit_module.make_signature();
+        let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(types::I8));
         sig.call_conv = CallConv::SystemV;
-        let id = self.jit_module
+        let id = self.module
             .declare_function("weir_print_bool", Linkage::Import, &sig)
             .map_err(|e| CodegenError::new(format!("declare weir_print_bool: {}", e)))?;
         self.runtime_fns.insert("print_bool", id);
 
         // weir_print_unit() -> void
-        let mut sig = self.jit_module.make_signature();
+        let mut sig = self.module.make_signature();
         sig.call_conv = CallConv::SystemV;
-        let id = self.jit_module
+        let id = self.module
             .declare_function("weir_print_unit", Linkage::Import, &sig)
             .map_err(|e| CodegenError::new(format!("declare weir_print_unit: {}", e)))?;
         self.runtime_fns.insert("print_unit", id);
 
         // weir_print_newline() -> void
-        let mut sig = self.jit_module.make_signature();
+        let mut sig = self.module.make_signature();
         sig.call_conv = CallConv::SystemV;
-        let id = self.jit_module
+        let id = self.module
             .declare_function("weir_print_newline", Linkage::Import, &sig)
             .map_err(|e| CodegenError::new(format!("declare weir_print_newline: {}", e)))?;
         self.runtime_fns.insert("print_newline", id);
@@ -234,12 +327,12 @@ impl<'a> Compiler<'a> {
 
     // ── Pass 1: declare all user function signatures ────────────
 
-    fn declare_user_functions(&mut self) -> Result<(), CodegenError> {
+    fn declare_user_functions(&mut self, linkage: Linkage) -> Result<(), CodegenError> {
         for (item, _span) in &self.ast_module.items {
             if let Item::Defn(defn) = item {
                 let (param_tys, ret_ty) = self.resolve_fn_signature(defn)?;
 
-                let mut sig = self.jit_module.make_signature();
+                let mut sig = self.module.make_signature();
                 sig.call_conv = CallConv::SystemV;
                 for pty in &param_tys {
                     if let Some(cl_ty) = ty_to_cl(pty) {
@@ -250,8 +343,42 @@ impl<'a> Compiler<'a> {
                     sig.returns.push(AbiParam::new(cl_ty));
                 }
 
-                let func_id = self.jit_module
-                    .declare_function(&defn.name, Linkage::Local, &sig)
+                let func_id = self.module
+                    .declare_function(&defn.name, linkage, &sig)
+                    .map_err(|e| CodegenError::new(format!("declare fn '{}': {}", defn.name, e)))?;
+
+                self.user_fns
+                    .insert(defn.name.clone(), (func_id, param_tys, ret_ty));
+            }
+        }
+        Ok(())
+    }
+
+    /// AOT variant: export `main` as `weir_main`, keep everything else local.
+    fn declare_user_functions_aot(&mut self) -> Result<(), CodegenError> {
+        for (item, _span) in &self.ast_module.items {
+            if let Item::Defn(defn) = item {
+                let (param_tys, ret_ty) = self.resolve_fn_signature(defn)?;
+
+                let mut sig = self.module.make_signature();
+                sig.call_conv = CallConv::SystemV;
+                for pty in &param_tys {
+                    if let Some(cl_ty) = ty_to_cl(pty) {
+                        sig.params.push(AbiParam::new(cl_ty));
+                    }
+                }
+                if let Some(cl_ty) = ty_to_cl(&ret_ty) {
+                    sig.returns.push(AbiParam::new(cl_ty));
+                }
+
+                let (export_name, linkage) = if defn.name == "main" {
+                    ("weir_main", Linkage::Export)
+                } else {
+                    (defn.name.as_str(), Linkage::Local)
+                };
+
+                let func_id = self.module
+                    .declare_function(export_name, linkage, &sig)
                     .map_err(|e| CodegenError::new(format!("declare fn '{}': {}", defn.name, e)))?;
 
                 self.user_fns
@@ -266,11 +393,6 @@ impl<'a> Compiler<'a> {
         let mut param_tys = Vec::new();
         for param in &defn.params {
             if let Some(type_ann_id) = param.type_ann {
-                // Look through the body expressions to find a typed usage,
-                // but we can resolve from the type_info expr_types map.
-                // The simplest approach: if the function has type annotations,
-                // resolve from the AST directly. For the codegen subset,
-                // all functions must have explicit type annotations.
                 let ty = self.resolve_type_expr_to_ty(type_ann_id)?;
                 param_tys.push(ty);
             } else {
@@ -283,19 +405,15 @@ impl<'a> Compiler<'a> {
 
         let ret_ty = if let Some(ret_id) = defn.return_type {
             self.resolve_type_expr_to_ty(ret_id)?
-        } else {
-            // Default to Unit if no return type annotation
-            // (but check the body type from type_info if available)
-            if !defn.body.is_empty() {
-                let last_expr_id = defn.body[defn.body.len() - 1];
-                if let Some(ty) = self.type_info.expr_types.get(last_expr_id) {
-                    ty.clone()
-                } else {
-                    Ty::Unit
-                }
+        } else if !defn.body.is_empty() {
+            let last_expr_id = defn.body[defn.body.len() - 1];
+            if let Some(ty) = self.type_info.expr_types.get(last_expr_id) {
+                ty.clone()
             } else {
                 Ty::Unit
             }
+        } else {
+            Ty::Unit
         };
 
         Ok((param_tys, ret_ty))
@@ -357,7 +475,7 @@ impl<'a> Compiler<'a> {
             .ok_or_else(|| CodegenError::new(format!("unknown function '{}'", defn.name)))?
             .clone();
 
-        let mut sig = self.jit_module.make_signature();
+        let mut sig = self.module.make_signature();
         sig.call_conv = CallConv::SystemV;
         for pty in &param_tys {
             if let Some(cl_ty) = ty_to_cl(pty) {
@@ -388,7 +506,7 @@ impl<'a> Compiler<'a> {
                 type_info: self.type_info,
                 user_fns: &self.user_fns,
                 runtime_fns: &self.runtime_fns,
-                jit_module: &mut self.jit_module,
+                module: &mut self.module,
                 vars: HashMap::new(),
             };
 
@@ -428,20 +546,24 @@ impl<'a> Compiler<'a> {
         builder.finalize();
 
         let mut ctx = Context::for_function(func);
-        self.jit_module
+        self.module
             .define_function(func_id, &mut ctx)
             .map_err(|e| CodegenError::new(format!("define fn '{}': {}", defn.name, e)))?;
 
         Ok(())
     }
+}
 
+// ── JIT-specific methods ────────────────────────────────────────
+
+impl Compiler<'_, JITModule> {
     fn run_main(&self) -> Result<String, CodegenError> {
         let (func_id, _, _) = self
             .user_fns
             .get("main")
             .ok_or_else(|| CodegenError::new("no 'main' function defined"))?;
 
-        let code_ptr = self.jit_module.get_finalized_function(*func_id);
+        let code_ptr = self.module.get_finalized_function(*func_id);
 
         output_reset();
 
@@ -456,17 +578,17 @@ impl<'a> Compiler<'a> {
 
 // ── Per-function compilation context ─────────────────────────────
 
-struct FnCompileCtx<'a, 'b> {
+struct FnCompileCtx<'a, 'b, M: Module> {
     builder: &'a mut FunctionBuilder<'b>,
     ast_module: &'a weir_ast::Module,
     type_info: &'a TypeCheckResult,
     user_fns: &'a HashMap<SmolStr, (FuncId, Vec<Ty>, Ty)>,
     runtime_fns: &'a HashMap<&'static str, FuncId>,
-    jit_module: &'a mut JITModule,
+    module: &'a mut M,
     vars: HashMap<SmolStr, (Variable, Ty)>,
 }
 
-impl<'a, 'b> FnCompileCtx<'a, 'b> {
+impl<M: Module> FnCompileCtx<'_, '_, M> {
     fn declare_variable(&mut self, cl_ty: Type) -> Variable {
         self.builder.declare_var(cl_ty)
     }
@@ -665,7 +787,7 @@ impl<'a, 'b> FnCompileCtx<'a, 'b> {
             // User function call
             if let Some((callee_id, param_tys, ret_ty)) = self.user_fns.get(name).cloned() {
                 let func_ref = self
-                    .jit_module
+                    .module
                     .declare_func_in_func(callee_id, self.builder.func);
 
                 let mut arg_vals = Vec::new();
@@ -761,9 +883,6 @@ impl<'a, 'b> FnCompileCtx<'a, 'b> {
                 "/" if is_signed(result_ty) => self.builder.ins().sdiv(acc, val),
                 "/" => self.builder.ins().udiv(acc, val),
                 "mod" if float => {
-                    // f % g = f - trunc(f/g)*g — but for simplicity, use libc fmod
-                    // Actually Cranelift doesn't have frem, so approximate:
-                    // a - trunc(a/b)*b
                     let div = self.builder.ins().fdiv(acc, val);
                     let trunc = self.builder.ins().trunc(div);
                     let prod = self.builder.ins().fmul(trunc, val);
@@ -881,7 +1000,7 @@ impl<'a, 'b> FnCompileCtx<'a, 'b> {
         // Print newline
         let newline_id = self.runtime_fns["print_newline"];
         let newline_ref = self
-            .jit_module
+            .module
             .declare_func_in_func(newline_id, self.builder.func);
         self.builder.ins().call(newline_ref, &[]);
 
@@ -910,7 +1029,7 @@ impl<'a, 'b> FnCompileCtx<'a, 'b> {
         };
 
         let func_id = self.runtime_fns[helper_name];
-        let func_ref = self.jit_module.declare_func_in_func(func_id, self.builder.func);
+        let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
 
         match &arg_ty {
             Ty::Unit => {
@@ -1479,23 +1598,23 @@ mod tests {
 
     // ── Fixture-based tests ─────────────────────────────────────
 
-    fn run_fixture_compiled(name: &str) -> String {
-        let path = format!(
+    fn fixture_path(name: &str) -> String {
+        format!(
             "{}/tests/fixtures/{}.weir",
             env!("CARGO_MANIFEST_DIR").replace("/crates/weir-codegen", ""),
             name
-        );
+        )
+    }
+
+    fn run_fixture_compiled(name: &str) -> String {
+        let path = fixture_path(name);
         let source = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("could not read fixture {}: {}", path, e));
         compile_run(&source)
     }
 
     fn run_fixture_interpreted(name: &str) -> String {
-        let path = format!(
-            "{}/tests/fixtures/{}.weir",
-            env!("CARGO_MANIFEST_DIR").replace("/crates/weir-codegen", ""),
-            name
-        );
+        let path = fixture_path(name);
         let source = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("could not read fixture {}: {}", path, e));
         interp_run(&source)
@@ -1527,5 +1646,124 @@ mod tests {
         let compiled = run_fixture_compiled("codegen-let-mutation");
         let interpreted = run_fixture_interpreted("codegen-let-mutation");
         assert_eq!(compiled, interpreted, "codegen-let-mutation: compiler and interpreter disagree");
+    }
+
+    // ── AOT compilation tests ───────────────────────────────────
+
+    #[test]
+    fn test_aot_compile_to_object() {
+        let source = "(defn main () : Unit (println 42))";
+        let (module, parse_errors) = weir_parser::parse(source);
+        assert!(parse_errors.is_empty());
+        let type_info = weir_typeck::check(&module);
+        assert!(type_info.errors.is_empty());
+        let obj_bytes = compile_to_object(&module, &type_info).expect("compile_to_object failed");
+        assert!(!obj_bytes.is_empty(), "object bytes should be non-empty");
+    }
+
+    #[test]
+    fn test_aot_build_and_run() {
+        let source = "(defn main () : Unit
+           (println (+ 1 2))
+           (println (* 3 4)))";
+        let (module, parse_errors) = weir_parser::parse(source);
+        assert!(parse_errors.is_empty());
+        let type_info = weir_typeck::check(&module);
+        assert!(type_info.errors.is_empty());
+
+        let tmp_dir = std::env::temp_dir();
+        let binary_path = tmp_dir.join("weir_test_aot");
+        build_executable(&module, &type_info, &binary_path).expect("build_executable failed");
+
+        let output = std::process::Command::new(&binary_path)
+            .output()
+            .expect("failed to run AOT binary");
+        let _ = std::fs::remove_file(&binary_path);
+
+        assert!(output.status.success(), "AOT binary exited with error");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(stdout, "3\n12\n");
+    }
+
+    #[test]
+    fn test_aot_oracle_factorial() {
+        let source = "(defn factorial ((n : i32)) : i32
+               (if (<= n 1) 1 (* n (factorial (- n 1)))))
+             (defn main () : Unit
+               (println (factorial 1))
+               (println (factorial 5))
+               (println (factorial 10)))";
+        let (module, parse_errors) = weir_parser::parse(source);
+        assert!(parse_errors.is_empty());
+        let type_info = weir_typeck::check(&module);
+        assert!(type_info.errors.is_empty());
+
+        let jit_output = compile_and_run(&module, &type_info).expect("JIT failed");
+        let interp_output = weir_interp::interpret(&module).expect("interp failed");
+
+        let tmp_dir = std::env::temp_dir();
+        let binary_path = tmp_dir.join("weir_test_aot_factorial");
+        build_executable(&module, &type_info, &binary_path).expect("build_executable failed");
+        let output = std::process::Command::new(&binary_path)
+            .output()
+            .expect("failed to run AOT binary");
+        let _ = std::fs::remove_file(&binary_path);
+
+        let aot_output = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(jit_output, interp_output, "JIT and interpreter disagree");
+        assert_eq!(jit_output, aot_output, "JIT and AOT disagree");
+    }
+
+    /// Oracle test across all three backends for each codegen fixture.
+    fn fixture_oracle_all(name: &str) {
+        let path = fixture_path(name);
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("could not read fixture {}: {}", path, e));
+
+        let (module, parse_errors) = weir_parser::parse(&source);
+        assert!(parse_errors.is_empty());
+        let type_info = weir_typeck::check(&module);
+        assert!(type_info.errors.is_empty());
+
+        let jit_output = compile_and_run(&module, &type_info).expect("JIT failed");
+        let interp_output = weir_interp::interpret(&module).expect("interp failed");
+
+        let tmp_dir = std::env::temp_dir();
+        let binary_path = tmp_dir.join(format!("weir_test_aot_{}", name));
+        build_executable(&module, &type_info, &binary_path).expect("build_executable failed");
+        let output = std::process::Command::new(&binary_path)
+            .output()
+            .expect("failed to run AOT binary");
+        let _ = std::fs::remove_file(&binary_path);
+
+        let aot_output = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(
+            jit_output, interp_output,
+            "{}: JIT and interpreter disagree", name
+        );
+        assert_eq!(
+            jit_output, aot_output,
+            "{}: JIT and AOT disagree\nJIT: {:?}\nAOT: {:?}", name, jit_output, aot_output
+        );
+    }
+
+    #[test]
+    fn fixture_aot_arithmetic() {
+        fixture_oracle_all("codegen-arithmetic");
+    }
+
+    #[test]
+    fn fixture_aot_control_flow() {
+        fixture_oracle_all("codegen-control-flow");
+    }
+
+    #[test]
+    fn fixture_aot_functions() {
+        fixture_oracle_all("codegen-functions");
+    }
+
+    #[test]
+    fn fixture_aot_let_mutation() {
+        fixture_oracle_all("codegen-let-mutation");
     }
 }
