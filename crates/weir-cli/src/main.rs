@@ -38,6 +38,11 @@ enum Command {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    /// Run a .weir file with live reload — watches for changes and hot-swaps functions
+    Dev {
+        /// Path to the .weir source file
+        file: PathBuf,
+    },
 }
 
 fn main() {
@@ -210,6 +215,30 @@ fn main() {
                     eprintln!("{}: build error: {}", file.display(), e);
                     std::process::exit(1);
                 }
+            }
+        }
+        Command::Dev { file } => {
+            let source = match std::fs::read_to_string(&file) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: could not read {}: {}", file.display(), e);
+                    std::process::exit(1);
+                }
+            };
+
+            let canonical = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
+
+            let session = match weir_codegen::DevSession::new(&source) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("{}: {}", file.display(), e);
+                    std::process::exit(1);
+                }
+            };
+
+            if let Err(e) = session.run_dev_loop(&canonical) {
+                eprintln!("{}: dev error: {}", file.display(), e);
+                std::process::exit(1);
             }
         }
         Command::Interp { file } => {

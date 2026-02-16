@@ -1,0 +1,8 @@
+(defn greet (-> Unit)
+  (println "hello from greet"))
+
+(defn main (-> Unit)
+  (do
+    (greet)
+    (sleep 1000)
+    (main)))

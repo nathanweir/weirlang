@@ -41,6 +41,7 @@ cranelift-module = "0.128"
 cranelift-native = "0.128"
 cranelift-object = "0.128"
 target-lexicon = "0.13"
+notify = "7"
 
 # Internal crates
 weir-lexer = { path = "crates/weir-lexer" }

@@ -6,12 +6,14 @@ use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{FuncId, Linkage, Module};
+use cranelift_codegen::ir::MemFlags;
+use cranelift_module::{DataId, FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use smol_str::SmolStr;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
+use std::sync::atomic::{AtomicPtr, Ordering};
 use weir_ast::*;
 use weir_typeck::{Ty, TypeCheckResult};
 
@@ -89,6 +91,10 @@ extern "C" fn weir_print_unit() {
 
 extern "C" fn weir_print_newline() {
     OUTPUT_BUF.with(|buf| buf.borrow_mut().push('\n'));
+}
+
+extern "C" fn weir_sleep_ms(ms: i64) {
+    std::thread::sleep(std::time::Duration::from_millis(ms as u64));
 }
 
 // ── C runtime for AOT binaries ──────────────────────────────────
@@ -171,6 +177,7 @@ pub fn compile_and_run(
     builder.symbol("weir_print_bool", weir_print_bool as *const u8);
     builder.symbol("weir_print_unit", weir_print_unit as *const u8);
     builder.symbol("weir_print_newline", weir_print_newline as *const u8);
+    builder.symbol("weir_sleep_ms", weir_sleep_ms as *const u8);
 
     let jit_module = JITModule::new(builder);
 
@@ -322,6 +329,15 @@ impl<'a, M: Module> Compiler<'a, M> {
             .map_err(|e| CodegenError::new(format!("declare weir_print_newline: {}", e)))?;
         self.runtime_fns.insert("print_newline", id);
 
+        // weir_sleep_ms(i64) -> void
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.call_conv = CallConv::SystemV;
+        let id = self.module
+            .declare_function("weir_sleep_ms", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::new(format!("declare weir_sleep_ms: {}", e)))?;
+        self.runtime_fns.insert("sleep_ms", id);
+
         Ok(())
     }
 
@@ -449,6 +465,14 @@ impl<'a, M: Module> Compiler<'a, M> {
     // ── Pass 2: compile each function body ──────────────────────
 
     fn compile_user_functions(&mut self) -> Result<(), CodegenError> {
+        self.compile_user_functions_with(None, None)
+    }
+
+    fn compile_user_functions_with(
+        &mut self,
+        fn_table_slots: Option<&HashMap<SmolStr, usize>>,
+        table_data_id: Option<DataId>,
+    ) -> Result<(), CodegenError> {
         let defns: Vec<Defn> = self
             .ast_module
             .items
@@ -463,12 +487,17 @@ impl<'a, M: Module> Compiler<'a, M> {
             .collect();
 
         for defn in &defns {
-            self.compile_function(defn)?;
+            self.compile_function_with(defn, fn_table_slots, table_data_id)?;
         }
         Ok(())
     }
 
-    fn compile_function(&mut self, defn: &Defn) -> Result<(), CodegenError> {
+    fn compile_function_with(
+        &mut self,
+        defn: &Defn,
+        fn_table_slots: Option<&HashMap<SmolStr, usize>>,
+        table_data_id: Option<DataId>,
+    ) -> Result<(), CodegenError> {
         let (func_id, param_tys, ret_ty) = self
             .user_fns
             .get(&defn.name)
@@ -508,6 +537,8 @@ impl<'a, M: Module> Compiler<'a, M> {
                 runtime_fns: &self.runtime_fns,
                 module: &mut self.module,
                 vars: HashMap::new(),
+                fn_table_slots,
+                table_data_id,
             };
 
             // Bind parameters to variables
@@ -586,6 +617,10 @@ struct FnCompileCtx<'a, 'b, M: Module> {
     runtime_fns: &'a HashMap<&'static str, FuncId>,
     module: &'a mut M,
     vars: HashMap<SmolStr, (Variable, Ty)>,
+    /// If Some, use indirect dispatch via function table. Maps fn name → slot index.
+    fn_table_slots: Option<&'a HashMap<SmolStr, usize>>,
+    /// Data ID for the function table base pointer (used with indirect dispatch).
+    table_data_id: Option<DataId>,
 }
 
 impl<M: Module> FnCompileCtx<'_, '_, M> {
@@ -781,15 +816,14 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                 "print" => {
                     return self.compile_print(args);
                 }
+                "sleep" => {
+                    return self.compile_sleep(args);
+                }
                 _ => {}
             }
 
             // User function call
             if let Some((callee_id, param_tys, ret_ty)) = self.user_fns.get(name).cloned() {
-                let func_ref = self
-                    .module
-                    .declare_func_in_func(callee_id, self.builder.func);
-
                 let mut arg_vals = Vec::new();
                 for (i, arg) in args.iter().enumerate() {
                     let pty = if i < param_tys.len() {
@@ -805,6 +839,43 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                     }
                 }
 
+                // Check if we should use indirect dispatch (dev mode)
+                if let (Some(slots), Some(data_id)) = (self.fn_table_slots, self.table_data_id) {
+                    if let Some(&slot_index) = slots.get(name) {
+                        // Build the callee signature
+                        let mut sig = cranelift_codegen::ir::Signature::new(CallConv::SystemV);
+                        for pty in &param_tys {
+                            if let Some(cl_ty) = ty_to_cl(pty) {
+                                sig.params.push(AbiParam::new(cl_ty));
+                            }
+                        }
+                        if let Some(cl_ty) = ty_to_cl(&ret_ty) {
+                            sig.returns.push(AbiParam::new(cl_ty));
+                        }
+
+                        // Load function pointer from table
+                        let table_gv = self.module.declare_data_in_func(data_id, self.builder.func);
+                        let table_base = self.builder.ins().global_value(types::I64, table_gv);
+                        let offset = self.builder.ins().iconst(types::I64, (slot_index * 8) as i64);
+                        let slot_addr = self.builder.ins().iadd(table_base, offset);
+                        let fn_ptr = self.builder.ins().load(types::I64, MemFlags::trusted(), slot_addr, 0);
+
+                        let sig_ref = self.builder.import_signature(sig);
+                        let call_inst = self.builder.ins().call_indirect(sig_ref, fn_ptr, &arg_vals);
+
+                        if ty_to_cl(&ret_ty).is_some() {
+                            let results = self.builder.inst_results(call_inst);
+                            return Ok(Some(results[0]));
+                        } else {
+                            return Ok(None);
+                        }
+                    }
+                }
+
+                // Direct call (normal JIT/AOT path)
+                let func_ref = self
+                    .module
+                    .declare_func_in_func(callee_id, self.builder.func);
                 let call_inst = self.builder.ins().call(func_ref, &arg_vals);
                 if ty_to_cl(&ret_ty).is_some() {
                     let results = self.builder.inst_results(call_inst);
@@ -1060,6 +1131,26 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
         Ok(None)
     }
 
+    // ── Sleep ────────────────────────────────────────────────────
+
+    fn compile_sleep(&mut self, args: &[Arg]) -> Result<Option<Value>, CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::new("sleep expects exactly 1 argument (milliseconds)"));
+        }
+        let arg_ty = self.expr_ty(args[0].value);
+        let val = self.compile_expr(args[0].value, &arg_ty)?.unwrap();
+        // Extend to i64 if needed
+        let arg_val = match &arg_ty {
+            Ty::I8 | Ty::I16 | Ty::I32 => self.builder.ins().sextend(types::I64, val),
+            Ty::U8 | Ty::U16 | Ty::U32 => self.builder.ins().uextend(types::I64, val),
+            _ => val,
+        };
+        let func_id = self.runtime_fns["sleep_ms"];
+        let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+        self.builder.ins().call(func_ref, &[arg_val]);
+        Ok(None)
+    }
+
     // ── If/else ─────────────────────────────────────────────────
 
     fn compile_if(
@@ -1232,6 +1323,310 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                 self.builder.ins().iconst(cl_ty, 0)
             }
         }
+    }
+}
+
+// ── Dev Session (live reload) ────────────────────────────────────
+
+/// Registers all JIT runtime symbols on a JITBuilder.
+fn register_jit_symbols(builder: &mut JITBuilder) {
+    builder.symbol("weir_print_i64", weir_print_i64 as *const u8);
+    builder.symbol("weir_print_f64", weir_print_f64 as *const u8);
+    builder.symbol("weir_print_bool", weir_print_bool as *const u8);
+    builder.symbol("weir_print_unit", weir_print_unit as *const u8);
+    builder.symbol("weir_print_newline", weir_print_newline as *const u8);
+    builder.symbol("weir_sleep_ms", weir_sleep_ms as *const u8);
+}
+
+pub struct DevSession {
+    ast_module: weir_ast::Module,
+    type_info: TypeCheckResult,
+    /// Stable function pointer table — indirect calls load from here.
+    /// Boxed slice with stable address; AtomicPtr for thread-safe swaps.
+    fn_table: Box<[AtomicPtr<u8>]>,
+    /// Maps function name → slot index in fn_table.
+    fn_slots: HashMap<SmolStr, usize>,
+    /// Maps function name → (param types, return type) for signature reconstruction.
+    fn_sigs: HashMap<SmolStr, (Vec<Ty>, Ty)>,
+    /// Current JIT module (holds live code pages).
+    current_module: JITModule,
+    /// Old modules kept alive to prevent code page deallocation.
+    _old_modules: Vec<JITModule>,
+}
+
+type UserFnMap = HashMap<SmolStr, (FuncId, Vec<Ty>, Ty)>;
+type FnSigMap = HashMap<SmolStr, (Vec<Ty>, Ty)>;
+
+/// Helper: compile all functions with indirect dispatch into a JITModule.
+/// Returns (jit_module, user_fns_map, fn_sigs_map).
+fn compile_dev_module(
+    ast_module: &weir_ast::Module,
+    type_info: &TypeCheckResult,
+    fn_table_ptr: *const AtomicPtr<u8>,
+    fn_slots: &HashMap<SmolStr, usize>,
+) -> Result<(JITModule, UserFnMap, FnSigMap), CodegenError> {
+    let isa = make_isa(false)?;
+    let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+    register_jit_symbols(&mut builder);
+    builder.symbol("weir_fn_table", fn_table_ptr as *const u8);
+
+    let jit_module = JITModule::new(builder);
+    let mut compiler = Compiler::new(ast_module, type_info, jit_module);
+    compiler.declare_runtime_helpers()?;
+    compiler.declare_user_functions(Linkage::Local)?;
+
+    let table_data_id = compiler
+        .module
+        .declare_data("weir_fn_table", Linkage::Import, false, false)
+        .map_err(|e| CodegenError::new(format!("declare weir_fn_table data: {}", e)))?;
+
+    let mut fn_sigs = HashMap::new();
+    for (name, (_fid, param_tys, ret_ty)) in &compiler.user_fns {
+        fn_sigs.insert(name.clone(), (param_tys.clone(), ret_ty.clone()));
+    }
+
+    compiler.compile_user_functions_with(Some(fn_slots), Some(table_data_id))?;
+
+    compiler
+        .module
+        .finalize_definitions()
+        .map_err(|e| CodegenError::new(format!("finalize: {}", e)))?;
+
+    let user_fns = compiler.user_fns.clone();
+    Ok((compiler.module, user_fns, fn_sigs))
+}
+
+impl DevSession {
+    /// Create a new dev session: parse, typecheck, compile with indirect dispatch.
+    pub fn new(source: &str) -> Result<Self, CodegenError> {
+        let (ast_module, parse_errors) = weir_parser::parse(source);
+        if !parse_errors.is_empty() {
+            return Err(CodegenError::new(format!(
+                "parse error: {}",
+                parse_errors[0].message
+            )));
+        }
+
+        let type_info = weir_typeck::check(&ast_module);
+        if !type_info.errors.is_empty() {
+            return Err(CodegenError::new(format!(
+                "type error: {}",
+                type_info.errors[0].message
+            )));
+        }
+
+        // Assign slots to all user functions
+        let mut fn_slots = HashMap::new();
+        let mut slot = 0usize;
+        for (item, _) in &ast_module.items {
+            if let Item::Defn(defn) = item {
+                fn_slots.insert(defn.name.clone(), slot);
+                slot += 1;
+            }
+        }
+
+        // Create function table (all null initially)
+        let fn_table: Box<[AtomicPtr<u8>]> = (0..slot)
+            .map(|_| AtomicPtr::new(std::ptr::null_mut()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
+        let (jit_module, user_fns, fn_sigs) =
+            compile_dev_module(&ast_module, &type_info, fn_table.as_ptr(), &fn_slots)?;
+
+        // Populate fn_table with finalized function pointers
+        for (name, &slot_idx) in &fn_slots {
+            let (func_id, _, _) = &user_fns[name];
+            let ptr = jit_module.get_finalized_function(*func_id);
+            fn_table[slot_idx].store(ptr as *mut u8, Ordering::Release);
+        }
+
+        Ok(DevSession {
+            ast_module,
+            type_info,
+            fn_table,
+            fn_slots,
+            fn_sigs,
+            current_module: jit_module,
+            _old_modules: Vec::new(),
+        })
+    }
+
+    /// Recompile all functions from new source and swap pointers in the table.
+    /// Returns the list of function names on success.
+    /// On parse/type error, returns Err but keeps old code running.
+    pub fn reload(&mut self, new_source: &str) -> Result<Vec<String>, CodegenError> {
+        let (ast_module, parse_errors) = weir_parser::parse(new_source);
+        if !parse_errors.is_empty() {
+            return Err(CodegenError::new(format!(
+                "parse error: {}",
+                parse_errors[0].message
+            )));
+        }
+
+        let type_info = weir_typeck::check(&ast_module);
+        if !type_info.errors.is_empty() {
+            return Err(CodegenError::new(format!(
+                "type error: {}",
+                type_info.errors[0].message
+            )));
+        }
+
+        // Reassign slots for the new source
+        let mut new_fn_slots = HashMap::new();
+        let mut slot = 0usize;
+        for (item, _) in &ast_module.items {
+            if let Item::Defn(defn) = item {
+                new_fn_slots.insert(defn.name.clone(), slot);
+                slot += 1;
+            }
+        }
+
+        // If function count changed, grow the table
+        if slot > self.fn_table.len() {
+            let mut new_table: Vec<AtomicPtr<u8>> = Vec::with_capacity(slot);
+            for i in 0..slot {
+                if i < self.fn_table.len() {
+                    let old_ptr = self.fn_table[i].load(Ordering::Acquire);
+                    new_table.push(AtomicPtr::new(old_ptr));
+                } else {
+                    new_table.push(AtomicPtr::new(std::ptr::null_mut()));
+                }
+            }
+            self.fn_table = new_table.into_boxed_slice();
+        }
+
+        let (jit_module, user_fns, new_fn_sigs) =
+            compile_dev_module(&ast_module, &type_info, self.fn_table.as_ptr(), &new_fn_slots)?;
+
+        // Swap function pointers in the table
+        let mut reloaded_names = Vec::new();
+        for (name, &slot_idx) in &new_fn_slots {
+            let (func_id, _, _) = &user_fns[name];
+            let ptr = jit_module.get_finalized_function(*func_id);
+            self.fn_table[slot_idx].store(ptr as *mut u8, Ordering::Release);
+            reloaded_names.push(name.to_string());
+        }
+
+        // Keep old module alive
+        let old_module = std::mem::replace(&mut self.current_module, jit_module);
+        self._old_modules.push(old_module);
+
+        // Update session state
+        self.ast_module = ast_module;
+        self.type_info = type_info;
+        self.fn_slots = new_fn_slots;
+        self.fn_sigs = new_fn_sigs;
+
+        Ok(reloaded_names)
+    }
+
+    /// Get a callable function pointer for main() (reads through the fn_table).
+    fn get_main_fn_ptr(&self) -> Result<*const u8, CodegenError> {
+        let slot = self
+            .fn_slots
+            .get("main")
+            .ok_or_else(|| CodegenError::new("no 'main' function defined"))?;
+        let ptr = self.fn_table[*slot].load(Ordering::Acquire);
+        if ptr.is_null() {
+            return Err(CodegenError::new("main function pointer is null"));
+        }
+        Ok(ptr as *const u8)
+    }
+
+    /// Run main() and capture output (for testing).
+    pub fn run_main(&self) -> Result<String, CodegenError> {
+        let ptr = self.get_main_fn_ptr()?;
+        output_reset();
+        unsafe {
+            let main_fn: fn() = std::mem::transmute(ptr);
+            main_fn();
+        }
+        Ok(output_take())
+    }
+
+    /// Run the dev loop: spawn main() on a background thread, watch for file changes.
+    pub fn run_dev_loop(mut self, source_path: &Path) -> Result<(), CodegenError> {
+        use notify::{RecursiveMode, Watcher};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let main_ptr = self.get_main_fn_ptr()?;
+
+        // Cast to usize (which is Send) to transfer across thread boundary.
+        // Safety: the fn_table and _old_modules keep the code pages alive.
+        let main_ptr_int = main_ptr as usize;
+
+        // Spawn main() on a background thread.
+        // main_fn calls through the fn_table, so pointer swaps take effect automatically.
+        let main_handle = std::thread::spawn(move || unsafe {
+            let main_fn: fn() = std::mem::transmute(main_ptr_int);
+            main_fn();
+        });
+
+        eprintln!("[weir dev] running — watching {} for changes", source_path.display());
+
+        // Set up file watcher
+        let (tx, rx) = mpsc::channel();
+        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            if let Ok(event) = res {
+                if event.kind.is_modify() {
+                    let _ = tx.send(());
+                }
+            }
+        })
+        .map_err(|e| CodegenError::new(format!("watcher setup: {}", e)))?;
+
+        let watch_path = source_path
+            .parent()
+            .unwrap_or(Path::new("."));
+        watcher
+            .watch(watch_path, RecursiveMode::NonRecursive)
+            .map_err(|e| CodegenError::new(format!("watch: {}", e)))?;
+
+        let source_path = source_path.to_path_buf();
+
+        loop {
+            // Check if main thread has exited
+            if main_handle.is_finished() {
+                eprintln!("[weir dev] main() exited");
+                break;
+            }
+
+            // Wait for a file change event (with timeout to check main thread)
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(()) => {
+                    // Debounce: drain any queued events
+                    std::thread::sleep(Duration::from_millis(50));
+                    while rx.try_recv().is_ok() {}
+
+                    // Read new source
+                    let new_source = match std::fs::read_to_string(&source_path) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[weir dev] error reading file: {}", e);
+                            continue;
+                        }
+                    };
+
+                    match self.reload(&new_source) {
+                        Ok(names) => {
+                            eprintln!(
+                                "[weir dev] reloaded: {}",
+                                names.join(", ")
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("[weir dev] reload error (old code still running): {}", e);
+                        }
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -1765,5 +2160,81 @@ mod tests {
     #[test]
     fn fixture_aot_let_mutation() {
         fixture_oracle_all("codegen-let-mutation");
+    }
+
+    // ── Dev mode (indirect dispatch) tests ───────────────────────
+
+    #[test]
+    fn test_dev_session_basic() {
+        let source = "(defn add ((x : i32) (y : i32)) : i32 (+ x y))
+             (defn main () : Unit (println (add 3 4)))";
+        let session = DevSession::new(source).expect("DevSession::new failed");
+        let output = session.run_main().expect("run_main failed");
+        assert_eq!(output, "7\n");
+    }
+
+    #[test]
+    fn test_dev_session_matches_jit() {
+        // Verify indirect dispatch produces same output as direct-call JIT
+        let source = "(defn factorial ((n : i32)) : i32
+               (if (<= n 1) 1 (* n (factorial (- n 1)))))
+             (defn main () : Unit
+               (println (factorial 1))
+               (println (factorial 5))
+               (println (factorial 10)))";
+        let jit_output = compile_run(source);
+        let session = DevSession::new(source).expect("DevSession::new failed");
+        let dev_output = session.run_main().expect("run_main failed");
+        assert_eq!(jit_output, dev_output, "JIT and dev-mode disagree");
+    }
+
+    #[test]
+    fn test_dev_session_reload() {
+        let source_v1 = "(defn greet () : Unit (println 1))
+             (defn main () : Unit (greet))";
+        let mut session = DevSession::new(source_v1).expect("DevSession::new failed");
+        let out1 = session.run_main().expect("run_main v1 failed");
+        assert_eq!(out1, "1\n");
+
+        let source_v2 = "(defn greet () : Unit (println 2))
+             (defn main () : Unit (greet))";
+        let reloaded = session.reload(source_v2).expect("reload failed");
+        assert!(!reloaded.is_empty(), "should have reloaded functions");
+
+        let out2 = session.run_main().expect("run_main v2 failed");
+        assert_eq!(out2, "2\n");
+    }
+
+    #[test]
+    fn test_dev_session_error_resilience() {
+        let source = "(defn main () : Unit (println 42))";
+        let mut session = DevSession::new(source).expect("DevSession::new failed");
+        let out1 = session.run_main().expect("run_main failed");
+        assert_eq!(out1, "42\n");
+
+        // Reload with broken source — should fail
+        let broken = "(defn main () : Unit (println";
+        let result = session.reload(broken);
+        assert!(result.is_err(), "reload with broken source should fail");
+
+        // Old code should still work
+        let out2 = session.run_main().expect("run_main after failed reload should work");
+        assert_eq!(out2, "42\n");
+    }
+
+    #[test]
+    fn test_dev_session_all_fixtures() {
+        // Verify all codegen fixtures produce same output in dev mode as JIT
+        for name in &["codegen-arithmetic", "codegen-control-flow", "codegen-functions", "codegen-let-mutation"] {
+            let path = fixture_path(name);
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("could not read fixture {}: {}", path, e));
+            let jit_output = compile_run(&source);
+            let session = DevSession::new(&source)
+                .unwrap_or_else(|e| panic!("DevSession::new failed for {}: {}", name, e));
+            let dev_output = session.run_main()
+                .unwrap_or_else(|e| panic!("run_main failed for {}: {}", name, e));
+            assert_eq!(jit_output, dev_output, "{}: JIT and dev-mode disagree", name);
+        }
     }
 }
