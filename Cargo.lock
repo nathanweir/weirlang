@@ -769,6 +769,7 @@ dependencies = [
  "weir-interp",
  "weir-lexer",
  "weir-parser",
+ "weir-typeck",
 ]
 
 [[package]]
@@ -798,6 +799,16 @@ dependencies = [
  "smol_str",
  "weir-ast",
  "weir-lexer",
+]
+
+[[package]]
+name = "weir-typeck"
+version = "0.1.0"
+dependencies = [
+ "insta",
+ "smol_str",
+ "weir-ast",
+ "weir-parser",
 ]
 
 [[package]]

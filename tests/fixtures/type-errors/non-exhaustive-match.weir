@@ -1,0 +1,9 @@
+;; This file should fail type checking:
+;; match is not exhaustive (missing None variant)
+(deftype (Option 'a)
+  (Some 'a)
+  None)
+
+(defn unwrap ((x : (Option i32))) : i32
+  (match x
+    ((Some v) v)))

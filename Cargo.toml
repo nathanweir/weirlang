@@ -4,6 +4,7 @@ members = [
     "crates/weir-lexer",
     "crates/weir-parser",
     "crates/weir-ast",
+    "crates/weir-typeck",
     "crates/weir-interp",
     "crates/weir-cli",
 ]
@@ -35,4 +36,5 @@ clap = { version = "4", features = ["derive"] }
 weir-lexer = { path = "crates/weir-lexer" }
 weir-parser = { path = "crates/weir-parser" }
 weir-ast = { path = "crates/weir-ast" }
+weir-typeck = { path = "crates/weir-typeck" }
 weir-interp = { path = "crates/weir-interp" }

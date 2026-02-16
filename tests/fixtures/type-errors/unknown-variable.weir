@@ -1,0 +1,4 @@
+;; This file should fail type checking:
+;; 'x' is not defined
+(defn main ()
+  (+ x 1))

@@ -11,7 +11,7 @@ pub type PatternId = Idx<Pattern>;
 // ── Module ────────────────────────────────────────────────────────
 
 /// A parsed source file.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Module {
     pub items: Vec<(Item, Span)>,
     pub exprs: Arena<Expr>,
@@ -38,7 +38,7 @@ impl Default for Module {
 
 // ── Top-level items ───────────────────────────────────────────────
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Item {
     Defn(Defn),
     Deftype(Deftype),
@@ -51,7 +51,7 @@ pub enum Item {
 }
 
 /// Function definition: `(defn name (params) : return-type body...)`
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Defn {
     pub name: SmolStr,
     pub params: Vec<Param>,
@@ -63,7 +63,7 @@ pub struct Defn {
 }
 
 /// Function parameter.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Param {
     pub name: SmolStr,
     pub type_ann: Option<TypeExprId>,
@@ -73,7 +73,7 @@ pub struct Param {
 }
 
 /// Sum type definition: `(deftype (Name 'a) variants...)`
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Deftype {
     pub name: SmolStr,
     pub type_params: Vec<SmolStr>,
@@ -83,7 +83,7 @@ pub struct Deftype {
 }
 
 /// Variant of a sum type.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Variant {
     pub name: SmolStr,
     pub fields: Vec<TypeExprId>,
@@ -91,7 +91,7 @@ pub struct Variant {
 }
 
 /// Struct definition: `(defstruct Name (field : type)...)`
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Defstruct {
     pub name: SmolStr,
     pub type_params: Vec<SmolStr>,
@@ -101,7 +101,7 @@ pub struct Defstruct {
 }
 
 /// Field of a struct.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct StructField {
     pub name: SmolStr,
     pub type_ann: TypeExprId,
@@ -109,7 +109,7 @@ pub struct StructField {
 }
 
 /// Typeclass definition: `(defclass (Name 'a) methods...)`
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Defclass {
     pub name: SmolStr,
     pub type_params: Vec<SmolStr>,
@@ -120,7 +120,7 @@ pub struct Defclass {
 }
 
 /// Method signature in a typeclass.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MethodSig {
     pub name: SmolStr,
     pub type_ann: TypeExprId,
@@ -136,7 +136,7 @@ pub struct Constraint {
 }
 
 /// Typeclass instance: `(instance (Class Type) methods...)`
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct InstanceDef {
     pub class_name: SmolStr,
     pub type_args: Vec<TypeExprId>,
@@ -146,14 +146,14 @@ pub struct InstanceDef {
 }
 
 /// Import declaration: `(import module.path ...)`
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Import {
     pub module_path: SmolStr,
     pub kind: ImportKind,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ImportKind {
     /// `(import m (a b c))`
     Names(Vec<SmolStr>),
@@ -164,7 +164,7 @@ pub enum ImportKind {
 }
 
 /// Type declaration: `(declare name type)`
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Declare {
     pub name: SmolStr,
     pub type_ann: TypeExprId,
@@ -172,7 +172,7 @@ pub struct Declare {
 }
 
 /// Extern C block: `(extern "C" decls...)`
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ExternC {
     pub declarations: Vec<Defn>,
     pub span: Span,
@@ -180,13 +180,13 @@ pub struct ExternC {
 
 // ── Expressions ───────────────────────────────────────────────────
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Expr {
     pub kind: ExprKind,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ExprKind {
     /// Literal value.
     Lit(Literal),
@@ -273,7 +273,7 @@ pub enum ExprKind {
 }
 
 /// A function call argument (positional or named).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Arg {
     pub name: Option<SmolStr>,
     pub value: ExprId,
@@ -290,7 +290,7 @@ pub enum Literal {
 }
 
 /// A binding in a let expression.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LetBinding {
     pub name: SmolStr,
     pub type_ann: Option<TypeExprId>,
@@ -300,7 +300,7 @@ pub struct LetBinding {
 }
 
 /// A match arm: `(pattern body...)`
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MatchArm {
     pub pattern: PatternId,
     pub body: Vec<ExprId>,
@@ -309,13 +309,13 @@ pub struct MatchArm {
 
 // ── Patterns ──────────────────────────────────────────────────────
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Pattern {
     pub kind: PatternKind,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum PatternKind {
     /// Wildcard: `_`
     Wildcard,
@@ -335,7 +335,7 @@ pub enum PatternKind {
 }
 
 /// Field in a struct destructuring pattern.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FieldPattern {
     pub field_name: SmolStr,
     pub binding: Option<SmolStr>,
@@ -344,13 +344,13 @@ pub struct FieldPattern {
 
 // ── Type expressions ──────────────────────────────────────────────
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TypeExpr {
     pub kind: TypeExprKind,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum TypeExprKind {
     /// Named type: `i32`, `String`, `Enemy`
     Named(SmolStr),

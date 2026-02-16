@@ -1,0 +1,4 @@
+;; This file should fail type checking:
+;; function declares i32 return but returns a string
+(defn bad () : i32
+  (str "hello"))

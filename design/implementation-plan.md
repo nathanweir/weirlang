@@ -132,7 +132,7 @@ Run `just test` on every commit. Tests must pass before merging.
 - [x] **Milestone 0 demo**: `tests/fixtures/milestone0-demo.weir` — functions, let bindings, mutation, arithmetic, ADTs, pattern matching, closures
 
 ### Phase 3: Type checker
-- [ ] **Type checker** (`weir-typeck`):
+- [x] **Type checker** (`weir-typeck`):
   - Phase 1: Check explicitly annotated code (no inference yet)
     - Verify function arg/return types match
     - Verify let binding types match
@@ -147,9 +147,9 @@ Run `just test` on every commit. Tests must pass before merging.
     - Pattern match type checking with exhaustiveness enforcement
   - All numeric types: i8, i16, i32, i64, u8, u16, u32, u64, f32, f64
   - Error reporting via `miette` with source spans
-- [ ] **Snapshot tests**: type error messages, inferred types
-- [ ] **CLI**: `weir check <file>` — parse and type-check without running
-- [ ] Verify: type errors produce clear, located diagnostics
+- [x] **Snapshot tests**: type error messages, inferred types
+- [x] **CLI**: `weir check <file>` — parse and type-check without running
+- [x] Verify: type errors produce clear, located diagnostics
 
 ### Phase 4: Lowered IR + Cranelift codegen
 - [ ] **IR** (`weir-ir`): lowered intermediate representation
