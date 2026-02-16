@@ -1,0 +1,39 @@
+;; Codegen test: control flow constructs
+
+(defn classify ((n : i32)) : i32
+  (cond
+    ((< n 0) (- 1))
+    ((= n 0) 0)
+    (else 1)))
+
+(defn main () : Unit
+  ;; if/else
+  (println (if (> 5 3) 1 0))
+  (println (if (< 5 3) 1 0))
+
+  ;; Comparisons
+  (println (< 1 2))
+  (println (> 1 2))
+  (println (= 3 3))
+  (println (!= 3 4))
+  (println (<= 5 5))
+  (println (>= 5 6))
+
+  ;; Boolean ops
+  (println (not true))
+  (println (not false))
+  (println (and true true))
+  (println (and true false))
+  (println (or false false))
+  (println (or false true))
+
+  ;; when / unless
+  (when true (println 42))
+  (when false (println 99))
+  (unless false (println 7))
+  (unless true (println 88))
+
+  ;; cond
+  (println (classify (- 5)))
+  (println (classify 0))
+  (println (classify 10)))

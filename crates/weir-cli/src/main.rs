@@ -20,8 +20,13 @@ enum Command {
         /// Path to the .weir source file
         file: PathBuf,
     },
-    /// Run a .weir file
+    /// Compile and run a .weir file natively via Cranelift JIT
     Run {
+        /// Path to the .weir source file
+        file: PathBuf,
+    },
+    /// Run a .weir file via the tree-walking interpreter
+    Interp {
         /// Path to the .weir source file
         file: PathBuf,
     },
@@ -102,6 +107,53 @@ fn main() {
             }
         }
         Command::Run { file } => {
+            let source = match std::fs::read_to_string(&file) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: could not read {}: {}", file.display(), e);
+                    std::process::exit(1);
+                }
+            };
+
+            let (module, parse_errors) = weir_parser::parse(&source);
+
+            if !parse_errors.is_empty() {
+                for error in &parse_errors {
+                    eprintln!(
+                        "{}:{}:{}: parse error: {}",
+                        file.display(),
+                        error.span.start,
+                        error.span.end,
+                        error.message
+                    );
+                }
+                std::process::exit(1);
+            }
+
+            let type_info = weir_typeck::check(&module);
+
+            if !type_info.errors.is_empty() {
+                for error in &type_info.errors {
+                    eprintln!(
+                        "{}:{}:{}: type error: {}",
+                        file.display(),
+                        error.span.start,
+                        error.span.end,
+                        error.message
+                    );
+                }
+                std::process::exit(1);
+            }
+
+            match weir_codegen::compile_and_run(&module, &type_info) {
+                Ok(output) => print!("{}", output),
+                Err(e) => {
+                    eprintln!("{}: codegen error: {}", file.display(), e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Command::Interp { file } => {
             let source = match std::fs::read_to_string(&file) {
                 Ok(s) => s,
                 Err(e) => {

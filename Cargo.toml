@@ -6,6 +6,7 @@ members = [
     "crates/weir-ast",
     "crates/weir-typeck",
     "crates/weir-interp",
+    "crates/weir-codegen",
     "crates/weir-cli",
 ]
 
@@ -32,9 +33,18 @@ insta = "1"
 # CLI
 clap = { version = "4", features = ["derive"] }
 
+# Codegen
+cranelift-codegen = "0.128"
+cranelift-frontend = "0.128"
+cranelift-jit = "0.128"
+cranelift-module = "0.128"
+cranelift-native = "0.128"
+target-lexicon = "0.13"
+
 # Internal crates
 weir-lexer = { path = "crates/weir-lexer" }
 weir-parser = { path = "crates/weir-parser" }
 weir-ast = { path = "crates/weir-ast" }
 weir-typeck = { path = "crates/weir-typeck" }
 weir-interp = { path = "crates/weir-interp" }
+weir-codegen = { path = "crates/weir-codegen" }

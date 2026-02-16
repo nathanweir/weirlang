@@ -1,0 +1,21 @@
+[package]
+name = "weir-codegen"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+weir-ast.workspace = true
+weir-typeck.workspace = true
+smol_str.workspace = true
+la-arena.workspace = true
+cranelift-codegen.workspace = true
+cranelift-frontend.workspace = true
+cranelift-jit.workspace = true
+cranelift-module.workspace = true
+cranelift-native.workspace = true
+target-lexicon.workspace = true
+
+[dev-dependencies]
+weir-parser.workspace = true
+weir-interp.workspace = true
+insta.workspace = true

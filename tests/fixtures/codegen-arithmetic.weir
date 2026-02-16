@@ -1,0 +1,25 @@
+;; Codegen test: arithmetic operations across numeric types
+
+(defn main () : Unit
+  ;; Basic integer arithmetic
+  (println (+ 1 2))
+  (println (- 10 3))
+  (println (* 4 5))
+  (println (/ 15 4))
+  (println (mod 17 5))
+
+  ;; Variadic arithmetic
+  (println (+ 1 2 3 4 5))
+  (println (* 1 2 3 4 5))
+
+  ;; Nested arithmetic
+  (println (+ (* 2 3) (- 10 4)))
+
+  ;; Unary negation
+  (println (- 5))
+
+  ;; Float arithmetic
+  (println (+ 1.5 2.5))
+  (println (- 10.0 3.5))
+  (println (* 2.0 3.0))
+  (println (/ 7.0 2.0)))

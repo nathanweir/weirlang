@@ -1,0 +1,41 @@
+;; Codegen test: let bindings, mutation, and do blocks
+
+(defn main () : Unit
+  ;; Simple let binding
+  (let (((x : i32) 10)
+        ((y : i32) 20))
+    (println (+ x y)))
+
+  ;; Mutable binding with set!
+  (let (((mut x : i32) 0))
+    (set! x 42)
+    (println x))
+
+  ;; Nested let bindings
+  (let (((a : i32) 5))
+    (let (((b : i32) (+ a 10)))
+      (println b)))
+
+  ;; Do block
+  (let (((result : i32) (do (println 1) 42)))
+    (println result))
+
+  ;; Mutation loop (counting up)
+  (let (((mut i : i32) 0)
+        ((mut sum : i32) 0))
+    (when (< i 5)
+      (set! sum (+ sum i))
+      (set! i (+ i 1)))
+    (when (< i 5)
+      (set! sum (+ sum i))
+      (set! i (+ i 1)))
+    (when (< i 5)
+      (set! sum (+ sum i))
+      (set! i (+ i 1)))
+    (when (< i 5)
+      (set! sum (+ sum i))
+      (set! i (+ i 1)))
+    (when (< i 5)
+      (set! sum (+ sum i))
+      (set! i (+ i 1)))
+    (println sum)))

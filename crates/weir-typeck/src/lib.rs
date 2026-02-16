@@ -1,3 +1,4 @@
+use la_arena::ArenaMap;
 use smol_str::SmolStr;
 use std::collections::HashMap;
 use std::fmt;
@@ -124,6 +125,8 @@ impl fmt::Display for TypeError {
 
 pub struct TypeCheckResult {
     pub errors: Vec<TypeError>,
+    /// Resolved type for every expression, after substitution + numeric defaulting.
+    pub expr_types: ArenaMap<ExprId, Ty>,
 }
 
 // ── Public API ───────────────────────────────────────────────────
@@ -132,8 +135,16 @@ pub fn check(module: &Module) -> TypeCheckResult {
     let mut checker = TypeChecker::new(module);
     checker.collect_definitions();
     checker.check_items();
+
+    // Apply final substitution to all recorded expression types
+    let mut expr_types = ArenaMap::default();
+    for (id, ty) in checker.expr_types.iter() {
+        expr_types.insert(id, checker.apply(ty));
+    }
+
     TypeCheckResult {
         errors: checker.errors,
+        expr_types,
     }
 }
 
@@ -202,6 +213,9 @@ struct TypeChecker<'a> {
     type_param_scope: HashMap<SmolStr, Ty>,
 
     errors: Vec<TypeError>,
+
+    /// Records the type of every expression (pre-substitution).
+    expr_types: ArenaMap<ExprId, Ty>,
 }
 
 impl<'a> TypeChecker<'a> {
@@ -217,6 +231,7 @@ impl<'a> TypeChecker<'a> {
             scopes: vec![HashMap::new()],
             type_param_scope: HashMap::new(),
             errors: Vec::new(),
+            expr_types: ArenaMap::default(),
         }
     }
 
@@ -729,6 +744,12 @@ impl<'a> TypeChecker<'a> {
     // ── Expression checking ──────────────────────────────────────
 
     fn check_expr(&mut self, expr_id: ExprId) -> Ty {
+        let ty = self.check_expr_inner(expr_id);
+        self.expr_types.insert(expr_id, ty.clone());
+        ty
+    }
+
+    fn check_expr_inner(&mut self, expr_id: ExprId) -> Ty {
         let expr = &self.module.exprs[expr_id];
         let span = expr.span;
 

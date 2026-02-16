@@ -1,0 +1,40 @@
+;; Codegen test: function definitions, calls, and recursion
+
+(defn add ((x : i32) (y : i32)) : i32
+  (+ x y))
+
+(defn square ((x : i32)) : i32
+  (* x x))
+
+(defn factorial ((n : i32)) : i32
+  (if (<= n 1) 1 (* n (factorial (- n 1)))))
+
+(defn fib ((n : i32)) : i32
+  (if (<= n 1) n (+ (fib (- n 1)) (fib (- n 2)))))
+
+(defn is-even ((n : i32)) : Bool
+  (if (= n 0) true (is-odd (- n 1))))
+
+(defn is-odd ((n : i32)) : Bool
+  (if (= n 0) false (is-even (- n 1))))
+
+(defn main () : Unit
+  ;; Simple function calls
+  (println (add 3 4))
+  (println (square 5))
+
+  ;; Recursive functions
+  (println (factorial 1))
+  (println (factorial 5))
+  (println (factorial 10))
+
+  ;; Fibonacci
+  (println (fib 0))
+  (println (fib 1))
+  (println (fib 10))
+
+  ;; Mutual recursion
+  (println (is-even 10))
+  (println (is-odd 10))
+  (println (is-even 7))
+  (println (is-odd 7)))
