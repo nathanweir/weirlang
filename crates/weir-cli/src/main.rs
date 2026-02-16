@@ -56,9 +56,37 @@ fn main() {
             }
         }
         Command::Run { file } => {
-            eprintln!("TODO: interpreter not yet implemented");
-            eprintln!("file: {}", file.display());
-            std::process::exit(1);
+            let source = match std::fs::read_to_string(&file) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: could not read {}: {}", file.display(), e);
+                    std::process::exit(1);
+                }
+            };
+
+            let (module, errors) = weir_parser::parse(&source);
+
+            if !errors.is_empty() {
+                for error in &errors {
+                    eprintln!(
+                        "{}:{}:{}: {}",
+                        file.display(),
+                        error.span.start,
+                        error.span.end,
+                        error.message
+                    );
+                }
+                std::process::exit(1);
+            }
+
+            match weir_interp::interpret(&module) {
+                Ok(output) => print!("{}", output),
+                Err(e) => {
+                    eprintln!("{}:{}: runtime error: {}", file.display(),
+                        e.span.map_or(0, |s| s.start), e.message);
+                    std::process::exit(1);
+                }
+            }
         }
     }
 }

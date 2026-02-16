@@ -766,7 +766,18 @@ dependencies = [
  "clap",
  "miette",
  "weir-ast",
+ "weir-interp",
  "weir-lexer",
+ "weir-parser",
+]
+
+[[package]]
+name = "weir-interp"
+version = "0.1.0"
+dependencies = [
+ "insta",
+ "smol_str",
+ "weir-ast",
  "weir-parser",
 ]
 

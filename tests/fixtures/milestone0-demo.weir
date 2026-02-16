@@ -1,0 +1,69 @@
+;; Milestone 0 demo: defines functions, uses let bindings,
+;; does arithmetic, uses ADTs and pattern matching, prints results.
+
+(deftype (Option 'a)
+  (Some 'a)
+  None)
+
+(defn abs (n)
+  (if (< n 0) (- n) n))
+
+(defn max (a b)
+  (if (> a b) a b))
+
+(defn factorial (n)
+  (if (<= n 1)
+    1
+    (* n (factorial (- n 1)))))
+
+(defn fib (n)
+  (if (<= n 1)
+    n
+    (+ (fib (- n 1)) (fib (- n 2)))))
+
+(defn safe-div (a b)
+  (if (= b 0)
+    None
+    (Some (/ a b))))
+
+(defn show-result (result)
+  (match result
+    ((Some val) (str "result: " val))
+    (None "error: division by zero")))
+
+(defn main ()
+  (println "=== Milestone 0 Demo ===")
+
+  ;; Basic arithmetic
+  (println (str "1 + 2 = " (+ 1 2)))
+  (println (str "10 - 3 = " (- 10 3)))
+  (println (str "abs(-42) = " (abs -42)))
+  (println (str "max(7, 12) = " (max 7 12)))
+
+  ;; Factorial
+  (println (str "5! = " (factorial 5)))
+  (println (str "10! = " (factorial 10)))
+
+  ;; Fibonacci
+  (println (str "fib(10) = " (fib 10)))
+
+  ;; Let bindings with mutation
+  (let ((mut sum 0))
+    (set! sum (+ sum 1))
+    (set! sum (+ sum 2))
+    (set! sum (+ sum 3))
+    (println (str "1+2+3 = " sum)))
+
+  ;; ADTs and pattern matching
+  (println (show-result (safe-div 10 3)))
+  (println (show-result (safe-div 10 0)))
+
+  ;; Closures
+  (let ((make-greeting (fn (prefix)
+          (fn (name) (str prefix " " name)))))
+    (let ((hello (make-greeting "Hello"))
+          (bye (make-greeting "Goodbye")))
+      (println (hello "World"))
+      (println (bye "World"))))
+
+  (println "=== Done ==="))

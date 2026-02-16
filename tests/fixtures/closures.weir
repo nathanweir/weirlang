@@ -1,0 +1,18 @@
+;; Higher-order functions and closures
+
+(defn make-adder (n)
+  (fn (x) (+ x n)))
+
+(defn apply-twice (f x)
+  (f (f x)))
+
+(defn main ()
+  ;; Closure captures n from make-adder
+  (let ((add5 (make-adder 5))
+        (add10 (make-adder 10)))
+    (println (add5 1))
+    (println (add10 1))
+    ;; Higher-order function
+    (println (apply-twice add5 0))
+    ;; Lambda as argument
+    (println (apply-twice (fn (x) (* x 2)) 3))))

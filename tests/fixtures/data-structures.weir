@@ -1,0 +1,38 @@
+;; ADTs, structs, pattern matching
+
+(deftype (Option 'a)
+  (Some 'a)
+  None)
+
+(defstruct Point
+  (x : f32)
+  (y : f32))
+
+(defn describe-option (opt)
+  (match opt
+    ((Some val) (str "Some(" val ")"))
+    (None "None")))
+
+(defn distance (p)
+  ;; Approximate: sqrt not available yet, just sum of squares
+  (+ (* (.x p) (.x p)) (* (.y p) (.y p))))
+
+(defn main ()
+  ;; ADT constructors and pattern matching
+  (println (describe-option (Some 42)))
+  (println (describe-option None))
+  (println (describe-option (Some "hello")))
+
+  ;; Struct construction and field access
+  (let ((p (Point 3.0 4.0)))
+    (println (.x p))
+    (println (.y p))
+    (println (distance p)))
+
+  ;; Vectors
+  (let ((v [10 20 30]))
+    (println (len v))
+    (println (nth v 1))
+    (let ((v2 (append v 40)))
+      (println (len v2))
+      (println (nth v2 3)))))

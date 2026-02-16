@@ -121,15 +121,15 @@ Run `just test` on every commit. Tests must pass before merging.
 - [x] Verify: can parse the example code from design/syntax.md (via `syntax-showcase.weir` fixture)
 
 ### Phase 2: Tree-walking interpreter
-- [ ] **Interpreter** (`weir-interp`): evaluate AST directly
+- [x] **Interpreter** (`weir-interp`): evaluate AST directly
   - Values: integers, floats, booleans, strings, Unit, closures, ADT constructors/instances, arrays, maps
   - Evaluation: function calls, let bindings, if/cond/when/unless, match (with exhaustiveness warning, not yet enforced), basic arithmetic/comparison/boolean ops
   - Environment: lexical scoping, `mut` bindings with `set!`
-  - Built-in functions: `+`, `-`, `*`, `/`, `<`, `>`, `=`, `println`, `print`, `str`
-- [ ] **End-to-end tests**: `.weir` fixtures → expected output
-- [ ] **CLI**: `weir run <file>` — parse and interpret
-- [ ] Verify: can run non-trivial programs (fibonacci, factorial, simple data structures)
-- [ ] **Milestone 0 demo**: a Weir program that defines functions, uses let bindings, does arithmetic, prints results
+  - Built-in functions: `+`, `-`, `*`, `/`, `<`, `>`, `=`, `println`, `print`, `str` (plus `mod`, `<=`, `>=`, `!=`, `not`, `and`, `or`, `len`, `nth`, `append`, `type-of`)
+- [x] **End-to-end tests**: `.weir` fixtures → expected output (5 fixture files with snapshot tests)
+- [x] **CLI**: `weir run <file>` — parse and interpret
+- [x] Verify: can run non-trivial programs (fibonacci, factorial, closures, ADTs, structs, pattern matching)
+- [x] **Milestone 0 demo**: `tests/fixtures/milestone0-demo.weir` — functions, let bindings, mutation, arithmetic, ADTs, pattern matching, closures
 
 ### Phase 3: Type checker
 - [ ] **Type checker** (`weir-typeck`):
