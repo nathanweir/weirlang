@@ -1,0 +1,1 @@
+This project is an attempt at very aggressively pushing Claude Code to do a complex task via an engineering-design oriented workflow. In this workflow, Claude is made to process transcripts of voice memos recorded in `transcripts/`, ingest those into a growing set of design documents in `design/`, and then iterate on these requirements with the developer to build the software.
