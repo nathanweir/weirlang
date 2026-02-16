@@ -11,6 +11,7 @@ Remaining design questions organized by topic. See individual design documents f
 - [macro-system.md](macro-system.md) — Macros and their interaction with types/reloading
 - [concurrency.md](concurrency.md) — Layered concurrency model with compile-time safety
 - [syntax.md](syntax.md) — Syntax decisions, type annotation style, collection literals
+- [implementation-plan.md](implementation-plan.md) — Phased implementation roadmap
 
 ## Decision summary
 

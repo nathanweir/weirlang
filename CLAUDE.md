@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Weirlang is a programming language project in the early design phase. The goal is to build a complete language ecosystem: compiler/interpreter, LSP (language server protocol), and a Zed editor extension.
+Weir is a programming language project transitioning from design to implementation. The goal is to build a complete language ecosystem: compiler/interpreter, LSP (language server protocol), and a Zed editor extension.
 
 ## Design Workflow
 
@@ -42,5 +42,6 @@ When processing a new transcript, ingest it into the existing design documents i
   - `concurrency.md` — Layered concurrency model with compile-time safety
   - `syntax.md` — Syntax decisions, type annotation style, collection literals
   - `open-questions.md` — Index of all decisions and remaining open questions
+  - `implementation-plan.md` — Phased implementation roadmap, technology choices, test strategy
 - `.transcripts/` — Raw voice memo transcripts (gitignored, not committed)
 - `README.md` — Project description and workflow explanation
