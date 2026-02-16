@@ -152,23 +152,32 @@ Run `just test` on every commit. Tests must pass before merging.
 - [x] Verify: type errors produce clear, located diagnostics
 
 ### Phase 4: Lowered IR + Cranelift codegen
-- [ ] **IR** (`weir-ir`): lowered intermediate representation
+- [ ] **IR** (`weir-ir`): lowered intermediate representation — *deferred; AST lowers directly to Cranelift IR for the current numeric/control-flow subset. A dedicated IR will be introduced when pattern matching decision trees require it.*
   - Desugar pattern matching into decision trees
   - Flatten nested expressions
   - Normalize control flow
   - Explicit temporary variables
-- [ ] **Codegen** (`weir-codegen`): translate IR to Cranelift CLIF
+- [x] **Codegen** (`weir-codegen`): AST → Cranelift IR (direct lowering via `FunctionBuilder`)
   - Use `cranelift-frontend` for SSA construction
   - Use `cranelift-jit` for JIT module
   - Function compilation → native function pointer
-  - Calling convention: standard C ABI initially
-  - All numeric types and arithmetic
-  - Function calls, let bindings, if/cond, basic control flow
-- [ ] **Test oracle**: interpreter and compiled code produce identical output for all fixtures
-- [ ] **CLI**: `weir run <file>` now compiles and runs natively (interpreter available via `weir interp <file>`)
-- [ ] Verify: compiled programs produce correct results, match interpreter
+  - Calling convention: SystemV ABI
+  - All numeric types (i8–i64, u8–u64, f32, f64), booleans, unit, and arithmetic
+  - Function calls (including mutual recursion), let bindings, if/cond/when/unless, do blocks, set!
+  - `println`/`print` via extern "C" runtime helpers with thread-local output buffer
+  - Expression type map (`expr_types`) added to `weir-typeck` for codegen type resolution
+- [x] **Test oracle**: interpreter and compiled code produce identical output (7 oracle tests + 4 fixture oracle tests)
+- [x] **CLI**: `weir run <file>` compiles and runs natively via Cranelift JIT; `weir interp <file>` runs via interpreter
+- [x] Verify: 32 codegen tests pass, all 144 workspace tests pass, clippy clean
 
-### Phase 5: Function table + basic live reload
+### Phase 5: AOT compilation, function table + basic live reload
+- [ ] **AOT compilation** (`weir-codegen`): produce standalone native binaries
+  - Switch from `JITModule` to `ObjectModule` to emit `.o` object files
+  - Small runtime library (`weir-runtime`) linked in: print helpers, startup
+  - Link via system linker (`cc`) to produce executable
+  - Same Cranelift IR generation as JIT path — just a different module backend
+  - Note: LLVM backend deferred; Cranelift codegen quality is sufficient for gamedev workloads where hot paths are arenas/GC-controlled (Phases 9–10) and rendering is GPU-bound. Revisit if profiling shows codegen is the bottleneck.
+- [ ] **CLI**: `weir build <file>` — compile to standalone binary
 - [ ] **Runtime** (`weir-runtime`):
   - Function pointer table with indirect dispatch
   - All calls go through the table (one extra indirection per call)
@@ -178,7 +187,7 @@ Run `just test` on every commit. Tests must pass before merging.
   - Error reporting: if recompilation fails, keep old version, print error
 - [ ] **CLI**: `weir dev <file>` — compile, run, watch for changes, live reload
 - [ ] **Milestone 1 demo**: a program running a loop; edit a function; the running program uses the new version without restart
-- [ ] Verify: live reload works for body-only changes and signature changes
+- [ ] Verify: `weir build` produces working binaries; live reload works for body-only changes and signature changes
 
 ### Phase 6: Tree-sitter grammar + basic LSP
 - [ ] **Tree-sitter grammar** (`tree-sitter-weir/`):
@@ -268,8 +277,8 @@ Run `just test` on every commit. Tests must pass before merging.
 | Milestone | Phase | What you can show |
 |---|---|---|
 | **M0: "It runs"** | After Phase 2 | Parse and interpret Weir programs with functions, let, if, arithmetic |
-| **M1: "It compiles"** | After Phase 4 | Programs compile to native code via Cranelift and run |
-| **M2: "Live reload"** | After Phase 5 | Edit a function → running program uses new version |
+| **M1: "It compiles"** | After Phase 4 | Programs compile to native code via Cranelift JIT and run |
+| **M2: "Standalone binary + live reload"** | After Phase 5 | `weir build` produces native binaries; `weir dev` enables live reload |
 | **M3: "Editor support"** | After Phase 6 | Syntax highlighting, inline errors, type hover in Zed |
 | **M4: "Real language"** | After Phase 8 | Generics, typeclasses, macros — write non-trivial programs |
 | **M5: "Production-ready runtime"** | After Phase 10 | GC, arenas, concurrency, full cascade — the complete vision |
