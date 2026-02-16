@@ -13,7 +13,7 @@
 (defn load-level ((path : String)) : Level
   (let ((data (read-file path))
         (entities (parse-entities data)))
-    (make-level entities)))
+    (Level entities)))
 
 ;; Hot path — arena allocated, no GC pauses
 (defn update-physics ((world : World)) : Unit

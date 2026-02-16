@@ -38,8 +38,19 @@ Remaining design questions organized by topic. See individual design documents f
 | String formatting | `format` macro (compile-time checked) + `str` function |
 | Record access | Coalton-style `.field` accessor functions |
 | Type definition forms | `deftype` for sum types, `defstruct` for product types |
+| Struct construction | Type name is constructor; positional and named args |
 | Control flow | `if` (else required when used as expression), `cond` (else required), `when`/`unless` |
 | Unit type | `Unit` — the "no meaningful value" type |
+| Mutation | `mut` for reassignable bindings, `ref` for mutable references |
+| Error handling | `Result` type + `?` propagation + `From` for error conversion |
+| Lambdas | `(fn (params) body)`, capture by reference |
+| FFI | C FFI via `extern "C"` + `unsafe`; safe Rust wrappers for stdlib |
+| Numeric types | Full set (i8–i64, u8–u64, f32, f64); defaults i32/f64 |
+| Prelude | Implicit; core types, typeclasses, and operations |
+| REPL | Another runtime client (like editor/LSP); implicit module |
+| Type assertion | `(ann type expr)` — disambiguation, not casting |
+| Block expressions | Implicit sequencing in bodies; explicit `do` block |
+| Threading | `->` (thread-first) and `->>` (thread-last) |
 
 ---
 
@@ -65,7 +76,6 @@ Remaining design questions organized by topic. See individual design documents f
 - Functional dependency syntax in S-expressions
 - Kind system design (at least `*` and `* -> *`)
 - Numeric typeclass hierarchy
-- Interior mutability patterns vs whole-binding mutability
 
 ### Macro system
 - Macro definition syntax/API (quasiquoting? pattern-based? procedural?)
@@ -75,7 +85,11 @@ Remaining design questions organized by topic. See individual design documents f
 - Side effects during expansion policy
 
 ### Syntax
-- (No remaining open questions)
+
+- Functional update syntax for structs (creating modified copies without `ref`)
+- Named arguments + threading macro interaction
+
+- `pub` modifier syntax (revisit with more examples)
 
 ---
 

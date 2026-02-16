@@ -1,6 +1,19 @@
 # Design Philosophy
 
-Core principles that guide all design decisions for Weirlang.
+Core principles that guide all design decisions for Weir.
+
+## The name
+
+A **weir** is a low dam built across a river to control water flow. It doesn't block the river — it guides it. Water still flows freely, but the weir shapes where it goes, prevents flooding, and creates predictable behavior downstream.
+
+This is the language's design philosophy in physical form:
+
+- **Controls flow without stopping it** — guard rails that prevent bugs without preventing expressiveness
+- **An engineering structure, not a wall** — practical, purposeful constraints that make the system more useful, not more restrictive
+- **Predictable downstream behavior** — static types, exhaustive matching, and clear error handling mean you know what to expect
+- **The water still flows** — Lisp's expressive power, live reloading, and fast iteration are preserved
+
+File extension: `.weir`
 
 ## Guard rails are a feature
 

@@ -12,7 +12,7 @@
 | Typeclass constraints | Prefix with `=>`: `(=> (Eq 'a) ...)` |
 | Pattern matching | Each case wrapped in parens |
 | Record field access | Coalton-style `.field` accessor functions |
-| Mutability | `mut` keyword in binding form |
+| Mutability | `mut` for reassignable bindings, `ref` for mutable references |
 | Collection literals | `[]` for arrays/vectors, `{}` for maps |
 | Functions | Multi-argument (not curried) |
 | String formatting | `format` macro (compile-time checked) + `str` function |
@@ -28,8 +28,13 @@
 | Control flow | `if` (else required when result used), `cond` (else required), `when`/`unless` |
 | Unit type | `Unit` — the "no meaningful value" type, returned by side-effecting functions |
 | Type definition forms | Separate: `deftype` for sum types (enums), `defstruct` for product types (structs) |
-| Type assertion | `(as type expr)` — inline type annotation for disambiguation, not casting |
+| Struct construction | Type name is constructor; supports positional and named args (same as functions) |
+| Type assertion | `(ann type expr)` — inline type annotation for disambiguation, not casting |
 | Block expressions | Implicit sequencing in bodies; explicit `do` block available for expressions |
+| Error handling | `Result` type + `?` propagation operator; errors visible in type signatures |
+| Lambdas | `(fn (params) body)`, mirrors `defn`; capture by reference (standard for GC'd languages) |
+| FFI | C FFI via `extern "C"` + safe Rust-implemented wrappers; raw C calls require `unsafe` block |
+| Numeric types | Full set (`i8`–`i64`, `u8`–`u64`, `f32`, `f64`); defaults: `i32` for integers, `f64` for floats |
 
 ## Type declarations
 
@@ -156,12 +161,19 @@ Coalton-style: `.field` is a first-class accessor function.
 
 ## Mutability syntax
 
-`mut` keyword in the binding form. `set!` for mutation (Scheme convention — `!` suffix signals mutation).
+Two distinct concepts, two distinct keywords:
+
+- **`mut`** — the local binding is reassignable. Value semantics. The caller's data is never affected.
+- **`ref`** — a mutable reference. The function can modify the caller's data in place.
+
+`set!` for mutation (Scheme convention — `!` suffix signals mutation).
+
+### `mut` — reassignable bindings
 
 ```lisp
 ;; Immutable (default)
 (let ((x 5))
-  ;; x cannot be mutated
+  ;; x cannot be reassigned
   (+ x 1))
 
 ;; Mutable — explicit opt-in
@@ -175,11 +187,53 @@ Coalton-style: `.field` is a first-class accessor function.
   x)
 ```
 
-For the parser: a binding is one of:
+### `ref` — mutable references
+
+For functions that need to modify the caller's data in place. The caller must pass a `mut` binding.
+
+```lisp
+;; Function takes a mutable reference
+(defn damage ((ref e : Enemy) (amount : i32)) : Unit
+  (set! (.health e) (- (.health e) amount)))
+
+;; Caller must have a mut binding
+(let ((mut e (spawn-enemy :pos (vec2 0 0) :health 100 :state Idle)))
+  (damage e 10)    ;; e.health is now 90
+  (.health e))     ;; => 90
+```
+
+Field mutation via `set!` is only valid through a `ref` parameter. Without `ref`, struct fields are read-only:
+
+```lisp
+;; Immutable binding — can read fields, not mutate them
+(let ((e (spawn-enemy ...)))
+  (.health e)                          ;; OK — read
+  (set! (.health e) 50))              ;; COMPILE ERROR — e is not a mutable reference
+
+;; mut binding without ref — can reassign the whole binding, not individual fields
+(let ((mut e (spawn-enemy ...)))
+  (set! e (spawn-enemy ...))           ;; OK — reassign entire binding
+  (set! (.health e) 50))              ;; COMPILE ERROR — use ref in a function to mutate fields
+```
+
+### Summary
+
+| Keyword | Meaning | Field mutation? | Caller affected? |
+|---|---|---|---|
+| (none) | Immutable binding | No | No |
+| `mut` | Reassignable binding | No | No |
+| `ref` (in params) | Mutable reference | Yes, via `set!` | Yes |
+
+For the parser, a binding is one of:
 - `(name value)` — immutable, type inferred
-- `(mut name value)` — mutable, type inferred
+- `(mut name value)` — reassignable, type inferred
 - `((name : type) value)` — immutable, type annotated
-- `((mut name : type) value)` — mutable, type annotated
+- `((mut name : type) value)` — reassignable, type annotated
+
+A function parameter is one of:
+- `(name : type)` — immutable
+- `(mut name : type)` — reassignable local copy
+- `(ref name : type)` — mutable reference to caller's data
 
 ## Collection literals
 
@@ -282,23 +336,48 @@ Inserts the previous result as the **last** argument. Natural for collection pip
 
 `as->` (bind-to-name threading) intentionally omitted — a `let` binding covers those rare cases.
 
-## Type assertion (`as`)
+## Type assertion (`ann`)
 
-`as` is an inline type annotation that constrains inference — it tells the compiler which type to pick when multiple are valid. It is **not** casting or coercion: no runtime conversion happens. If the expression can't be the asserted type, it's a compile error.
+`ann` (annotate) is an inline type annotation that constrains inference — it tells the compiler which type to pick when multiple are valid. It is **not** casting or coercion: no runtime conversion happens. If the expression can't be the asserted type, it's a compile error.
 
 ```lisp
 ;; Disambiguate numeric literals
-(as i32 42)
-(as f32 (* delta speed))
+(ann i32 42)
+(ann f32 (* delta speed))
 
 ;; Pin a polymorphic return type
-(as (List Enemy) (filter alive? entities))
+(ann (List Enemy) (filter alive? entities))
 
 ;; Compile error — not a conversion:
-(as String 42)  ;; Error: i32 is not String
+(ann String 42)  ;; Error: i32 is not String
 ```
 
 For actual type conversion, use explicit conversion functions or typeclass methods (e.g., a `From`/`Into` pattern).
+
+## Numeric types
+
+Full set of fixed-size numeric types, matching Rust/C for FFI completeness:
+
+| Category | Types |
+|---|---|
+| Signed integers | `i8`, `i16`, `i32`, `i64` |
+| Unsigned integers | `u8`, `u16`, `u32`, `u64` |
+| Floating point | `f32`, `f64` |
+
+### Defaults for unadorned literals
+
+- Integer literals (`42`, `-7`) default to `i32`
+- Float literals (`3.14`, `-0.5`) default to `f64`
+- Use `ann` to disambiguate when needed: `(ann f32 3.14)`, `(ann u8 255)`
+
+```lisp
+(let ((x 42))          ;; x : i32 (default)
+     ((y 3.14))        ;; y : f64 (default)
+     ((z (ann f32 3.14)))  ;; z : f32 (explicit)
+  ...)
+```
+
+Numeric conversions are explicit — no implicit widening or narrowing. Use conversion functions or a `From`/`Into` typeclass.
 
 ## Module system
 
@@ -311,6 +390,17 @@ src/game/physics.weir   →  module game.physics
 src/math/vec2.weir      →  module math.vec2
 src/main.weir           →  entry point
 ```
+
+### Prelude
+
+An implicit prelude is automatically in scope for all modules — no import needed. Contents will be built up during implementation, but expected to include:
+
+- Primitive types: all numeric types, `Bool`, `String`, `Unit`
+- Core ADTs: `Option` (`Some`, `None`), `Result` (`Ok`, `Err`)
+- Core typeclasses: `Eq`, `Ord`, `Show`, `From`, `Shareable`
+- Basic operations: arithmetic, comparison, boolean logic
+- Collection types: `List`, `Array`, `Map`
+- I/O: `println`, `print`
 
 ### Imports
 
@@ -420,6 +510,21 @@ Separate forms for sum types and product types, following Coalton's pattern.
 
 No `fields` keyword needed — `defstruct` is unambiguous. Fields always have names and types.
 
+### Struct construction
+
+The type name is automatically a constructor function. Supports both positional and named arguments, consistent with regular function calls:
+
+```lisp
+;; Positional (fine for small structs)
+(Vec2 1.0 2.0)
+
+;; Named (better for larger structs)
+(Enemy :pos (vec2 0 0) :health 100 :state Idle)
+
+;; Mixed (positional first, then named)
+(Enemy (vec2 0 0) :health 100 :state Idle)
+```
+
 ## Bringing it all together
 
 What Weirlang code looks like:
@@ -459,8 +564,8 @@ What Weirlang code looks like:
 ;; Function with types
 (defn spawn-wave ((n : i32) (origin : Vec2)) : (List Enemy)
   (map (fn (i)
-         (make-enemy
-           :pos (vec2 (+ (.x origin) (* (the f32 i) 32.0)) (.y origin))
+         (Enemy
+           :pos (vec2 (+ (.x origin) (* (ann f32 i) 32.0)) (.y origin))
            :health 100
            :state Idle))
        (range n)))
@@ -615,3 +720,121 @@ An explicit `do` block is available for contexts where you need to sequence mult
       (branch-a))
   (branch-b))
 ```
+
+## Lambdas / closures
+
+Lambda syntax mirrors `defn` without the name. Type annotations are optional (usually inferred from context).
+
+```lisp
+;; Type-inferred (common)
+(fn (x) (+ x 1))
+
+;; Type-annotated
+(fn ((x : i32)) : i32 (+ x 1))
+
+;; Multi-arg
+(fn ((x : i32) (y : i32)) (+ x y))
+
+;; Multi-expression body (implicit sequencing)
+(fn (e)
+  (println (.name e))
+  (.health e))
+```
+
+### Capture semantics
+
+Closures capture by reference — the closure shares the variable with its enclosing scope. This is the standard for GC'd languages (no lifetime concerns). Changes to a `mut` binding in the enclosing scope are visible to the closure and vice versa.
+
+```lisp
+(let ((mut x 5))
+  (let ((f (fn () x)))
+    (set! x 10)
+    (f)))           ;; => 10
+```
+
+Thread safety is handled by the `Shareable` typeclass, not the capture mechanism: a closure that captures a `mut` binding is not `Shareable` and cannot be sent across threads. This is a compile-time check.
+
+## Error handling
+
+Errors are values, represented by the `Result` type. Functions that can fail declare this in their return type. The `?` operator propagates errors up the call stack.
+
+```lisp
+;; Function that can fail — Result in return type
+(defn load-level ((path : String)) : (Result Level IOError)
+  (let ((data (read-file path)?)            ;; ? propagates IOError on failure
+        (entities (parse-entities data)?))
+    (Ok (Level entities))))
+
+;; Callers must handle the Result
+(match (load-level "level1.weir")
+  ((Ok level) (start level))
+  ((Err e) (show-error e)))
+```
+
+The `?` operator on a `(Result 'a 'err)` expression:
+- If `(Ok val)` → unwraps to `val`, execution continues
+- If `(Err e)` → immediately returns `(Err e)` from the enclosing function
+
+For functions that can produce multiple error types, a `From` typeclass enables automatic error conversion at `?` sites:
+
+```lisp
+;; GameError can be constructed from IOError or ParseError
+(instance (From IOError GameError) ...)
+(instance (From ParseError GameError) ...)
+
+;; ? automatically converts via From
+(defn load-level ((path : String)) : (Result Level GameError)
+  (let ((data (read-file path)?)            ;; IOError → GameError via From
+        (entities (parse-entities data)?))   ;; ParseError → GameError via From
+    (Ok (Level entities))))
+```
+
+This keeps errors visible in type signatures — you can never accidentally ignore a fallible operation. Aligns with the guard rails philosophy.
+
+## FFI (Foreign Function Interface)
+
+Two layers: raw C FFI for binding external libraries, and safe Rust-implemented wrappers for common functionality.
+
+### C FFI
+
+Declare external C functions with `extern "C"`. Calling them requires an `unsafe` block — C code can violate all of Weirlang's safety guarantees.
+
+```lisp
+;; Declare external C functions
+(extern "C"
+  (defn SDL_Init ((flags : u32)) : i32)
+  (defn SDL_CreateWindow ((title : CString) (x : i32) (y : i32)
+                          (w : i32) (h : i32) (flags : u32)) : (Ptr SDL_Window)))
+
+;; Must wrap calls in unsafe
+(unsafe
+  (SDL_Init SDL_INIT_VIDEO)
+  (let ((window (SDL_CreateWindow "My Game" 0 0 800 600 0)))
+    ...))
+```
+
+### Safe Rust wrappers (primary interface)
+
+The standard library and runtime are implemented in Rust. These provide safe abstractions over I/O, graphics, networking, etc. No `unsafe` needed — the Rust compiler already enforces safety on that side.
+
+```lisp
+;; These are safe — implemented in Rust, linked into the runtime
+(let ((window (create-window "My Game" 800 600)))
+  (println "Window created"))
+```
+
+### What `unsafe` means in Weirlang
+
+`unsafe` is narrower than in Rust. It means: "I'm calling code that the Weirlang compiler can't verify." Specifically:
+- Calling `extern "C"` functions
+- Calling Rust functions explicitly marked `unsafe`
+
+Safe Rust code (the vast majority of the runtime/stdlib) does not require `unsafe` — the Rust compiler already guarantees safety. The expected pattern: C FFI lives behind safe wrapper libraries. Most developers never write `unsafe`.
+
+## Open questions
+
+
+- Functional update syntax for structs (creating modified copies without `ref`)
+- Named arguments + threading macro interaction (where does threaded value go?)
+
+- `pub` modifier syntax (wrapper vs inline modifier — revisit with more examples)

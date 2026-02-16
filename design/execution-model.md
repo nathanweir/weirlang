@@ -108,3 +108,21 @@ Old compiled code stays in memory after redefinition. Can be deferred initially 
 - What's the compilation unit for incremental recompilation? Per-function is most flexible but more dependency tracker overhead.
 - How important is it that dev mode and release mode produce identical behavior?
 - How should the cascade recompiler communicate with the developer? (LSP inline errors? Runtime warnings? Dedicated UI?)
+- FFI decided: C FFI via `extern "C"` + `unsafe` blocks; safe Rust-implemented wrappers for stdlib. See syntax.md.
+## REPL and interactive development
+
+The REPL is not architecturally special — it's another client of the same runtime that the editor/LSP uses. The runtime already accepts code, compiles it via Cranelift, and executes it. The REPL is a text interface to that mechanism; the editor (via LSP) is a richer one.
+
+- The REPL acts as an implicit module. Definitions accumulate during the session.
+- `defn` at the REPL requires type signatures, same as in source files.
+- Bare expressions are evaluated with full local type inference — `(+ 1 2)` just works. This isn't a REPL-specific relaxation; it's how inference already works for expressions everywhere.
+- Definitions entered at the REPL participate in the same live-reloading cascade as file-based code.
+
+### Tooling
+
+Primary interactive development interface is the **editor + LSP**, not the REPL. The REPL is a complement, not the centerpiece (unlike the Emacs/SLIME model). Planned tooling:
+
+- **LSP language server** — primary interface for live reloading, errors, completions
+- **Editor extensions** (Zed initially) — first-class editor support from day one
+- **DAP debugger** — under consideration for interactive debugging
+- **REPL** — available for exploration, testing, and scripting
