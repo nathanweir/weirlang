@@ -1,0 +1,15 @@
+---
+source: crates/weir-parser/src/lib.rs
+expression: result
+---
+(defn main
+  params:
+  returns: Unit
+  body:
+    (let
+      bindings:
+        f = (fn (x) (+ x 1))
+      body:
+        (println (f 5))
+    )
+)

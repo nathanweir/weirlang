@@ -1,0 +1,16 @@
+---
+source: crates/weir-parser/src/lib.rs
+expression: result
+---
+(defn main
+  params:
+  returns: Unit
+  body:
+    (let
+      bindings:
+        x = 5
+        y = 10
+      body:
+        (+ x y)
+    )
+)

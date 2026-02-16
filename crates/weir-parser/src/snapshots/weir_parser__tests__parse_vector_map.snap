@@ -1,0 +1,16 @@
+---
+source: crates/weir-parser/src/lib.rs
+expression: result
+---
+(defn main
+  params:
+  returns: Unit
+  body:
+    (let
+      bindings:
+        v = [1 2 3]
+        m = {":name" "Alice" ":age" 30}
+      body:
+        (println v)
+    )
+)

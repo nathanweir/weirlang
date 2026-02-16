@@ -1,0 +1,11 @@
+[package]
+name = "weir-lexer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+logos.workspace = true
+smol_str.workspace = true
+
+[dev-dependencies]
+insta.workspace = true

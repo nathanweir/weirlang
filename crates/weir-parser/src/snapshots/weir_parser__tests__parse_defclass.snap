@@ -1,0 +1,9 @@
+---
+source: crates/weir-parser/src/lib.rs
+expression: result
+---
+(defclass Show
+  type-params: 'a
+  methods:
+    show : (Fn ['a] String)
+)

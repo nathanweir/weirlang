@@ -1,0 +1,12 @@
+---
+source: crates/weir-parser/src/lib.rs
+expression: result
+---
+(defn show-option
+  params:
+    opt
+  body:
+    (match opt
+      ((Some val) (println val))
+      (None (println "none")))
+)

@@ -1,0 +1,15 @@
+[package]
+name = "weir-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "weir"
+path = "src/main.rs"
+
+[dependencies]
+weir-lexer.workspace = true
+weir-parser.workspace = true
+weir-ast.workspace = true
+clap.workspace = true
+miette = { workspace = true, features = ["fancy"] }

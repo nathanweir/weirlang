@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/weir-lexer",
+    "crates/weir-parser",
+    "crates/weir-ast",
+    "crates/weir-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+# Lexer
+logos = "0.15"
+
+# AST infrastructure
+la-arena = "0.3"
+smol_str = "0.3"
+
+# Error reporting
+miette = { version = "7", features = ["fancy"] }
+thiserror = "2"
+
+# Testing
+insta = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Internal crates
+weir-lexer = { path = "crates/weir-lexer" }
+weir-parser = { path = "crates/weir-parser" }
+weir-ast = { path = "crates/weir-ast" }

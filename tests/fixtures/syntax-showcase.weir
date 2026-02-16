@@ -1,0 +1,62 @@
+;; Syntax showcase - exercises most of the Weir syntax
+
+;; Sum type
+(deftype (Option 'a)
+  (Some 'a)
+  None)
+
+;; Struct
+(defstruct Vec2
+  (x : f32)
+  (y : f32))
+
+;; Typeclass
+(defclass (Show 'a)
+  (show : (Fn ['a] String)))
+
+;; Instance
+(instance (Show Vec2)
+  (defn show (v)
+    (str "(" (.x v) ", " (.y v) ")")))
+
+;; Public function with types
+(pub defn add ((x : i32) (y : i32)) : i32
+  (+ x y))
+
+;; Function with let, mut, set!, match, cond, when
+(defn demo () : Unit
+  (let ((x 5)
+        (mut counter 0))
+    (set! counter (+ counter 1))
+
+    ;; If expression
+    (if (> x 0)
+      (println "positive")
+      (println "non-positive"))
+
+    ;; Match
+    (match (Some 42)
+      ((Some val) (println val))
+      (None (println "nothing")))
+
+    ;; Cond
+    (cond
+      ((< x 0) "negative")
+      ((= x 0) "zero")
+      (else "positive"))
+
+    ;; When / unless
+    (when (> counter 0)
+      (println "counter is positive"))
+
+    ;; Lambda
+    (let ((f (fn (n) (+ n 1))))
+      (f 10))
+
+    ;; Threading
+    (-> x add add)
+
+    ;; Collections
+    (let ((v [1 2 3])
+          (m {:name "Alice" :age 30}))
+      (println v))))

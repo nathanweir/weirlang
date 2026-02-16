@@ -92,33 +92,33 @@ Run `just test` on every commit. Tests must pass before merging.
 ## Phases
 
 ### Phase 0: Project scaffold
-- [ ] Create `flake.nix` with Rust toolchain (stable), `just`, and dev tools
-- [ ] Create `.envrc` for direnv
-- [ ] Create `Justfile` with recipes: `build`, `test`, `run`, `clean`, `check`, `fmt`, `clippy`
-- [ ] Create Cargo workspace with initial crates: `weir-lexer`, `weir-parser`, `weir-ast`, `weir-cli`
-- [ ] Set up `insta` for snapshot testing
-- [ ] Create initial tree-sitter grammar skeleton (`tree-sitter-weir/`) — basic S-expression grammar adapted from existing Lisp grammars, extended for `[]` and `{}`
-- [ ] Verify: `just build` compiles, `just test` runs (even if no real tests yet)
+- [x] Create `flake.nix` with Rust toolchain (stable), `just`, and dev tools
+- [x] Create `.envrc` for direnv
+- [x] Create `Justfile` with recipes: `build`, `test`, `run`, `clean`, `check`, `fmt`, `clippy`
+- [x] Create Cargo workspace with initial crates: `weir-lexer`, `weir-parser`, `weir-ast`, `weir-cli`
+- [x] Set up `insta` for snapshot testing
+- [ ] Create initial tree-sitter grammar skeleton (`tree-sitter-weir/`) — *skipped for now; not needed until Phase 6 (editor tooling)*
+- [x] Verify: `just build` compiles, `just test` runs (even if no real tests yet)
 
 ### Phase 1: Lexer + Parser
-- [ ] **Lexer** (`weir-lexer`): tokenize Weir source into token stream
+- [x] **Lexer** (`weir-lexer`): tokenize Weir source into token stream
   - Tokens: `(`, `)`, `[`, `]`, `{`, `}`, integers, floats, strings, symbols, keywords (`:name`), type variables (`'a`), comments (`;`), `?`, `.field`
   - Use `logos` for token definitions
   - Track source spans for error reporting
-- [ ] **AST** (`weir-ast`): define AST node types
+- [x] **AST** (`weir-ast`): define AST node types
   - Top-level: `Defn`, `Deftype`, `Defstruct`, `Defclass`, `Instance`, `Import`, `Declare`, `ExternC`
   - Expressions: `Lit`, `Var`, `Call`, `Let`, `If`, `Cond`, `When`, `Unless`, `Match`, `Fn`, `Do`, `Set!`, `Ann`, `FieldAccess`, `VectorLit`, `MapLit`, `Thread`, `Unsafe`
   - Patterns: `Wildcard`, `Var`, `Constructor`, `Literal`, `StructDestructure`
   - Types: `Named`, `Fn`, `Applied`, `TypeVar`, `Constrained`
-  - Use `la-arena` for ID-based nodes, `string-interner` for identifiers
-- [ ] **Parser** (`weir-parser`): hand-written recursive descent
+  - Use `la-arena` for ID-based nodes, `smol_str` for identifiers
+- [x] **Parser** (`weir-parser`): hand-written recursive descent
   - Parse S-expressions into AST
   - Error recovery: on parse error, skip to next top-level form
   - Track source spans on all nodes
-- [ ] **Snapshot tests**: parse fixtures, snapshot AST pretty-print
-- [ ] **Property tests**: parser never panics on arbitrary input
-- [ ] **CLI** (`weir-cli`): `weir parse <file>` — dump parsed AST
-- [ ] Verify: can parse the example code from design/syntax.md
+- [x] **Snapshot tests**: parse fixtures, snapshot AST pretty-print (18 snapshot tests)
+- [ ] **Property tests**: parser never panics on arbitrary input — *deferred; will add with `proptest`*
+- [x] **CLI** (`weir-cli`): `weir parse <file>` — dump parsed AST
+- [x] Verify: can parse the example code from design/syntax.md (via `syntax-showcase.weir` fixture)
 
 ### Phase 2: Tree-walking interpreter
 - [ ] **Interpreter** (`weir-interp`): evaluate AST directly

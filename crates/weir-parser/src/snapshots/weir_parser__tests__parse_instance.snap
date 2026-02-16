@@ -1,0 +1,12 @@
+---
+source: crates/weir-parser/src/lib.rs
+expression: result
+---
+(instance Show i32
+  (defn show
+    params:
+      x
+    body:
+      (str x)
+  )
+)

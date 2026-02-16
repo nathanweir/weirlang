@@ -1,0 +1,12 @@
+[package]
+name = "weir-ast"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+la-arena.workspace = true
+smol_str.workspace = true
+weir-lexer.workspace = true
+
+[dev-dependencies]
+insta.workspace = true

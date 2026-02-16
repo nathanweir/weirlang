@@ -1,0 +1,12 @@
+---
+source: crates/weir-parser/src/lib.rs
+expression: result
+---
+(defn pub add
+  params:
+    x : i32
+    y : i32
+  returns: i32
+  body:
+    (+ x y)
+)
