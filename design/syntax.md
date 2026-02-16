@@ -17,7 +17,7 @@
 | Functions | Multi-argument (not curried) |
 | String formatting | `format` macro (compile-time checked) + `str` function |
 | Comments | `;` line comments, docstrings in definitions |
-| Pipe/threading | `->` threading macro; also used for chained field access |
+| Pipe/threading | `->` (thread-first) and `->>` (thread-last); `->` also used for chained field access |
 | Module system | File = module, `import` at top-level, compiler resolves order |
 | Visibility | Private by default, `pub` modifier per definition (Rust-style) |
 | Circular imports | Disallowed (compile error) |
@@ -28,6 +28,8 @@
 | Control flow | `if` (else required when result used), `cond` (else required), `when`/`unless` |
 | Unit type | `Unit` — the "no meaningful value" type, returned by side-effecting functions |
 | Type definition forms | Separate: `deftype` for sum types (enums), `defstruct` for product types (structs) |
+| Type assertion | `(as type expr)` — inline type annotation for disambiguation, not casting |
+| Block expressions | Implicit sequencing in bodies; explicit `do` block available for expressions |
 
 ## Type declarations
 
@@ -249,16 +251,13 @@ No CL-style destination argument. Printing and formatting are separate concerns.
 
 ## Pipe / threading operators
 
-The `->` threading macro inserts the previous result as the first argument to each subsequent form. Also serves as the primary mechanism for chained field access, avoiding nested `.field` calls:
+Two threading macros: `->` (thread-first) and `->>` (thread-last).
+
+### `->` (thread-first)
+
+Inserts the previous result as the **first** argument to each subsequent form. Primary mechanism for chained field access and object-like pipelines:
 
 ```lisp
-;; Data transformation pipeline
-(-> data
-    (filter even?)
-    (map square)
-    (take 10))
-;; Expands to: (take (map (filter data even?) square) 10)
-
 ;; Chained field access (instead of (.x (.pos enemy)))
 (-> enemy .pos .x)
 
@@ -269,7 +268,37 @@ The `->` threading macro inserts the previous result as the first argument to ea
     (map .pos))
 ```
 
-Specific threading variants (`->`, `->>`, `as->`) TBD.
+### `->>` (thread-last)
+
+Inserts the previous result as the **last** argument. Natural for collection pipelines where the data argument is conventionally last:
+
+```lisp
+(->> (range 100)
+     (filter even?)
+     (map square)
+     (take 10))
+;; Expands to: (take (map (filter (range 100) even?) square) 10)
+```
+
+`as->` (bind-to-name threading) intentionally omitted — a `let` binding covers those rare cases.
+
+## Type assertion (`as`)
+
+`as` is an inline type annotation that constrains inference — it tells the compiler which type to pick when multiple are valid. It is **not** casting or coercion: no runtime conversion happens. If the expression can't be the asserted type, it's a compile error.
+
+```lisp
+;; Disambiguate numeric literals
+(as i32 42)
+(as f32 (* delta speed))
+
+;; Pin a polymorphic return type
+(as (List Enemy) (filter alive? entities))
+
+;; Compile error — not a conversion:
+(as String 42)  ;; Error: i32 is not String
+```
+
+For actual type conversion, use explicit conversion functions or typeclass methods (e.g., a `From`/`Into` pattern).
 
 ## Module system
 
@@ -395,6 +424,7 @@ No `fields` keyword needed — `defstruct` is unambiguous. Fields always have na
 
 What Weirlang code looks like:
 
+```lisp
 ;; Enum with data
 (deftype EnemyState
   Idle
@@ -562,11 +592,26 @@ Always return `Unit`. No else branch. Makes intent clear: "I only care about thi
   (println (format "Hello, {}!" name)))
 ```
 
-## Open questions
+## Block expressions
 
-- Exact `deftype` syntax for structs vs enums (unified or separate forms?)
-- Destructuring in let bindings and function parameters
-- `cond` / `if` / `when` syntax (standard Lisp forms, but exact details)
-- Pipe/threading operator variants (`->` vs `->>` vs `as->`)
-- Whether `the` (explicit type annotation on expression) is needed
-- Block expressions (implicit `progn`/`do` in function bodies?)
+Function bodies, `let` bodies, `when`/`unless` bodies, and lambda bodies implicitly sequence multiple expressions. The last expression is the return value. This is standard Lisp behavior.
+
+```lisp
+(defn update-enemy ((mut e : Enemy)) : Unit
+  (set! (.health e) (- (.health e) 1))
+  (set! (.pos e) (move (.pos e)))
+  (check-death e))
+
+(let ((x 5))
+  (println x)
+  (+ x 1))  ;; returns 6
+```
+
+An explicit `do` block is available for contexts where you need to sequence multiple expressions inside a single-expression position (e.g., one branch of an `if`):
+
+```lisp
+(if condition
+  (do (log "taking branch A")
+      (branch-a))
+  (branch-b))
+```

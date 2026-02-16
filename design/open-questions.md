@@ -37,6 +37,9 @@ Remaining design questions organized by topic. See individual design documents f
 | Collection literals | `[]` for arrays/vectors, `{}` for maps |
 | String formatting | `format` macro (compile-time checked) + `str` function |
 | Record access | Coalton-style `.field` accessor functions |
+| Type definition forms | `deftype` for sum types, `defstruct` for product types |
+| Control flow | `if` (else required when used as expression), `cond` (else required), `when`/`unless` |
+| Unit type | `Unit` — the "no meaningful value" type |
 
 ---
 
@@ -72,14 +75,7 @@ Remaining design questions organized by topic. See individual design documents f
 - Side effects during expansion policy
 
 ### Syntax
-- Exact `deftype` syntax: unified form for structs/enums, or separate?
-- Named/keyword arguments in function calls
-- Module/namespace system (`module`, `import`, qualified names)
-- Destructuring in let bindings and function parameters
-- Control flow forms (`cond`, `if`, `when`)
-- Pipe/threading operator specifics
-- Whether `the` (inline type annotation on expressions) is needed
-- Block expressions / implicit `progn`
+- (No remaining open questions)
 
 ---
 
