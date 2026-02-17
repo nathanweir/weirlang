@@ -12,6 +12,8 @@ use crate::document::Document;
 use crate::formatting;
 use crate::hover;
 use crate::inlay_hints;
+use crate::semantic_tokens;
+use crate::signature_help;
 use crate::symbols;
 
 pub struct WeirLspBackend {
@@ -65,6 +67,11 @@ impl LanguageServer for WeirLspBackend {
                     trigger_characters: Some(vec!["(".into(), ".".into()]),
                     ..Default::default()
                 }),
+                signature_help_provider: Some(SignatureHelpOptions {
+                    trigger_characters: Some(vec!["(".into(), " ".into()]),
+                    retrigger_characters: Some(vec![" ".into()]),
+                    work_done_progress_options: Default::default(),
+                }),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
@@ -74,6 +81,16 @@ impl LanguageServer for WeirLspBackend {
                 })),
                 inlay_hint_provider: Some(OneOf::Left(true)),
                 document_formatting_provider: Some(OneOf::Left(true)),
+                semantic_tokens_provider: Some(
+                    SemanticTokensServerCapabilities::SemanticTokensOptions(
+                        SemanticTokensOptions {
+                            legend: semantic_tokens::legend(),
+                            full: Some(SemanticTokensFullOptions::Bool(true)),
+                            range: None,
+                            work_done_progress_options: Default::default(),
+                        },
+                    ),
+                ),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -139,6 +156,29 @@ impl LanguageServer for WeirLspBackend {
             &analysis.type_result,
             &analysis.expanded_source,
             &analysis.expanded_line_index,
+            offset,
+        ))
+    }
+
+    async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+
+        let docs = self.documents.lock().unwrap();
+        let doc = match docs.get(uri) {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+
+        let analysis = match &doc.analysis {
+            Some(a) => a,
+            None => return Ok(None),
+        };
+
+        let offset = analysis.expanded_line_index.position_to_offset(position);
+        Ok(signature_help::signature_help(
+            &analysis.module,
+            &analysis.type_result,
             offset,
         ))
     }
@@ -276,6 +316,7 @@ impl LanguageServer for WeirLspBackend {
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         let uri = &params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
 
         let docs = self.documents.lock().unwrap();
         let doc = match docs.get(uri) {
@@ -288,7 +329,13 @@ impl LanguageServer for WeirLspBackend {
             None => return Ok(None),
         };
 
-        let items = completion::completions(&analysis.module);
+        let offset = analysis.expanded_line_index.position_to_offset(position);
+        let items = completion::completions(
+            &analysis.module,
+            Some(&analysis.type_result),
+            Some(&analysis.symbol_index),
+            Some(offset),
+        );
         Ok(Some(CompletionResponse::Array(items)))
     }
 
@@ -349,5 +396,35 @@ impl LanguageServer for WeirLspBackend {
             params.range,
         );
         Ok(Some(hints))
+    }
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> Result<Option<SemanticTokensResult>> {
+        let uri = &params.text_document.uri;
+
+        let docs = self.documents.lock().unwrap();
+        let doc = match docs.get(uri) {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+
+        let analysis = match &doc.analysis {
+            Some(a) => a,
+            None => return Ok(None),
+        };
+
+        let tokens = semantic_tokens::semantic_tokens(
+            &analysis.module,
+            &analysis.type_result,
+            &analysis.expanded_source,
+            &analysis.expanded_line_index,
+        );
+
+        Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+            result_id: None,
+            data: tokens,
+        })))
     }
 }

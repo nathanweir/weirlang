@@ -1,59 +1,124 @@
 use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind};
 use weir_ast::{Item, Module};
+use weir_typeck::TypeCheckResult;
 
-/// Collect completion items from module definitions, builtins, and keywords.
-pub fn completions(module: &Module) -> Vec<CompletionItem> {
+use crate::index::{SymbolIndex, SymbolKind};
+
+/// Collect completion items from module definitions, builtins, keywords,
+/// and local variables visible at `offset` (when a symbol index is provided).
+pub fn completions(
+    module: &Module,
+    type_result: Option<&TypeCheckResult>,
+    symbol_index: Option<&SymbolIndex>,
+    offset: Option<u32>,
+) -> Vec<CompletionItem> {
     let mut items = Vec::new();
 
     // Top-level definitions
     for (item, _span) in &module.items {
         match item {
             Item::Defn(d) => {
+                let detail = type_result
+                    .and_then(|tr| tr.fn_types.get(d.name.as_str()))
+                    .map(|ft| format_fn_type(&ft.param_types, &ft.return_type));
                 items.push(CompletionItem {
                     label: d.name.to_string(),
                     kind: Some(CompletionItemKind::FUNCTION),
+                    detail,
                     ..Default::default()
                 });
             }
             Item::Deftype(d) => {
+                let detail = if d.type_params.is_empty() {
+                    None
+                } else {
+                    Some(format!(
+                        "({})",
+                        std::iter::once(d.name.as_str())
+                            .chain(d.type_params.iter().map(|p| p.as_str()))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    ))
+                };
                 items.push(CompletionItem {
                     label: d.name.to_string(),
                     kind: Some(CompletionItemKind::ENUM),
+                    detail,
                     ..Default::default()
                 });
                 // Variant constructors
                 for v in &d.variants {
+                    let detail = if v.fields.is_empty() {
+                        Some(d.name.to_string())
+                    } else {
+                        Some(format!(
+                            "{} -> {}",
+                            v.fields
+                                .iter()
+                                .map(|f| format_type_expr(module, *f))
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            d.name
+                        ))
+                    };
                     items.push(CompletionItem {
                         label: v.name.to_string(),
                         kind: Some(CompletionItemKind::ENUM_MEMBER),
+                        detail,
                         ..Default::default()
                     });
                 }
             }
             Item::Defstruct(d) => {
+                let fields: String = d
+                    .fields
+                    .iter()
+                    .map(|f| f.name.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 items.push(CompletionItem {
                     label: d.name.to_string(),
                     kind: Some(CompletionItemKind::STRUCT),
+                    detail: Some(format!("{{ {} }}", fields)),
                     ..Default::default()
                 });
             }
             Item::Defclass(d) => {
+                let methods: String = d
+                    .methods
+                    .iter()
+                    .map(|m| m.name.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 items.push(CompletionItem {
                     label: d.name.to_string(),
                     kind: Some(CompletionItemKind::INTERFACE),
+                    detail: Some(format!("class: {}", methods)),
                     ..Default::default()
                 });
+                // Class methods as completion items
+                for method in &d.methods {
+                    let detail = type_result
+                        .and_then(|tr| tr.fn_types.get(method.name.as_str()))
+                        .map(|ft| format_fn_type(&ft.param_types, &ft.return_type));
+                    items.push(CompletionItem {
+                        label: method.name.to_string(),
+                        kind: Some(CompletionItemKind::METHOD),
+                        detail,
+                        ..Default::default()
+                    });
+                }
             }
             _ => {}
         }
     }
 
     // Builtin functions
-    for name in BUILTINS {
+    for &(name, sig) in BUILTINS {
         items.push(CompletionItem {
             label: name.to_string(),
             kind: Some(CompletionItemKind::FUNCTION),
-            detail: Some("builtin".into()),
+            detail: Some(sig.to_string()),
             ..Default::default()
         });
     }
@@ -77,15 +142,101 @@ pub fn completions(module: &Module) -> Vec<CompletionItem> {
         });
     }
 
+    // Scope-aware local variables (params, let bindings, match bindings)
+    if let (Some(idx), Some(off)) = (symbol_index, offset) {
+        let existing: std::collections::HashSet<String> =
+            items.iter().map(|i| i.label.clone()).collect();
+        for (name, kind) in idx.visible_definitions_at(off) {
+            if existing.contains(&name) {
+                continue;
+            }
+            let (item_kind, detail) = match kind {
+                SymbolKind::Parameter => (CompletionItemKind::VARIABLE, Some("parameter".into())),
+                SymbolKind::LetBinding => {
+                    (CompletionItemKind::VARIABLE, Some("let binding".into()))
+                }
+                _ => continue, // top-level defs already added above
+            };
+            items.push(CompletionItem {
+                label: name,
+                kind: Some(item_kind),
+                detail,
+                sort_text: Some("0".into()), // sort locals first
+                ..Default::default()
+            });
+        }
+    }
+
     items
 }
 
-const BUILTINS: &[&str] = &[
-    "+", "-", "*", "/", "mod", "<", ">", "<=", ">=", "=", "!=", "not", "and", "or", "println",
-    "print", "str", "len", "nth", "append", "type-of",
+fn format_type_expr(module: &Module, id: weir_ast::TypeExprId) -> String {
+    let texpr = &module.type_exprs[id];
+    match &texpr.kind {
+        weir_ast::TypeExprKind::Named(name) => name.to_string(),
+        weir_ast::TypeExprKind::TypeVar(name) => format!("'{}", name),
+        weir_ast::TypeExprKind::Applied {
+            constructor, args, ..
+        } => {
+            let ctor = format_type_expr(module, *constructor);
+            let arg_strs: Vec<String> = args.iter().map(|a| format_type_expr(module, *a)).collect();
+            format!("({} {})", ctor, arg_strs.join(" "))
+        }
+        weir_ast::TypeExprKind::Fn {
+            params,
+            return_type,
+        } => {
+            let param_strs: Vec<String> = params
+                .iter()
+                .map(|p| format_type_expr(module, *p))
+                .collect();
+            let ret = format_type_expr(module, *return_type);
+            format!("(Fn [{}] {})", param_strs.join(" "), ret)
+        }
+        weir_ast::TypeExprKind::Constrained {
+            constraints: _,
+            inner,
+        } => format_type_expr(module, *inner),
+    }
+}
+
+fn format_fn_type(params: &[weir_typeck::Ty], ret: &weir_typeck::Ty) -> String {
+    let params_str: String = params
+        .iter()
+        .map(|t| format!("{}", t))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("(Fn [{}] {})", params_str, ret)
+}
+
+const BUILTINS: &[(&str, &str)] = &[
+    ("+", "(Fn [Num Num ...] Num)"),
+    ("-", "(Fn [Num Num ...] Num)"),
+    ("*", "(Fn [Num Num ...] Num)"),
+    ("/", "(Fn [Num Num] Num)"),
+    ("mod", "(Fn [Int Int] Int)"),
+    ("<", "(Fn [Num Num] Bool)"),
+    (">", "(Fn [Num Num] Bool)"),
+    ("<=", "(Fn [Num Num] Bool)"),
+    (">=", "(Fn [Num Num] Bool)"),
+    ("=", "(Fn [a a] Bool)"),
+    ("!=", "(Fn [a a] Bool)"),
+    ("not", "(Fn [Bool] Bool)"),
+    ("and", "(Fn [Bool Bool ...] Bool)"),
+    ("or", "(Fn [Bool Bool ...] Bool)"),
+    ("println", "(Fn [a] Unit)"),
+    ("print", "(Fn [a] Unit)"),
+    ("str", "(Fn [a] String)"),
+    ("len", "(Fn [Collection] i32)"),
+    ("nth", "(Fn [Collection i32] a)"),
+    ("append", "(Fn [Collection a] Collection)"),
+    ("type-of", "(Fn [a] String)"),
+    ("sleep", "(Fn [i64] Unit)"),
 ];
 
-const PRIMITIVE_TYPES: &[&str] = &["i32", "i64", "f32", "f64", "Bool", "String", "Unit"];
+const PRIMITIVE_TYPES: &[&str] = &[
+    "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64", "Bool", "String", "Unit",
+];
 
 const KEYWORDS: &[&str] = &[
     "defn",
@@ -117,10 +268,11 @@ const KEYWORDS: &[&str] = &[
 mod tests {
     use super::*;
 
-    fn parse_module(source: &str) -> Module {
+    fn parse_module(source: &str) -> (Module, TypeCheckResult) {
         let (module, errors) = weir_parser::parse(source);
         assert!(errors.is_empty(), "parse errors: {:?}", errors);
-        module
+        let type_result = weir_typeck::check(&module);
+        (module, type_result)
     }
 
     fn labels(items: &[CompletionItem]) -> Vec<String> {
@@ -129,17 +281,25 @@ mod tests {
 
     #[test]
     fn includes_user_defined_functions() {
-        let module = parse_module("(defn foo () 42) (defn bar () 0)");
-        let items = completions(&module);
+        let (module, tr) = parse_module("(defn foo () 42) (defn bar () 0)");
+        let items = completions(&module, Some(&tr), None, None);
         let l = labels(&items);
         assert!(l.contains(&"foo".to_string()));
         assert!(l.contains(&"bar".to_string()));
     }
 
     #[test]
+    fn function_detail_shows_type_signature() {
+        let (module, tr) = parse_module("(defn add ((x : i32) (y : i32)) : i32 (+ x y))");
+        let items = completions(&module, Some(&tr), None, None);
+        let add = items.iter().find(|i| i.label == "add").unwrap();
+        assert_eq!(add.detail.as_deref(), Some("(Fn [i32 i32] i32)"));
+    }
+
+    #[test]
     fn includes_user_defined_types_and_variants() {
-        let module = parse_module("(deftype Color Red Green Blue)");
-        let items = completions(&module);
+        let (module, tr) = parse_module("(deftype Color Red Green Blue)");
+        let items = completions(&module, Some(&tr), None, None);
         let l = labels(&items);
         assert!(l.contains(&"Color".to_string()));
         assert!(l.contains(&"Red".to_string()));
@@ -149,8 +309,8 @@ mod tests {
 
     #[test]
     fn user_type_has_correct_kind() {
-        let module = parse_module("(deftype Color Red)");
-        let items = completions(&module);
+        let (module, tr) = parse_module("(deftype Color Red)");
+        let items = completions(&module, Some(&tr), None, None);
         let color = items.iter().find(|i| i.label == "Color").unwrap();
         assert_eq!(color.kind, Some(CompletionItemKind::ENUM));
         let red = items.iter().find(|i| i.label == "Red").unwrap();
@@ -158,25 +318,48 @@ mod tests {
     }
 
     #[test]
+    fn variant_detail_shows_parent_type() {
+        let (module, tr) = parse_module("(deftype Color Red Green Blue)");
+        let items = completions(&module, Some(&tr), None, None);
+        let red = items.iter().find(|i| i.label == "Red").unwrap();
+        assert_eq!(red.detail.as_deref(), Some("Color"));
+    }
+
+    #[test]
     fn includes_user_defined_structs() {
-        let module = parse_module("(defstruct Point (x : f64) (y : f64))");
-        let items = completions(&module);
+        let (module, tr) = parse_module("(defstruct Point (x : f64) (y : f64))");
+        let items = completions(&module, Some(&tr), None, None);
         let point = items.iter().find(|i| i.label == "Point").unwrap();
         assert_eq!(point.kind, Some(CompletionItemKind::STRUCT));
+        assert_eq!(point.detail.as_deref(), Some("{ x, y }"));
     }
 
     #[test]
     fn includes_user_defined_classes() {
-        let module = parse_module("(defclass (Show 'a) (show : (Fn ['a] String)))");
-        let items = completions(&module);
-        let show = items.iter().find(|i| i.label == "Show").unwrap();
-        assert_eq!(show.kind, Some(CompletionItemKind::INTERFACE));
+        let (module, tr) = parse_module("(defclass (Show 'a) (show : (Fn ['a] String)))");
+        let items = completions(&module, Some(&tr), None, None);
+        let show_class = items.iter().find(|i| i.label == "Show").unwrap();
+        assert_eq!(show_class.kind, Some(CompletionItemKind::INTERFACE));
+        assert_eq!(show_class.detail.as_deref(), Some("class: show"));
+    }
+
+    #[test]
+    fn class_methods_appear_in_completions() {
+        let (module, tr) = parse_module(
+            "(defclass (Eq 'a)
+               (== : (Fn ['a 'a] Bool)))",
+        );
+        let items = completions(&module, Some(&tr), None, None);
+        let l = labels(&items);
+        assert!(l.contains(&"==".to_string()));
+        let eq_method = items.iter().find(|i| i.label == "==").unwrap();
+        assert_eq!(eq_method.kind, Some(CompletionItemKind::METHOD));
     }
 
     #[test]
     fn includes_builtin_functions() {
-        let module = parse_module("");
-        let items = completions(&module);
+        let (module, tr) = parse_module("");
+        let items = completions(&module, Some(&tr), None, None);
         let l = labels(&items);
         assert!(l.contains(&"print".to_string()));
         assert!(l.contains(&"println".to_string()));
@@ -185,17 +368,19 @@ mod tests {
     }
 
     #[test]
-    fn builtins_have_correct_detail() {
-        let module = parse_module("");
-        let items = completions(&module);
-        let print = items.iter().find(|i| i.label == "print").unwrap();
-        assert_eq!(print.detail.as_deref(), Some("builtin"));
+    fn builtins_have_type_signatures() {
+        let (module, tr) = parse_module("");
+        let items = completions(&module, Some(&tr), None, None);
+        let print = items.iter().find(|i| i.label == "println").unwrap();
+        assert_eq!(print.detail.as_deref(), Some("(Fn [a] Unit)"));
+        let add = items.iter().find(|i| i.label == "+").unwrap();
+        assert!(add.detail.as_deref().unwrap().starts_with("(Fn"));
     }
 
     #[test]
     fn includes_primitive_types() {
-        let module = parse_module("");
-        let items = completions(&module);
+        let (module, tr) = parse_module("");
+        let items = completions(&module, Some(&tr), None, None);
         let l = labels(&items);
         assert!(l.contains(&"i32".to_string()), "should include i32");
         assert!(l.contains(&"i64".to_string()), "should include i64");
@@ -208,8 +393,8 @@ mod tests {
 
     #[test]
     fn primitive_types_have_correct_detail() {
-        let module = parse_module("");
-        let items = completions(&module);
+        let (module, tr) = parse_module("");
+        let items = completions(&module, Some(&tr), None, None);
         let string = items.iter().find(|i| i.label == "String").unwrap();
         assert_eq!(string.detail.as_deref(), Some("primitive type"));
         assert_eq!(string.kind, Some(CompletionItemKind::CLASS));
@@ -217,8 +402,8 @@ mod tests {
 
     #[test]
     fn includes_keywords() {
-        let module = parse_module("");
-        let items = completions(&module);
+        let (module, tr) = parse_module("");
+        let items = completions(&module, Some(&tr), None, None);
         let l = labels(&items);
         assert!(l.contains(&"defn".to_string()));
         assert!(l.contains(&"let".to_string()));
@@ -229,17 +414,16 @@ mod tests {
 
     #[test]
     fn keywords_have_correct_kind() {
-        let module = parse_module("");
-        let items = completions(&module);
+        let (module, tr) = parse_module("");
+        let items = completions(&module, Some(&tr), None, None);
         let defn = items.iter().find(|i| i.label == "defn").unwrap();
         assert_eq!(defn.kind, Some(CompletionItemKind::KEYWORD));
     }
 
     #[test]
     fn empty_module_still_has_builtins_types_and_keywords() {
-        let module = parse_module("");
-        let items = completions(&module);
-        // At minimum: BUILTINS + PRIMITIVE_TYPES + KEYWORDS
+        let (module, tr) = parse_module("");
+        let items = completions(&module, Some(&tr), None, None);
         let expected_min = BUILTINS.len() + PRIMITIVE_TYPES.len() + KEYWORDS.len();
         assert!(
             items.len() >= expected_min,
@@ -247,5 +431,116 @@ mod tests {
             expected_min,
             items.len()
         );
+    }
+
+    #[test]
+    fn works_without_type_result() {
+        let (module, _errors) = weir_parser::parse("(defn foo () 42)");
+        let items = completions(&module, None, None, None);
+        let l = labels(&items);
+        assert!(l.contains(&"foo".to_string()));
+        // Without type result, detail should be None for user fns
+        let foo = items.iter().find(|i| i.label == "foo").unwrap();
+        assert!(foo.detail.is_none());
+    }
+
+    // ── Scope-aware completion tests ────────────────────────────
+
+    fn setup_with_index(source: &str) -> (Module, TypeCheckResult, SymbolIndex) {
+        let (module, errors) = weir_parser::parse(source);
+        assert!(errors.is_empty(), "parse errors: {:?}", errors);
+        let type_result = weir_typeck::check(&module);
+        let idx = SymbolIndex::build(&module);
+        (module, type_result, idx)
+    }
+
+    #[test]
+    fn scope_aware_includes_params() {
+        let source = "(defn add ((x : i32) (y : i32)) (+ x y))";
+        let (module, tr, idx) = setup_with_index(source);
+        // Cursor inside the body, at "+" (offset ~33)
+        let offset = source.find("+ x").unwrap() as u32;
+        let items = completions(&module, Some(&tr), Some(&idx), Some(offset));
+        let l = labels(&items);
+        assert!(l.contains(&"x".to_string()), "should include param x");
+        assert!(l.contains(&"y".to_string()), "should include param y");
+    }
+
+    #[test]
+    fn scope_aware_includes_let_bindings() {
+        let source = "(defn main () (let ((count 42)) count))";
+        let (module, tr, idx) = setup_with_index(source);
+        // Cursor in the let body (at "count" reference)
+        let body_offset = source.rfind("count").unwrap() as u32;
+        let items = completions(&module, Some(&tr), Some(&idx), Some(body_offset));
+        let l = labels(&items);
+        assert!(
+            l.contains(&"count".to_string()),
+            "should include let binding 'count'"
+        );
+    }
+
+    #[test]
+    fn scope_aware_param_has_variable_kind() {
+        let source = "(defn f (x) x)";
+        let (module, tr, idx) = setup_with_index(source);
+        let offset = source.rfind('x').unwrap() as u32;
+        let items = completions(&module, Some(&tr), Some(&idx), Some(offset));
+        let x = items.iter().find(|i| i.label == "x").unwrap();
+        assert_eq!(x.kind, Some(CompletionItemKind::VARIABLE));
+        assert_eq!(x.detail.as_deref(), Some("parameter"));
+    }
+
+    #[test]
+    fn scope_aware_let_binding_has_variable_kind() {
+        let source = "(defn main () (let ((val 1)) val))";
+        let (module, tr, idx) = setup_with_index(source);
+        let offset = source.rfind("val").unwrap() as u32;
+        let items = completions(&module, Some(&tr), Some(&idx), Some(offset));
+        let val = items.iter().find(|i| i.label == "val").unwrap();
+        assert_eq!(val.kind, Some(CompletionItemKind::VARIABLE));
+        assert_eq!(val.detail.as_deref(), Some("let binding"));
+    }
+
+    #[test]
+    fn scope_aware_no_locals_outside_function() {
+        // Extra whitespace after the defn to ensure offset is truly outside
+        let source = "(defn f (x) x)   ";
+        let (module, tr, idx) = setup_with_index(source);
+        // Offset 17 is in trailing whitespace, outside any item
+        let items = completions(&module, Some(&tr), Some(&idx), Some(17));
+        let l = labels(&items);
+        assert!(
+            !l.contains(&"x".to_string()),
+            "param x should not appear outside function"
+        );
+    }
+
+    #[test]
+    fn scope_aware_nested_let() {
+        let source = "(defn main () (let ((a 1)) (let ((b 2)) (+ a b))))";
+        let (module, tr, idx) = setup_with_index(source);
+        // Cursor in the inner let body
+        let offset = source.find("(+ a b)").unwrap() as u32 + 3;
+        let items = completions(&module, Some(&tr), Some(&idx), Some(offset));
+        let l = labels(&items);
+        assert!(
+            l.contains(&"a".to_string()),
+            "should see outer let binding a"
+        );
+        assert!(
+            l.contains(&"b".to_string()),
+            "should see inner let binding b"
+        );
+    }
+
+    #[test]
+    fn scope_aware_locals_sorted_first() {
+        let source = "(defn main (myvar) myvar)";
+        let (module, tr, idx) = setup_with_index(source);
+        let offset = source.rfind("myvar").unwrap() as u32;
+        let items = completions(&module, Some(&tr), Some(&idx), Some(offset));
+        let myvar = items.iter().find(|i| i.label == "myvar").unwrap();
+        assert_eq!(myvar.sort_text.as_deref(), Some("0"));
     }
 }

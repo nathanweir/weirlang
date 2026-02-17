@@ -188,27 +188,35 @@ Run `just test` on every commit. Tests must pass before merging.
 - [ ] **Milestone 1 demo**: a program running a loop; edit a function; the running program uses the new version without restart — *not documented yet, but `weir dev` is functional*
 - [x] Verify: `weir build` produces working binaries; live reload works for body-only changes (8 AOT tests + 5 dev-session tests)
 
-### Phase 6: Tree-sitter grammar + basic LSP
+### Phase 6: Tree-sitter grammar + LSP
 - [x] **Tree-sitter grammar** (`tree-sitter-weir/`):
   - Complete grammar covering all Weir syntax
   - Highlighting queries (`.scm` files)
   - Bracket/indent queries
   - Test corpus (tree-sitter's built-in test format, 4 test files)
-- [ ] **LSP** (`weir-lsp`):
-  - Tier 1 features (syntax-only):
-    - Diagnostic reporting (parse errors, type errors)
-    - Semantic token highlighting
-    - Document symbols (outline)
-    - Go-to-definition (same file, via name resolution)
-    - Hover (show type of symbol)
-  - Reference: adapt patterns from `/home/nathan/dev/clef` (CL language server)
-  - Use `tower-lsp` + `lsp-types`
+- [x] **LSP** (`weir-lsp`):
+  - Uses `tower-lsp` + `lsp-types`, full-text document sync
+  - Analysis pipeline: macro expansion → parse → typecheck → cache per document
+  - [x] Diagnostic reporting (parse errors, type errors, macro expansion errors)
+  - [x] Document symbols / outline (defn, deftype, defstruct, defclass, instances with nested children)
+  - [x] Go-to-definition (same file, scope-aware via SymbolIndex)
+  - [x] Hover (expression types from typeck, function signatures, docstrings)
+  - [x] Completion (user-defined items + builtins + types + keywords; static, not scope-aware)
+  - [x] Find references (same file, scope-aware with shadowing)
+  - [x] Rename (same file, scope-aware with prepare_rename support)
+  - [x] Inlay hints (unannotated params, return types, let bindings, lambdas; range-aware)
+  - [x] Document formatting (Wadler-Lindig pretty printer, 80-col, comment-preserving)
+  - [ ] Semantic token highlighting — *not implemented*
+  - [ ] Signature help — *not implemented*
+  - [ ] Code actions — *not implemented*
+  - [ ] Cross-file support (multi-file definition, references, workspace) — *not implemented*
+  - [ ] Scope-aware completion (filter by visible bindings at cursor) — *not implemented*
 - [x] **Zed extension**: create `zed-weir` extension (adapt from `/home/nathan/dev/zed-common-lisp`)
   - `extension.toml` with language/grammar config
   - Point to tree-sitter-weir grammar
   - Syntax highlighting, brackets, outline queries
-  - [ ] Configure LSP launch — *blocked on `weir-lsp` crate*
-- [ ] Verify: open a `.weir` file in Zed, see syntax highlighting, get type errors inline — *syntax highlighting works; type errors inline not yet (needs LSP)*
+  - [x] Configure LSP launch (`weir lsp` via extension)
+- [x] Verify: open a `.weir` file in Zed, see syntax highlighting, get type errors inline, hover, inlay hints, completion
 
 ### Phase 7: Macros
 - [x] **Macro expander** (`weir-macros`):
@@ -226,22 +234,26 @@ Run `just test` on every commit. Tests must pass before merging.
 - [x] Verify: user-defined macros work, built-in macros work, hygiene prevents capture, 183 workspace tests pass
 
 ### Phase 8: Generics + typeclasses
-- [ ] **Generics** (in `weir-typeck`):
-  - Parametric polymorphism with type variables
-  - Type variable binding and unification
-  - Dev mode: type erasure (boxed representation)
-  - Generic function instantiation
-- [ ] **Typeclasses**:
+- [x] **Generics** (in `weir-typeck`):
+  - Parametric polymorphism with type variables (`'a`)
+  - Type variable binding and unification via `FnScheme` with `instantiate()`
+  - Generic function instantiation at call sites
+- [x] **Typeclasses**:
   - `defclass` / `instance` syntax and semantics
-  - Single-parameter typeclasses first
-  - Dictionary passing (dev mode) or monomorphization (release mode)
-  - Core typeclasses: `Eq`, `Ord`, `Show`, `From`
-  - Coherence checking (Rust-style: only defining module can write instance)
-  - `Shareable` typeclass (auto-derived based on type contents)
-- [ ] **HKTs** (if time permits, can defer):
-  - Kind system (`*`, `* -> *`)
-  - `Functor`, `Foldable`, etc.
-- [ ] Verify: generic functions work, typeclass dispatch works, coherence errors are caught
+  - Single-parameter typeclasses with method signatures and constraints
+  - Interpreter: runtime dispatch via type tags
+  - Codegen: monomorphization (specialization collection + mangled names)
+  - Constraint resolution with deferred checking
+  - [ ] Core typeclasses beyond Eq/Show: `Ord`, `From` — *deferred*
+  - [ ] Coherence checking (Rust-style: only defining module can write instance) — *deferred*
+  - [ ] `Shareable` typeclass (auto-derived based on type contents) — *deferred; needs concurrency (Phase 10)*
+- [x] **HKTs**:
+  - Kind system (`TyKind::Star`, `TyKind::Arrow`)
+  - `Ty::App` for type application (`('f 'a)`)
+  - Kind inference from method signatures
+  - Kind checking in instance declarations
+  - Functor example working (interpreter)
+- [x] Verify: 322 tests pass, generic functions work in interpreter + codegen, typeclass dispatch works, HKTs work, oracle tests confirm interpreter/codegen agreement
 
 ### Phase 9: GC + arenas
 - [ ] **Tracing GC** (in `weir-runtime`):
@@ -280,8 +292,8 @@ Run `just test` on every commit. Tests must pass before merging.
 | **M0: "It runs"** | Phase 2 | Parse and interpret Weir programs with functions, let, if, arithmetic | **Done** |
 | **M1: "It compiles"** | Phase 4 | Programs compile to native code via Cranelift JIT and run | **Done** |
 | **M2: "Standalone binary + live reload"** | Phase 5 | `weir build` produces native binaries; `weir dev` enables live reload | **Done** |
-| **M3: "Editor support"** | Phase 6 | Syntax highlighting, inline errors, type hover in Zed | **Partial** (highlighting done, LSP not started) |
-| **M4: "Real language"** | Phase 8 | Generics, typeclasses, macros — write non-trivial programs | **Partial** (macros done, generics/typeclasses not started) |
+| **M3: "Editor support"** | Phase 6 | Syntax highlighting, inline errors, type hover in Zed | **Done** (LSP: diagnostics, hover, goto-def, references, rename, completion, inlay hints, formatting; Zed: tree-sitter highlighting; LSP launch wiring pending) |
+| **M4: "Real language"** | Phase 8 | Generics, typeclasses, macros — write non-trivial programs | **Done** (macros, generics, typeclasses, HKTs all working) |
 | **M5: "Production-ready runtime"** | Phase 10 | GC, arenas, concurrency, full cascade — the complete vision | Not started |
 
 ## Verification strategy

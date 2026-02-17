@@ -159,6 +159,48 @@ impl SymbolIndex {
         results
     }
 
+    /// Return all definitions visible at `offset`, with inner scopes
+    /// shadowing outer scopes.  Each entry is (name, kind).
+    pub fn visible_definitions_at(&self, offset: u32) -> Vec<(String, SymbolKind)> {
+        // Find the innermost scope containing this offset
+        let scope_id = match self.innermost_scope_at(offset) {
+            Some(id) => id,
+            None => return Vec::new(),
+        };
+
+        // Walk up the scope chain collecting definitions; earlier (inner) defs shadow later (outer)
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+        let mut current = Some(scope_id);
+        while let Some(sid) = current {
+            let scope = &self.scopes[sid];
+            for def in &scope.definitions {
+                if seen.insert(def.name.clone()) {
+                    result.push((def.name.clone(), def.kind));
+                }
+            }
+            current = scope.parent;
+        }
+        result
+    }
+
+    fn innermost_scope_at(&self, offset: u32) -> Option<ScopeId> {
+        let mut best: Option<(ScopeId, u32)> = None;
+        for (i, scope) in self.scopes.iter().enumerate() {
+            if scope.span.start <= offset && offset <= scope.span.end {
+                let size = scope.span.end - scope.span.start;
+                let is_better = match best {
+                    Some((_, best_size)) => size <= best_size,
+                    None => true,
+                };
+                if is_better {
+                    best = Some((i, size));
+                }
+            }
+        }
+        best.map(|(id, _)| id)
+    }
+
     // ── internal helpers ─────────────────────────────────────────
 
     fn occurrence_at(&self, offset: u32) -> Option<&Occurrence> {

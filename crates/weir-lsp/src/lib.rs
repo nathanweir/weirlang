@@ -6,7 +6,9 @@ pub mod formatting;
 mod hover;
 pub mod index;
 mod inlay_hints;
+mod semantic_tokens;
 mod server;
+mod signature_help;
 mod symbols;
 
 use tower_lsp::{LspService, Server};
