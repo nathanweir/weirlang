@@ -1,21 +1,13 @@
 [package]
-name = "weir-cli"
+name = "weir-lsp"
 version.workspace = true
 edition.workspace = true
-
-[[bin]]
-name = "weir"
-path = "src/main.rs"
 
 [dependencies]
 weir-lexer.workspace = true
 weir-parser.workspace = true
 weir-ast.workspace = true
 weir-typeck.workspace = true
-weir-interp.workspace = true
-weir-codegen.workspace = true
 weir-macros.workspace = true
-weir-lsp.workspace = true
-clap.workspace = true
-miette = { workspace = true, features = ["fancy"] }
+tower-lsp.workspace = true
 tokio.workspace = true

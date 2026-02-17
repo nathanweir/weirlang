@@ -127,10 +127,19 @@ impl fmt::Display for TypeError {
     }
 }
 
+/// Resolved function type: param types + return type after substitution.
+#[derive(Clone, Debug)]
+pub struct FnType {
+    pub param_types: Vec<Ty>,
+    pub return_type: Ty,
+}
+
 pub struct TypeCheckResult {
     pub errors: Vec<TypeError>,
     /// Resolved type for every expression, after substitution + numeric defaulting.
     pub expr_types: ArenaMap<ExprId, Ty>,
+    /// Resolved function types for each named function, after substitution.
+    pub fn_types: HashMap<SmolStr, FnType>,
 }
 
 // ── Public API ───────────────────────────────────────────────────
@@ -146,9 +155,28 @@ pub fn check(module: &Module) -> TypeCheckResult {
         expr_types.insert(id, checker.apply(ty));
     }
 
+    // Apply final substitution to all function schemes
+    let mut fn_types = HashMap::new();
+    for (name, scheme) in &checker.fn_schemes {
+        let param_types = scheme
+            .param_types
+            .iter()
+            .map(|t| checker.apply(t))
+            .collect();
+        let return_type = checker.apply(&scheme.return_type);
+        fn_types.insert(
+            name.clone(),
+            FnType {
+                param_types,
+                return_type,
+            },
+        );
+    }
+
     TypeCheckResult {
         errors: checker.errors,
         expr_types,
+        fn_types,
     }
 }
 
@@ -1002,7 +1030,11 @@ impl<'a> TypeChecker<'a> {
         if let ExprKind::Var(name) = &func_expr.kind {
             if self.is_builtin(name) {
                 let arg_tys: Vec<Ty> = args.iter().map(|a| self.check_expr(a.value)).collect();
-                return self.check_builtin_call(name, &arg_tys, span);
+                let ret_ty = self.check_builtin_call(name, &arg_tys, span);
+                // Record the builtin's function type so hover works on the Var expression
+                let func_ty = Ty::Fn(arg_tys, Box::new(ret_ty.clone()));
+                self.expr_types.insert(func_id, func_ty);
+                return ret_ty;
             }
 
             // Check for ADT constructor call
@@ -1049,6 +1081,10 @@ impl<'a> TypeChecker<'a> {
             if let Some(scheme) = self.fn_schemes.get(name).cloned() {
                 let (param_tys, ret_ty) = self.instantiate(&scheme);
                 let arg_tys: Vec<Ty> = args.iter().map(|a| self.check_expr(a.value)).collect();
+
+                // Record the function's type so hover works on the Var expression
+                let func_ty = Ty::Fn(param_tys.clone(), Box::new(ret_ty.clone()));
+                self.expr_types.insert(func_id, func_ty);
 
                 if param_tys.len() != arg_tys.len() {
                     self.error(

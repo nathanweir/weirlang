@@ -241,7 +241,7 @@ impl Parser {
 
     fn parse_defn(&mut self, is_pub: bool) -> Option<Defn> {
         let start = self.peek_span();
-        let (name, _) = self.expect_symbol()?;
+        let (name, name_span) = self.expect_symbol()?;
 
         let params = self.parse_params()?;
 
@@ -274,6 +274,7 @@ impl Parser {
         let end = self.peek_span();
         Some(Defn {
             name,
+            name_span,
             params,
             return_type,
             body,
@@ -309,7 +310,7 @@ impl Parser {
             } else {
                 false
             };
-            let (name, _) = self.expect_symbol()?;
+            let (name, name_span) = self.expect_symbol()?;
             let type_ann = if self.eat(&Token::Colon) {
                 Some(self.parse_type_expr()?)
             } else {
@@ -319,6 +320,7 @@ impl Parser {
             self.expect(&Token::RParen)?;
             Some(Param {
                 name,
+                name_span,
                 type_ann,
                 is_mut,
                 is_ref,
@@ -326,13 +328,14 @@ impl Parser {
             })
         } else if let Some(Token::Symbol(_)) = self.peek() {
             // Bare param: name
-            let (name, span) = self.expect_symbol()?;
+            let (name, name_span) = self.expect_symbol()?;
             Some(Param {
                 name,
+                name_span,
                 type_ann: None,
                 is_mut: false,
                 is_ref: false,
-                span,
+                span: name_span,
             })
         } else {
             let span = self.peek_span();
@@ -345,7 +348,7 @@ impl Parser {
 
     fn parse_deftype(&mut self, is_pub: bool) -> Option<Deftype> {
         let start = self.peek_span();
-        let (name, type_params) = self.parse_type_name()?;
+        let (name, name_span, type_params) = self.parse_type_name()?;
 
         let mut variants = Vec::new();
         while !self.at_end() && !self.check(&Token::RParen) {
@@ -359,6 +362,7 @@ impl Parser {
         let end = self.peek_span();
         Some(Deftype {
             name,
+            name_span,
             type_params,
             variants,
             is_pub,
@@ -367,10 +371,11 @@ impl Parser {
     }
 
     /// Parse `Name` or `(Name 'a 'b)` for type/struct name with optional type params.
-    fn parse_type_name(&mut self) -> Option<(SmolStr, Vec<SmolStr>)> {
+    /// Returns `(name, name_span, type_params)`.
+    fn parse_type_name(&mut self) -> Option<(SmolStr, Span, Vec<SmolStr>)> {
         if self.check(&Token::LParen) {
             self.advance();
-            let (name, _) = self.expect_symbol()?;
+            let (name, name_span) = self.expect_symbol()?;
             let mut type_params = Vec::new();
             while let Some(Token::TypeVar(_)) = self.peek() {
                 let (tok, _) = self.advance();
@@ -379,10 +384,10 @@ impl Parser {
                 }
             }
             self.expect(&Token::RParen)?;
-            Some((name, type_params))
+            Some((name, name_span, type_params))
         } else {
-            let (name, _) = self.expect_symbol()?;
-            Some((name, Vec::new()))
+            let (name, name_span) = self.expect_symbol()?;
+            Some((name, name_span, Vec::new()))
         }
     }
 
@@ -391,7 +396,7 @@ impl Parser {
         if self.check(&Token::LParen) {
             // Variant with fields: (Name type1 type2)
             self.advance();
-            let (name, _) = self.expect_symbol()?;
+            let (name, name_span) = self.expect_symbol()?;
             let mut fields = Vec::new();
             while !self.at_end() && !self.check(&Token::RParen) {
                 fields.push(self.parse_type_expr()?);
@@ -400,16 +405,18 @@ impl Parser {
             self.expect(&Token::RParen)?;
             Some(Variant {
                 name,
+                name_span,
                 fields,
                 span: start.merge(end),
             })
         } else if let Some(Token::Symbol(_)) = self.peek() {
             // Nullary variant: Name
-            let (name, span) = self.expect_symbol()?;
+            let (name, name_span) = self.expect_symbol()?;
             Some(Variant {
                 name,
+                name_span,
                 fields: Vec::new(),
-                span,
+                span: name_span,
             })
         } else {
             let span = self.peek_span();
@@ -422,7 +429,7 @@ impl Parser {
 
     fn parse_defstruct(&mut self, is_pub: bool) -> Option<Defstruct> {
         let start = self.peek_span();
-        let (name, type_params) = self.parse_type_name()?;
+        let (name, name_span, type_params) = self.parse_type_name()?;
 
         let mut fields = Vec::new();
         while !self.at_end() && !self.check(&Token::RParen) {
@@ -432,6 +439,7 @@ impl Parser {
         let end = self.peek_span();
         Some(Defstruct {
             name,
+            name_span,
             type_params,
             fields,
             is_pub,
@@ -442,13 +450,14 @@ impl Parser {
     fn parse_struct_field(&mut self) -> Option<StructField> {
         let start = self.peek_span();
         self.expect(&Token::LParen)?;
-        let (name, _) = self.expect_symbol()?;
+        let (name, name_span) = self.expect_symbol()?;
         self.expect(&Token::Colon)?;
         let type_ann = self.parse_type_expr()?;
         let end = self.peek_span();
         self.expect(&Token::RParen)?;
         Some(StructField {
             name,
+            name_span,
             type_ann,
             span: start.merge(end),
         })
@@ -461,25 +470,25 @@ impl Parser {
         // Parse class head: (Name 'a) or (=> (Super 'a) (Name 'a))
         self.expect(&Token::LParen)?;
 
-        let (superclasses, name, type_params) = if self.check_symbol("=>") {
+        let (superclasses, name, name_span, type_params) = if self.check_symbol("=>") {
             self.advance();
             // Collect all constraint-like forms; last one is the class itself
             let mut items = Vec::new();
             while !self.at_end() && !self.check(&Token::RParen) {
                 self.expect(&Token::LParen)?;
-                let (n, _) = self.expect_symbol()?;
+                let (n, n_span) = self.expect_symbol()?;
                 let mut args = Vec::new();
                 while !self.at_end() && !self.check(&Token::RParen) {
                     args.push(self.parse_type_expr()?);
                 }
                 let end = self.peek_span();
                 self.expect(&Token::RParen)?;
-                items.push((n, args, start.merge(end)));
+                items.push((n, n_span, args, start.merge(end)));
             }
-            let (class_name, class_args, _) = items.pop()?;
+            let (class_name, class_name_span, class_args, _) = items.pop()?;
             let superclasses: Vec<Constraint> = items
                 .into_iter()
-                .map(|(name, type_args, span)| Constraint {
+                .map(|(name, _name_span, type_args, span)| Constraint {
                     class_name: name,
                     type_args,
                     span,
@@ -496,9 +505,9 @@ impl Parser {
                     }
                 })
                 .collect();
-            (superclasses, class_name, type_params)
+            (superclasses, class_name, class_name_span, type_params)
         } else {
-            let (name, _) = self.expect_symbol()?;
+            let (name, name_span) = self.expect_symbol()?;
             let mut type_params = Vec::new();
             while let Some(Token::TypeVar(_)) = self.peek() {
                 let (tok, _) = self.advance();
@@ -506,7 +515,7 @@ impl Parser {
                     type_params.push(s);
                 }
             }
-            (Vec::new(), name, type_params)
+            (Vec::new(), name, name_span, type_params)
         };
 
         self.expect(&Token::RParen)?;
@@ -524,6 +533,7 @@ impl Parser {
         let end = self.peek_span();
         Some(Defclass {
             name,
+            name_span,
             type_params,
             superclasses,
             methods,
@@ -535,13 +545,14 @@ impl Parser {
     fn parse_method_sig(&mut self) -> Option<MethodSig> {
         let start = self.peek_span();
         self.expect(&Token::LParen)?;
-        let (name, _) = self.expect_symbol()?;
+        let (name, name_span) = self.expect_symbol()?;
         self.expect(&Token::Colon)?;
         let type_ann = self.parse_type_expr()?;
         let end = self.peek_span();
         self.expect(&Token::RParen)?;
         Some(MethodSig {
             name,
+            name_span,
             type_ann,
             span: start.merge(end),
         })
@@ -884,7 +895,7 @@ impl Parser {
             // Annotated: ((name : type) value) or ((mut name : type) value)
             self.advance();
             let is_mut = self.eat_symbol("mut");
-            let (name, _) = self.expect_symbol()?;
+            let (name, name_span) = self.expect_symbol()?;
             let type_ann = if self.eat(&Token::Colon) {
                 Some(self.parse_type_expr()?)
             } else {
@@ -896,6 +907,7 @@ impl Parser {
             self.expect(&Token::RParen)?;
             Some(LetBinding {
                 name,
+                name_span,
                 type_ann,
                 value,
                 is_mut,
@@ -904,12 +916,13 @@ impl Parser {
         } else if self.check_symbol("mut") {
             // Mutable: (mut name value)
             self.advance();
-            let (name, _) = self.expect_symbol()?;
+            let (name, name_span) = self.expect_symbol()?;
             let value = self.parse_expr()?;
             let end = self.peek_span();
             self.expect(&Token::RParen)?;
             Some(LetBinding {
                 name,
+                name_span,
                 type_ann: None,
                 value,
                 is_mut: true,
@@ -917,12 +930,13 @@ impl Parser {
             })
         } else {
             // Simple: (name value)
-            let (name, _) = self.expect_symbol()?;
+            let (name, name_span) = self.expect_symbol()?;
             let value = self.parse_expr()?;
             let end = self.peek_span();
             self.expect(&Token::RParen)?;
             Some(LetBinding {
                 name,
+                name_span,
                 type_ann: None,
                 value,
                 is_mut: false,

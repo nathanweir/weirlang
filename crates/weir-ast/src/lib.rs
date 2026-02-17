@@ -54,6 +54,7 @@ pub enum Item {
 #[derive(Debug, Clone)]
 pub struct Defn {
     pub name: SmolStr,
+    pub name_span: Span,
     pub params: Vec<Param>,
     pub return_type: Option<TypeExprId>,
     pub body: Vec<ExprId>,
@@ -66,6 +67,7 @@ pub struct Defn {
 #[derive(Debug, Clone)]
 pub struct Param {
     pub name: SmolStr,
+    pub name_span: Span,
     pub type_ann: Option<TypeExprId>,
     pub is_mut: bool,
     pub is_ref: bool,
@@ -76,6 +78,7 @@ pub struct Param {
 #[derive(Debug, Clone)]
 pub struct Deftype {
     pub name: SmolStr,
+    pub name_span: Span,
     pub type_params: Vec<SmolStr>,
     pub variants: Vec<Variant>,
     pub is_pub: bool,
@@ -86,6 +89,7 @@ pub struct Deftype {
 #[derive(Debug, Clone)]
 pub struct Variant {
     pub name: SmolStr,
+    pub name_span: Span,
     pub fields: Vec<TypeExprId>,
     pub span: Span,
 }
@@ -94,6 +98,7 @@ pub struct Variant {
 #[derive(Debug, Clone)]
 pub struct Defstruct {
     pub name: SmolStr,
+    pub name_span: Span,
     pub type_params: Vec<SmolStr>,
     pub fields: Vec<StructField>,
     pub is_pub: bool,
@@ -104,6 +109,7 @@ pub struct Defstruct {
 #[derive(Debug, Clone)]
 pub struct StructField {
     pub name: SmolStr,
+    pub name_span: Span,
     pub type_ann: TypeExprId,
     pub span: Span,
 }
@@ -112,6 +118,7 @@ pub struct StructField {
 #[derive(Debug, Clone)]
 pub struct Defclass {
     pub name: SmolStr,
+    pub name_span: Span,
     pub type_params: Vec<SmolStr>,
     pub superclasses: Vec<Constraint>,
     pub methods: Vec<MethodSig>,
@@ -123,6 +130,7 @@ pub struct Defclass {
 #[derive(Debug, Clone)]
 pub struct MethodSig {
     pub name: SmolStr,
+    pub name_span: Span,
     pub type_ann: TypeExprId,
     pub span: Span,
 }
@@ -271,6 +279,7 @@ pub enum Literal {
 #[derive(Debug, Clone)]
 pub struct LetBinding {
     pub name: SmolStr,
+    pub name_span: Span,
     pub type_ann: Option<TypeExprId>,
     pub value: ExprId,
     pub is_mut: bool,

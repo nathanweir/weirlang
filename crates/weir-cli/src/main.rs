@@ -48,6 +48,8 @@ enum Command {
         /// Path to the .weir source file
         file: PathBuf,
     },
+    /// Start the Weir Language Server Protocol server
+    Lsp,
 }
 
 fn read_file(file: &std::path::Path) -> String {
@@ -285,6 +287,10 @@ fn main() {
             let source = read_file(&file);
             let expanded = expand_source(&source, &file);
             print!("{}", expanded);
+        }
+        Command::Lsp => {
+            let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+            rt.block_on(weir_lsp::run_lsp());
         }
     }
 }

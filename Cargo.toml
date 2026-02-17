@@ -8,6 +8,7 @@ members = [
     "crates/weir-interp",
     "crates/weir-codegen",
     "crates/weir-macros",
+    "crates/weir-lsp",
     "crates/weir-cli",
 ]
 exclude = [
@@ -47,6 +48,10 @@ cranelift-object = "0.128"
 target-lexicon = "0.13"
 notify = "7"
 
+# LSP
+tower-lsp = "0.20"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-std"] }
+
 # Internal crates
 weir-lexer = { path = "crates/weir-lexer" }
 weir-parser = { path = "crates/weir-parser" }
@@ -55,3 +60,4 @@ weir-typeck = { path = "crates/weir-typeck" }
 weir-interp = { path = "crates/weir-interp" }
 weir-codegen = { path = "crates/weir-codegen" }
 weir-macros = { path = "crates/weir-macros" }
+weir-lsp = { path = "crates/weir-lsp" }
