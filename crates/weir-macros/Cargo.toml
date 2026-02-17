@@ -1,13 +1,14 @@
 [package]
-name = "weir-interp"
+name = "weir-macros"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-weir-ast.workspace = true
+weir-lexer.workspace = true
 smol_str.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
-weir-parser.workspace = true
-weir-macros.workspace = true
 insta.workspace = true
+weir-parser.workspace = true
+weir-ast.workspace = true

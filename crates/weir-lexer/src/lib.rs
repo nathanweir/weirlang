@@ -67,6 +67,12 @@ pub enum Token {
     Question,
     #[token(":")]
     Colon,
+    #[token("`")]
+    Backtick,
+    #[token(",@", priority = 2)]
+    CommaSplice,
+    #[token(",")]
+    Comma,
 
     #[regex(r"-?[0-9]+\.[0-9]+([eE][+-]?[0-9]+)?", priority = 3, callback = |lex| lex.slice().parse::<f64>().ok())]
     Float(f64),
@@ -166,10 +172,7 @@ mod tests {
             lex_tokens(r#""hello\nworld""#),
             vec![Token::String("hello\nworld".into())]
         );
-        assert_eq!(
-            lex_tokens(r#""""#),
-            vec![Token::String("".into())]
-        );
+        assert_eq!(lex_tokens(r#""""#), vec![Token::String("".into())]);
     }
 
     #[test]
@@ -192,10 +195,7 @@ mod tests {
     fn test_type_vars() {
         assert_eq!(
             lex_tokens("'a 'elem"),
-            vec![
-                Token::TypeVar("a".into()),
-                Token::TypeVar("elem".into()),
-            ]
+            vec![Token::TypeVar("a".into()), Token::TypeVar("elem".into()),]
         );
     }
 
@@ -284,10 +284,7 @@ mod tests {
 
     #[test]
     fn test_comments_skipped() {
-        assert_eq!(
-            lex_tokens("; this is a comment\n42"),
-            vec![Token::Int(42)]
-        );
+        assert_eq!(lex_tokens("; this is a comment\n42"), vec![Token::Int(42)]);
     }
 
     #[test]
@@ -332,6 +329,44 @@ mod tests {
                 Token::Keyword("name".into()),
                 Token::String("Alice".into()),
                 Token::RBrace,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_quasiquote_tokens() {
+        assert_eq!(
+            lex_tokens("` , ,@"),
+            vec![Token::Backtick, Token::Comma, Token::CommaSplice]
+        );
+    }
+
+    #[test]
+    fn test_comma_splice_priority() {
+        // ,@ should tokenize as a single CommaSplice, not Comma + Symbol(@)
+        assert_eq!(
+            lex_tokens(",@foo"),
+            vec![Token::CommaSplice, Token::Symbol("foo".into())]
+        );
+        assert_eq!(
+            lex_tokens(",foo"),
+            vec![Token::Comma, Token::Symbol("foo".into())]
+        );
+    }
+
+    #[test]
+    fn test_quasiquote_in_context() {
+        assert_eq!(
+            lex_tokens("`(list ,a ,@rest)"),
+            vec![
+                Token::Backtick,
+                Token::LParen,
+                Token::Symbol("list".into()),
+                Token::Comma,
+                Token::Symbol("a".into()),
+                Token::CommaSplice,
+                Token::Symbol("rest".into()),
+                Token::RParen,
             ]
         );
     }

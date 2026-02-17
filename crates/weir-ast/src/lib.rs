@@ -193,10 +193,7 @@ pub enum ExprKind {
     /// Variable reference.
     Var(SmolStr),
     /// Function call: `(f args...)`
-    Call {
-        func: ExprId,
-        args: Vec<Arg>,
-    },
+    Call { func: ExprId, args: Vec<Arg> },
     /// Let binding: `(let (bindings...) body...)`
     Let {
         bindings: Vec<LetBinding>,
@@ -235,39 +232,20 @@ pub enum ExprKind {
         body: Vec<ExprId>,
     },
     /// Do block: `(do exprs...)`
-    Do {
-        body: Vec<ExprId>,
-    },
+    Do { body: Vec<ExprId> },
     /// Mutation: `(set! place value)`
-    SetBang {
-        place: ExprId,
-        value: ExprId,
-    },
+    SetBang { place: ExprId, value: ExprId },
     /// Type annotation: `(ann type expr)`
-    Ann {
-        type_ann: TypeExprId,
-        expr: ExprId,
-    },
+    Ann { type_ann: TypeExprId, expr: ExprId },
     /// Field access: `.field`
     FieldAccess(SmolStr),
     /// Vector literal: `[exprs...]`
     VectorLit(Vec<ExprId>),
     /// Map literal: `{key val ...}`
     MapLit(Vec<(ExprId, ExprId)>),
-    /// Thread-first: `(-> expr forms...)`
-    ThreadFirst {
-        initial: ExprId,
-        steps: Vec<ExprId>,
-    },
-    /// Thread-last: `(->> expr forms...)`
-    ThreadLast {
-        initial: ExprId,
-        steps: Vec<ExprId>,
-    },
+
     /// Unsafe block: `(unsafe exprs...)`
-    Unsafe {
-        body: Vec<ExprId>,
-    },
+    Unsafe { body: Vec<ExprId> },
     /// Try/question operator: `expr?`
     Try(ExprId),
 }
@@ -322,16 +300,11 @@ pub enum PatternKind {
     /// Variable binding (lowercase).
     Var(SmolStr),
     /// Constructor: `Name` or `(Name args...)`
-    Constructor {
-        name: SmolStr,
-        args: Vec<PatternId>,
-    },
+    Constructor { name: SmolStr, args: Vec<PatternId> },
     /// Literal pattern.
     Literal(Literal),
     /// Struct destructuring: `{field1 field2}` or `{field1 name1 field2 name2}`
-    StructDestructure {
-        fields: Vec<FieldPattern>,
-    },
+    StructDestructure { fields: Vec<FieldPattern> },
 }
 
 /// Field in a struct destructuring pattern.
@@ -590,7 +563,11 @@ impl<'a> PrettyPrinter<'a> {
                 self.buf.push_str(&format!(
                     "(import {} ({}))\n",
                     d.module_path,
-                    names.iter().map(|n| n.as_str()).collect::<Vec<_>>().join(" ")
+                    names
+                        .iter()
+                        .map(|n| n.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
                 ));
             }
             ImportKind::Alias(alias) => {
@@ -818,24 +795,7 @@ impl<'a> PrettyPrinter<'a> {
                 }
                 self.buf.push('}');
             }
-            ExprKind::ThreadFirst { initial, steps } => {
-                self.buf.push_str("(-> ");
-                self.print_expr(*initial);
-                for &s in steps {
-                    self.buf.push(' ');
-                    self.print_expr(s);
-                }
-                self.buf.push(')');
-            }
-            ExprKind::ThreadLast { initial, steps } => {
-                self.buf.push_str("(->> ");
-                self.print_expr(*initial);
-                for &s in steps {
-                    self.buf.push(' ');
-                    self.print_expr(s);
-                }
-                self.buf.push(')');
-            }
+
             ExprKind::Unsafe { body } => {
                 self.buf.push_str("(unsafe");
                 for &e in body {

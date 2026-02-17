@@ -1,12 +1,12 @@
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types;
+use cranelift_codegen::ir::MemFlags;
 use cranelift_codegen::ir::{AbiParam, BlockArg, Function, InstBuilder, Type, Value};
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_codegen::ir::MemFlags;
 use cranelift_module::{DataId, FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use smol_str::SmolStr;
@@ -78,7 +78,12 @@ extern "C" fn weir_print_f64(val: f64) {
 extern "C" fn weir_print_bool(val: i8) {
     OUTPUT_BUF.with(|buf| {
         use std::fmt::Write;
-        write!(buf.borrow_mut(), "{}", if val != 0 { "true" } else { "false" }).unwrap();
+        write!(
+            buf.borrow_mut(),
+            "{}",
+            if val != 0 { "true" } else { "false" }
+        )
+        .unwrap();
     });
 }
 
@@ -142,7 +147,9 @@ fn is_signed(ty: &Ty) -> bool {
 
 // ── ISA construction (shared between JIT and AOT) ───────────────
 
-fn make_isa(pic: bool) -> Result<std::sync::Arc<dyn cranelift_codegen::isa::TargetIsa>, CodegenError> {
+fn make_isa(
+    pic: bool,
+) -> Result<std::sync::Arc<dyn cranelift_codegen::isa::TargetIsa>, CodegenError> {
     let mut flag_builder = settings::builder();
     flag_builder
         .set("opt_level", "speed")
@@ -153,8 +160,8 @@ fn make_isa(pic: bool) -> Result<std::sync::Arc<dyn cranelift_codegen::isa::Targ
             .map_err(|e| CodegenError::new(format!("setting is_pic: {}", e)))?;
     }
 
-    let isa_builder = cranelift_native::builder()
-        .map_err(|e| CodegenError::new(format!("native ISA: {}", e)))?;
+    let isa_builder =
+        cranelift_native::builder().map_err(|e| CodegenError::new(format!("native ISA: {}", e)))?;
 
     isa_builder
         .finish(settings::Flags::new(flag_builder))
@@ -185,7 +192,9 @@ pub fn compile_and_run(
     compiler.declare_runtime_helpers()?;
     compiler.declare_user_functions(Linkage::Local)?;
     compiler.compile_user_functions()?;
-    compiler.module.finalize_definitions()
+    compiler
+        .module
+        .finalize_definitions()
         .map_err(|e| CodegenError::new(format!("finalize: {}", e)))?;
     compiler.run_main()
 }
@@ -212,7 +221,9 @@ pub fn compile_to_object(
     compiler.compile_user_functions()?;
 
     let product = compiler.module.finish();
-    product.emit().map_err(|e| CodegenError::new(format!("emit object: {}", e)))
+    product
+        .emit()
+        .map_err(|e| CodegenError::new(format!("emit object: {}", e)))
 }
 
 pub fn build_executable(
@@ -225,7 +236,11 @@ pub fn build_executable(
 
     let obj_bytes = compile_to_object(module, type_info)?;
 
-    let unique = format!("{}_{}", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed));
+    let unique = format!(
+        "{}_{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
     let tmp_dir = std::env::temp_dir();
     let obj_path = tmp_dir.join(format!("weir_output_{}.o", unique));
     let runtime_path = tmp_dir.join(format!("weir_runtime_{}.c", unique));
@@ -269,11 +284,7 @@ struct Compiler<'a, M: Module> {
 }
 
 impl<'a, M: Module> Compiler<'a, M> {
-    fn new(
-        ast_module: &'a weir_ast::Module,
-        type_info: &'a TypeCheckResult,
-        module: M,
-    ) -> Self {
+    fn new(ast_module: &'a weir_ast::Module, type_info: &'a TypeCheckResult, module: M) -> Self {
         Self {
             ast_module,
             type_info,
@@ -290,7 +301,8 @@ impl<'a, M: Module> Compiler<'a, M> {
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(types::I64));
         sig.call_conv = CallConv::SystemV;
-        let id = self.module
+        let id = self
+            .module
             .declare_function("weir_print_i64", Linkage::Import, &sig)
             .map_err(|e| CodegenError::new(format!("declare weir_print_i64: {}", e)))?;
         self.runtime_fns.insert("print_i64", id);
@@ -299,7 +311,8 @@ impl<'a, M: Module> Compiler<'a, M> {
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(types::F64));
         sig.call_conv = CallConv::SystemV;
-        let id = self.module
+        let id = self
+            .module
             .declare_function("weir_print_f64", Linkage::Import, &sig)
             .map_err(|e| CodegenError::new(format!("declare weir_print_f64: {}", e)))?;
         self.runtime_fns.insert("print_f64", id);
@@ -308,7 +321,8 @@ impl<'a, M: Module> Compiler<'a, M> {
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(types::I8));
         sig.call_conv = CallConv::SystemV;
-        let id = self.module
+        let id = self
+            .module
             .declare_function("weir_print_bool", Linkage::Import, &sig)
             .map_err(|e| CodegenError::new(format!("declare weir_print_bool: {}", e)))?;
         self.runtime_fns.insert("print_bool", id);
@@ -316,7 +330,8 @@ impl<'a, M: Module> Compiler<'a, M> {
         // weir_print_unit() -> void
         let mut sig = self.module.make_signature();
         sig.call_conv = CallConv::SystemV;
-        let id = self.module
+        let id = self
+            .module
             .declare_function("weir_print_unit", Linkage::Import, &sig)
             .map_err(|e| CodegenError::new(format!("declare weir_print_unit: {}", e)))?;
         self.runtime_fns.insert("print_unit", id);
@@ -324,7 +339,8 @@ impl<'a, M: Module> Compiler<'a, M> {
         // weir_print_newline() -> void
         let mut sig = self.module.make_signature();
         sig.call_conv = CallConv::SystemV;
-        let id = self.module
+        let id = self
+            .module
             .declare_function("weir_print_newline", Linkage::Import, &sig)
             .map_err(|e| CodegenError::new(format!("declare weir_print_newline: {}", e)))?;
         self.runtime_fns.insert("print_newline", id);
@@ -333,7 +349,8 @@ impl<'a, M: Module> Compiler<'a, M> {
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(types::I64));
         sig.call_conv = CallConv::SystemV;
-        let id = self.module
+        let id = self
+            .module
             .declare_function("weir_sleep_ms", Linkage::Import, &sig)
             .map_err(|e| CodegenError::new(format!("declare weir_sleep_ms: {}", e)))?;
         self.runtime_fns.insert("sleep_ms", id);
@@ -359,7 +376,8 @@ impl<'a, M: Module> Compiler<'a, M> {
                     sig.returns.push(AbiParam::new(cl_ty));
                 }
 
-                let func_id = self.module
+                let func_id = self
+                    .module
                     .declare_function(&defn.name, linkage, &sig)
                     .map_err(|e| CodegenError::new(format!("declare fn '{}': {}", defn.name, e)))?;
 
@@ -393,7 +411,8 @@ impl<'a, M: Module> Compiler<'a, M> {
                     (defn.name.as_str(), Linkage::Local)
                 };
 
-                let func_id = self.module
+                let func_id = self
+                    .module
                     .declare_function(export_name, linkage, &sig)
                     .map_err(|e| CodegenError::new(format!("declare fn '{}': {}", defn.name, e)))?;
 
@@ -515,10 +534,8 @@ impl<'a, M: Module> Compiler<'a, M> {
             sig.returns.push(AbiParam::new(cl_ty));
         }
 
-        let mut func = Function::with_name_signature(
-            cranelift_codegen::ir::UserFuncName::default(),
-            sig,
-        );
+        let mut func =
+            Function::with_name_signature(cranelift_codegen::ir::UserFuncName::default(), sig);
 
         let mut fb_ctx = FunctionBuilderContext::new();
         let mut builder = FunctionBuilder::new(&mut func, &mut fb_ctx);
@@ -548,7 +565,9 @@ impl<'a, M: Module> Compiler<'a, M> {
                 if let Some(cl_ty) = ty_to_cl(&param_tys[i]) {
                     let var = fn_ctx.declare_variable(cl_ty);
                     fn_ctx.builder.def_var(var, block_params[param_idx]);
-                    fn_ctx.vars.insert(param.name.clone(), (var, param_tys[i].clone()));
+                    fn_ctx
+                        .vars
+                        .insert(param.name.clone(), (var, param_tys[i].clone()));
                     param_idx += 1;
                 }
             }
@@ -744,9 +763,7 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                 }
             }
 
-            ExprKind::Ann { expr, .. } => {
-                self.compile_expr(*expr, &resolved_ty)
-            }
+            ExprKind::Ann { expr, .. } => self.compile_expr(*expr, &resolved_ty),
 
             _ => Err(CodegenError::new(format!(
                 "unsupported expression kind in codegen: {:?}",
@@ -757,15 +774,10 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
 
     // ── Literals ────────────────────────────────────────────────
 
-    fn compile_lit(
-        &mut self,
-        lit: &Literal,
-        ty: &Ty,
-    ) -> Result<Option<Value>, CodegenError> {
+    fn compile_lit(&mut self, lit: &Literal, ty: &Ty) -> Result<Option<Value>, CodegenError> {
         match lit {
             Literal::Int(n) => {
-                let cl_ty = ty_to_cl(ty)
-                    .unwrap_or(types::I64);
+                let cl_ty = ty_to_cl(ty).unwrap_or(types::I64);
                 let val = self.builder.ins().iconst(cl_ty, *n);
                 Ok(Some(val))
             }
@@ -856,12 +868,19 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                         // Load function pointer from table
                         let table_gv = self.module.declare_data_in_func(data_id, self.builder.func);
                         let table_base = self.builder.ins().global_value(types::I64, table_gv);
-                        let offset = self.builder.ins().iconst(types::I64, (slot_index * 8) as i64);
+                        let offset = self
+                            .builder
+                            .ins()
+                            .iconst(types::I64, (slot_index * 8) as i64);
                         let slot_addr = self.builder.ins().iadd(table_base, offset);
-                        let fn_ptr = self.builder.ins().load(types::I64, MemFlags::trusted(), slot_addr, 0);
+                        let fn_ptr =
+                            self.builder
+                                .ins()
+                                .load(types::I64, MemFlags::trusted(), slot_addr, 0);
 
                         let sig_ref = self.builder.import_signature(sig);
-                        let call_inst = self.builder.ins().call_indirect(sig_ref, fn_ptr, &arg_vals);
+                        let call_inst =
+                            self.builder.ins().call_indirect(sig_ref, fn_ptr, &arg_vals);
 
                         if ty_to_cl(&ret_ty).is_some() {
                             let results = self.builder.inst_results(call_inst);
@@ -1087,16 +1106,19 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
         let val = self.compile_expr(args[0].value, &arg_ty)?;
 
         let (helper_name, need_extend) = match &arg_ty {
-            Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 |
-            Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 => ("print_i64", true),
+            Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 => {
+                ("print_i64", true)
+            }
             Ty::F32 => ("print_f64", true),
             Ty::F64 => ("print_f64", false),
             Ty::Bool => ("print_bool", false),
             Ty::Unit => ("print_unit", false),
-            _ => return Err(CodegenError::new(format!(
-                "cannot print type {} in codegen",
-                arg_ty
-            ))),
+            _ => {
+                return Err(CodegenError::new(format!(
+                    "cannot print type {} in codegen",
+                    arg_ty
+                )))
+            }
         };
 
         let func_id = self.runtime_fns[helper_name];
@@ -1110,15 +1132,9 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                 let val = val.unwrap();
                 let arg_val = if need_extend {
                     match &arg_ty {
-                        Ty::I8 | Ty::I16 | Ty::I32 => {
-                            self.builder.ins().sextend(types::I64, val)
-                        }
-                        Ty::U8 | Ty::U16 | Ty::U32 => {
-                            self.builder.ins().uextend(types::I64, val)
-                        }
-                        Ty::F32 => {
-                            self.builder.ins().fpromote(types::F64, val)
-                        }
+                        Ty::I8 | Ty::I16 | Ty::I32 => self.builder.ins().sextend(types::I64, val),
+                        Ty::U8 | Ty::U16 | Ty::U32 => self.builder.ins().uextend(types::I64, val),
+                        Ty::F32 => self.builder.ins().fpromote(types::F64, val),
                         _ => val, // I64, U64 already right size
                     }
                 } else {
@@ -1135,7 +1151,9 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
 
     fn compile_sleep(&mut self, args: &[Arg]) -> Result<Option<Value>, CodegenError> {
         if args.len() != 1 {
-            return Err(CodegenError::new("sleep expects exactly 1 argument (milliseconds)"));
+            return Err(CodegenError::new(
+                "sleep expects exactly 1 argument (milliseconds)",
+            ));
         }
         let arg_ty = self.expr_ty(args[0].value);
         let val = self.compile_expr(args[0].value, &arg_ty)?.unwrap();
@@ -1173,7 +1191,9 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
             self.builder.append_block_param(merge_block, cl_ty);
         }
 
-        self.builder.ins().brif(cond_val, then_block, &[], else_block, &[]);
+        self.builder
+            .ins()
+            .brif(cond_val, then_block, &[], else_block, &[]);
 
         // Then branch
         self.builder.switch_to_block(then_block);
@@ -1181,7 +1201,9 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
         let then_val = self.compile_expr(then_branch, result_ty)?;
         if has_value {
             let val = then_val.unwrap_or_else(|| self.zero_value(result_ty));
-            self.builder.ins().jump(merge_block, &[BlockArg::Value(val)]);
+            self.builder
+                .ins()
+                .jump(merge_block, &[BlockArg::Value(val)]);
         } else {
             self.builder.ins().jump(merge_block, &[]);
         }
@@ -1193,7 +1215,9 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
             let else_val = self.compile_expr(else_id, result_ty)?;
             if has_value {
                 let val = else_val.unwrap_or_else(|| self.zero_value(result_ty));
-                self.builder.ins().jump(merge_block, &[BlockArg::Value(val)]);
+                self.builder
+                    .ins()
+                    .jump(merge_block, &[BlockArg::Value(val)]);
             } else {
                 self.builder.ins().jump(merge_block, &[]);
             }
@@ -1234,14 +1258,18 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
             let next_block = self.builder.create_block();
 
             let cond_val = self.compile_expr(*test_id, &Ty::Bool)?.unwrap();
-            self.builder.ins().brif(cond_val, then_block, &[], next_block, &[]);
+            self.builder
+                .ins()
+                .brif(cond_val, then_block, &[], next_block, &[]);
 
             self.builder.switch_to_block(then_block);
             self.builder.seal_block(then_block);
             let body_val = self.compile_expr(*body_id, result_ty)?;
             if has_value {
                 let val = body_val.unwrap_or_else(|| self.zero_value(result_ty));
-                self.builder.ins().jump(merge_block, &[BlockArg::Value(val)]);
+                self.builder
+                    .ins()
+                    .jump(merge_block, &[BlockArg::Value(val)]);
             } else {
                 self.builder.ins().jump(merge_block, &[]);
             }
@@ -1255,7 +1283,9 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
             let else_val = self.compile_expr(else_id, result_ty)?;
             if has_value {
                 let val = else_val.unwrap_or_else(|| self.zero_value(result_ty));
-                self.builder.ins().jump(merge_block, &[BlockArg::Value(val)]);
+                self.builder
+                    .ins()
+                    .jump(merge_block, &[BlockArg::Value(val)]);
             } else {
                 self.builder.ins().jump(merge_block, &[]);
             }
@@ -1263,7 +1293,9 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
             // No else — jump to merge with default
             if has_value {
                 let zero = self.zero_value(result_ty);
-                self.builder.ins().jump(merge_block, &[BlockArg::Value(zero)]);
+                self.builder
+                    .ins()
+                    .jump(merge_block, &[BlockArg::Value(zero)]);
             } else {
                 self.builder.ins().jump(merge_block, &[]);
             }
@@ -1295,10 +1327,14 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
 
         if invert {
             // unless: run body when condition is false
-            self.builder.ins().brif(cond_val, merge_block, &[], body_block, &[]);
+            self.builder
+                .ins()
+                .brif(cond_val, merge_block, &[], body_block, &[]);
         } else {
             // when: run body when condition is true
-            self.builder.ins().brif(cond_val, body_block, &[], merge_block, &[]);
+            self.builder
+                .ins()
+                .brif(cond_val, body_block, &[], merge_block, &[]);
         }
 
         self.builder.switch_to_block(body_block);
@@ -1496,8 +1532,12 @@ impl DevSession {
             self.fn_table = new_table.into_boxed_slice();
         }
 
-        let (jit_module, user_fns, new_fn_sigs) =
-            compile_dev_module(&ast_module, &type_info, self.fn_table.as_ptr(), &new_fn_slots)?;
+        let (jit_module, user_fns, new_fn_sigs) = compile_dev_module(
+            &ast_module,
+            &type_info,
+            self.fn_table.as_ptr(),
+            &new_fn_slots,
+        )?;
 
         // Swap function pointers in the table
         let mut reloaded_names = Vec::new();
@@ -1564,7 +1604,10 @@ impl DevSession {
             main_fn();
         });
 
-        eprintln!("[weir dev] running — watching {} for changes", source_path.display());
+        eprintln!(
+            "[weir dev] running — watching {} for changes",
+            source_path.display()
+        );
 
         // Set up file watcher
         let (tx, rx) = mpsc::channel();
@@ -1577,9 +1620,7 @@ impl DevSession {
         })
         .map_err(|e| CodegenError::new(format!("watcher setup: {}", e)))?;
 
-        let watch_path = source_path
-            .parent()
-            .unwrap_or(Path::new("."));
+        let watch_path = source_path.parent().unwrap_or(Path::new("."));
         watcher
             .watch(watch_path, RecursiveMode::NonRecursive)
             .map_err(|e| CodegenError::new(format!("watch: {}", e)))?;
@@ -1611,10 +1652,7 @@ impl DevSession {
 
                     match self.reload(&new_source) {
                         Ok(names) => {
-                            eprintln!(
-                                "[weir dev] reloaded: {}",
-                                names.join(", ")
-                            );
+                            eprintln!("[weir dev] reloaded: {}", names.join(", "));
                         }
                         Err(e) => {
                             eprintln!("[weir dev] reload error (old code still running): {}", e);
@@ -1636,13 +1674,20 @@ impl DevSession {
 mod tests {
     use super::*;
 
-    fn compile_run(source: &str) -> String {
-        let (module, parse_errors) = weir_parser::parse(source);
+    fn expand(source: &str) -> String {
+        let result = weir_macros::expand(source);
         assert!(
-            parse_errors.is_empty(),
-            "parse errors: {:?}",
-            parse_errors
+            result.errors.is_empty(),
+            "macro errors: {:?}",
+            result.errors
         );
+        result.source
+    }
+
+    fn compile_run(source: &str) -> String {
+        let expanded = expand(source);
+        let (module, parse_errors) = weir_parser::parse(&expanded);
+        assert!(parse_errors.is_empty(), "parse errors: {:?}", parse_errors);
         let type_info = weir_typeck::check(&module);
         assert!(
             type_info.errors.is_empty(),
@@ -1653,12 +1698,9 @@ mod tests {
     }
 
     fn interp_run(source: &str) -> String {
-        let (module, parse_errors) = weir_parser::parse(source);
-        assert!(
-            parse_errors.is_empty(),
-            "parse errors: {:?}",
-            parse_errors
-        );
+        let expanded = expand(source);
+        let (module, parse_errors) = weir_parser::parse(&expanded);
+        assert!(parse_errors.is_empty(), "parse errors: {:?}", parse_errors);
         weir_interp::interpret(&module).expect("interpreter error")
     }
 
@@ -2019,28 +2061,51 @@ mod tests {
     fn fixture_codegen_arithmetic() {
         let compiled = run_fixture_compiled("codegen-arithmetic");
         let interpreted = run_fixture_interpreted("codegen-arithmetic");
-        assert_eq!(compiled, interpreted, "codegen-arithmetic: compiler and interpreter disagree");
+        assert_eq!(
+            compiled, interpreted,
+            "codegen-arithmetic: compiler and interpreter disagree"
+        );
     }
 
     #[test]
     fn fixture_codegen_control_flow() {
         let compiled = run_fixture_compiled("codegen-control-flow");
         let interpreted = run_fixture_interpreted("codegen-control-flow");
-        assert_eq!(compiled, interpreted, "codegen-control-flow: compiler and interpreter disagree");
+        assert_eq!(
+            compiled, interpreted,
+            "codegen-control-flow: compiler and interpreter disagree"
+        );
     }
 
     #[test]
     fn fixture_codegen_functions() {
         let compiled = run_fixture_compiled("codegen-functions");
         let interpreted = run_fixture_interpreted("codegen-functions");
-        assert_eq!(compiled, interpreted, "codegen-functions: compiler and interpreter disagree");
+        assert_eq!(
+            compiled, interpreted,
+            "codegen-functions: compiler and interpreter disagree"
+        );
     }
 
     #[test]
     fn fixture_codegen_let_mutation() {
         let compiled = run_fixture_compiled("codegen-let-mutation");
         let interpreted = run_fixture_interpreted("codegen-let-mutation");
-        assert_eq!(compiled, interpreted, "codegen-let-mutation: compiler and interpreter disagree");
+        assert_eq!(
+            compiled, interpreted,
+            "codegen-let-mutation: compiler and interpreter disagree"
+        );
+    }
+
+    #[test]
+    fn fixture_macros() {
+        let compiled = run_fixture_compiled("macros");
+        let interpreted = run_fixture_interpreted("macros");
+        assert_eq!(
+            compiled, interpreted,
+            "macros: compiler and interpreter disagree"
+        );
+        assert_eq!(compiled, "12\n30\n33\n100\n200\n300\n");
     }
 
     // ── AOT compilation tests ───────────────────────────────────
@@ -2134,11 +2199,13 @@ mod tests {
         let aot_output = String::from_utf8(output.stdout).unwrap();
         assert_eq!(
             jit_output, interp_output,
-            "{}: JIT and interpreter disagree", name
+            "{}: JIT and interpreter disagree",
+            name
         );
         assert_eq!(
             jit_output, aot_output,
-            "{}: JIT and AOT disagree\nJIT: {:?}\nAOT: {:?}", name, jit_output, aot_output
+            "{}: JIT and AOT disagree\nJIT: {:?}\nAOT: {:?}",
+            name, jit_output, aot_output
         );
     }
 
@@ -2218,23 +2285,35 @@ mod tests {
         assert!(result.is_err(), "reload with broken source should fail");
 
         // Old code should still work
-        let out2 = session.run_main().expect("run_main after failed reload should work");
+        let out2 = session
+            .run_main()
+            .expect("run_main after failed reload should work");
         assert_eq!(out2, "42\n");
     }
 
     #[test]
     fn test_dev_session_all_fixtures() {
         // Verify all codegen fixtures produce same output in dev mode as JIT
-        for name in &["codegen-arithmetic", "codegen-control-flow", "codegen-functions", "codegen-let-mutation"] {
+        for name in &[
+            "codegen-arithmetic",
+            "codegen-control-flow",
+            "codegen-functions",
+            "codegen-let-mutation",
+        ] {
             let path = fixture_path(name);
             let source = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("could not read fixture {}: {}", path, e));
             let jit_output = compile_run(&source);
             let session = DevSession::new(&source)
                 .unwrap_or_else(|e| panic!("DevSession::new failed for {}: {}", name, e));
-            let dev_output = session.run_main()
+            let dev_output = session
+                .run_main()
                 .unwrap_or_else(|e| panic!("run_main failed for {}: {}", name, e));
-            assert_eq!(jit_output, dev_output, "{}: JIT and dev-mode disagree", name);
+            assert_eq!(
+                jit_output, dev_output,
+                "{}: JIT and dev-mode disagree",
+                name
+            );
         }
     }
 }

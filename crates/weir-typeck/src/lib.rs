@@ -119,7 +119,11 @@ pub struct TypeError {
 
 impl fmt::Display for TypeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "[{}:{}] {}", self.span.start, self.span.end, self.message)
+        write!(
+            f,
+            "[{}:{}] {}",
+            self.span.start, self.span.end, self.message
+        )
     }
 }
 
@@ -360,12 +364,8 @@ impl<'a> TypeChecker<'a> {
                 self.var_kinds[*other_id as usize] = kind_a;
             } else if kind_b != VarKind::General && kind_a == VarKind::General {
                 self.var_kinds[var_id as usize] = kind_b;
-            } else if kind_a != kind_b && kind_a != VarKind::General && kind_b != VarKind::General
-            {
-                self.error(
-                    "cannot unify integer literal with float literal",
-                    span,
-                );
+            } else if kind_a != kind_b && kind_a != VarKind::General && kind_b != VarKind::General {
+                self.error("cannot unify integer literal with float literal", span);
                 return false;
             }
             return true;
@@ -478,7 +478,10 @@ impl<'a> TypeChecker<'a> {
                 params,
                 return_type,
             } => {
-                let p: Vec<Ty> = params.iter().map(|&id| self.resolve_type_expr(id)).collect();
+                let p: Vec<Ty> = params
+                    .iter()
+                    .map(|&id| self.resolve_type_expr(id))
+                    .collect();
                 let r = self.resolve_type_expr(*return_type);
                 Ty::Fn(p, Box::new(r))
             }
@@ -495,10 +498,7 @@ impl<'a> TypeChecker<'a> {
                         return Ty::Vector(Box::new(arg_tys[0].clone()));
                     }
                     if name == "Map" && arg_tys.len() == 2 {
-                        return Ty::Map(
-                            Box::new(arg_tys[0].clone()),
-                            Box::new(arg_tys[1].clone()),
-                        );
+                        return Ty::Map(Box::new(arg_tys[0].clone()), Box::new(arg_tys[1].clone()));
                     }
 
                     Ty::Con(name, arg_tys)
@@ -558,7 +558,12 @@ impl<'a> TypeChecker<'a> {
         // Register builtins
         self.register_builtin_schemes();
 
-        let items: Vec<_> = self.module.items.iter().map(|(item, _)| item.clone()).collect();
+        let items: Vec<_> = self
+            .module
+            .items
+            .iter()
+            .map(|(item, _)| item.clone())
+            .collect();
 
         for item in &items {
             match item {
@@ -598,8 +603,11 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn collect_defstruct(&mut self, d: &Defstruct) {
-        let fields: Vec<(SmolStr, TypeExprId)> =
-            d.fields.iter().map(|f| (f.name.clone(), f.type_ann)).collect();
+        let fields: Vec<(SmolStr, TypeExprId)> = d
+            .fields
+            .iter()
+            .map(|f| (f.name.clone(), f.type_ann))
+            .collect();
         self.struct_defs.insert(
             d.name.clone(),
             StructDef {
@@ -676,7 +684,10 @@ impl<'a> TypeChecker<'a> {
         let fn_names: Vec<SmolStr> = self.fn_schemes.keys().cloned().collect();
         for name in &fn_names {
             let scheme = self.fn_schemes[name].clone();
-            let fn_ty = Ty::Fn(scheme.param_types.clone(), Box::new(scheme.return_type.clone()));
+            let fn_ty = Ty::Fn(
+                scheme.param_types.clone(),
+                Box::new(scheme.return_type.clone()),
+            );
             self.define_var(name.clone(), fn_ty);
         }
 
@@ -959,52 +970,6 @@ impl<'a> TypeChecker<'a> {
                 Ty::Map(Box::new(key_ty), Box::new(val_ty))
             }
 
-            ExprKind::ThreadFirst { initial, steps }
-            | ExprKind::ThreadLast { initial, steps } => {
-                let mut ty = self.check_expr(*initial);
-                for &step_id in steps {
-                    let step = &self.module.exprs[step_id];
-                    match &step.kind {
-                        ExprKind::Var(_) | ExprKind::FieldAccess(_) => {
-                            let step_ty = self.check_expr(step_id);
-                            let ret = self.fresh_var();
-                            let fn_ty = Ty::Fn(vec![ty.clone()], Box::new(ret.clone()));
-                            self.unify(&step_ty, &fn_ty, step.span);
-                            ty = ret;
-                        }
-                        ExprKind::Call { func, args } => {
-                            let func_ty = self.check_expr(*func);
-                            let is_first =
-                                matches!(expr.kind, ExprKind::ThreadFirst { .. });
-                            let mut param_tys = Vec::new();
-                            let ret = self.fresh_var();
-
-                            if is_first {
-                                param_tys.push(ty.clone());
-                                for arg in args {
-                                    param_tys.push(self.check_expr(arg.value));
-                                }
-                            } else {
-                                for arg in args {
-                                    param_tys.push(self.check_expr(arg.value));
-                                }
-                                param_tys.push(ty.clone());
-                            }
-
-                            let expected_fn =
-                                Ty::Fn(param_tys, Box::new(ret.clone()));
-                            self.unify(&func_ty, &expected_fn, step.span);
-                            ty = ret;
-                        }
-                        _ => {
-                            self.error("threading step must be a function or call", step.span);
-                            ty = Ty::Error;
-                        }
-                    }
-                }
-                ty
-            }
-
             ExprKind::Unsafe { body } => self.check_body(body),
 
             ExprKind::Try(inner) => {
@@ -1042,8 +1007,7 @@ impl<'a> TypeChecker<'a> {
 
             // Check for ADT constructor call
             if let Some(info) = self.constructors.get(name).cloned() {
-                let con_ty =
-                    self.instantiate_constructor(&info.0, &info.1, &info.2);
+                let con_ty = self.instantiate_constructor(&info.0, &info.1, &info.2);
                 let arg_tys: Vec<Ty> = args.iter().map(|a| self.check_expr(a.value)).collect();
 
                 let ret = self.fresh_var();
@@ -1141,10 +1105,7 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
 
-                self.error(
-                    format!("struct {} has no field '{}'", name, field),
-                    span,
-                );
+                self.error(format!("struct {} has no field '{}'", name, field), span);
                 return Ty::Error;
             }
         }
@@ -1161,21 +1122,20 @@ impl<'a> TypeChecker<'a> {
         Ty::Error
     }
 
-    fn check_struct_construction(
-        &mut self,
-        sdef: &StructDef,
-        args: &[Arg],
-        span: Span,
-    ) -> Ty {
+    fn check_struct_construction(&mut self, sdef: &StructDef, args: &[Arg], span: Span) -> Ty {
         // Create fresh type vars for type params
         let saved = self.type_param_scope.clone();
         self.type_param_scope.clear();
 
-        let type_args: Vec<Ty> = sdef.params.iter().map(|p| {
-            let v = self.fresh_var();
-            self.type_param_scope.insert(p.clone(), v.clone());
-            v
-        }).collect();
+        let type_args: Vec<Ty> = sdef
+            .params
+            .iter()
+            .map(|p| {
+                let v = self.fresh_var();
+                self.type_param_scope.insert(p.clone(), v.clone());
+                v
+            })
+            .collect();
 
         let has_named = args.iter().any(|a| a.name.is_some());
 
@@ -1353,10 +1313,8 @@ impl<'a> TypeChecker<'a> {
 
                         let mut bindings = Vec::new();
                         for field_pat in &fields {
-                            let field_def = sdef
-                                .fields
-                                .iter()
-                                .find(|(n, _)| *n == field_pat.field_name);
+                            let field_def =
+                                sdef.fields.iter().find(|(n, _)| *n == field_pat.field_name);
                             if let Some((_, ftype_id)) = field_def {
                                 let saved = self.type_param_scope.clone();
                                 self.type_param_scope = mapping
@@ -1428,7 +1386,10 @@ impl<'a> TypeChecker<'a> {
                 if !missing.is_empty() {
                     let names: Vec<&str> = missing.iter().map(|n| n.as_str()).collect();
                     self.error(
-                        format!("non-exhaustive match: missing variants: {}", names.join(", ")),
+                        format!(
+                            "non-exhaustive match: missing variants: {}",
+                            names.join(", ")
+                        ),
                         span,
                     );
                 }
@@ -1610,11 +1571,7 @@ mod tests {
 
     fn check_src(source: &str) -> Vec<TypeError> {
         let (module, parse_errors) = weir_parser::parse(source);
-        assert!(
-            parse_errors.is_empty(),
-            "parse errors: {:?}",
-            parse_errors
-        );
+        assert!(parse_errors.is_empty(), "parse errors: {:?}", parse_errors);
         let result = check(&module);
         result.errors
     }
@@ -1627,7 +1584,11 @@ mod tests {
     fn check_err(source: &str) -> String {
         let errors = check_src(source);
         assert!(!errors.is_empty(), "expected type errors, got none");
-        errors.iter().map(|e| e.message.clone()).collect::<Vec<_>>().join("\n")
+        errors
+            .iter()
+            .map(|e| e.message.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     // ── Passing programs ─────────────────────────────────────────

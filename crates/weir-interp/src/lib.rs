@@ -303,8 +303,11 @@ impl<'a> Interpreter<'a> {
             "println", "print", "str", "len", "nth", "append", "type-of",
         ];
         for name in builtins {
-            self.global_env
-                .define(SmolStr::new(name), Value::Builtin(SmolStr::new(name)), false);
+            self.global_env.define(
+                SmolStr::new(name),
+                Value::Builtin(SmolStr::new(name)),
+                false,
+            );
         }
     }
 
@@ -490,11 +493,8 @@ impl<'a> Interpreter<'a> {
                 ))
             }
 
-            ExprKind::Lambda {
-                params, body, ..
-            } => {
-                let param_names: Vec<SmolStr> =
-                    params.iter().map(|p| p.name.clone()).collect();
+            ExprKind::Lambda { params, body, .. } => {
+                let param_names: Vec<SmolStr> = params.iter().map(|p| p.name.clone()).collect();
                 Ok(Value::Closure {
                     name: None,
                     params: param_names,
@@ -548,14 +548,6 @@ impl<'a> Interpreter<'a> {
                 Ok(Value::Map(vals))
             }
 
-            ExprKind::ThreadFirst { initial, steps } => {
-                self.eval_thread(env, *initial, steps, true, span)
-            }
-
-            ExprKind::ThreadLast { initial, steps } => {
-                self.eval_thread(env, *initial, steps, false, span)
-            }
-
             ExprKind::Unsafe { body } => self.eval_body(env, body),
 
             ExprKind::Try(inner) => {
@@ -592,18 +584,11 @@ impl<'a> Interpreter<'a> {
     ) -> Result<Value, InterpError> {
         match func {
             Value::Closure {
-                params,
-                body,
-                env,
-                ..
+                params, body, env, ..
             } => {
                 if args.len() != params.len() {
                     return Err(InterpError::with_span(
-                        format!(
-                            "expected {} arguments, got {}",
-                            params.len(),
-                            args.len()
-                        ),
+                        format!("expected {} arguments, got {}", params.len(), args.len()),
                         span,
                     ));
                 }
@@ -711,12 +696,7 @@ impl<'a> Interpreter<'a> {
 
     // ── Field access ─────────────────────────────────────────────
 
-    fn field_access(
-        &self,
-        obj: &Value,
-        field: &str,
-        span: Span,
-    ) -> Result<Value, InterpError> {
+    fn field_access(&self, obj: &Value, field: &str, span: Span) -> Result<Value, InterpError> {
         match obj {
             Value::StructInstance { type_name, fields } => {
                 for (name, val) in fields {
@@ -746,65 +726,6 @@ impl<'a> Interpreter<'a> {
                 span,
             )),
         }
-    }
-
-    // ── Threading ────────────────────────────────────────────────
-
-    fn eval_thread(
-        &mut self,
-        env: &Env,
-        initial: ExprId,
-        steps: &[ExprId],
-        is_first: bool,
-        span: Span,
-    ) -> Result<Value, InterpError> {
-        let mut val = self.eval_expr(env, initial)?;
-
-        for &step_id in steps {
-            let step_expr = &self.module.exprs[step_id];
-            match &step_expr.kind {
-                ExprKind::Var(name) => {
-                    let func = env.lookup(name).ok_or_else(|| {
-                        InterpError::with_span(
-                            format!("undefined variable '{}'", name),
-                            step_expr.span,
-                        )
-                    })?;
-                    val = self.call_value(&func, &[val], step_expr.span)?;
-                }
-                ExprKind::FieldAccess(field) => {
-                    val = self.field_access(&val, field, step_expr.span)?;
-                }
-                ExprKind::Call { func, args } => {
-                    let func_val = self.eval_expr(env, *func)?;
-                    let mut call_args: Vec<Value> = Vec::new();
-
-                    if is_first {
-                        // Thread-first: insert as first arg
-                        call_args.push(val);
-                        for arg in args {
-                            call_args.push(self.eval_expr(env, arg.value)?);
-                        }
-                    } else {
-                        // Thread-last: insert as last arg
-                        for arg in args {
-                            call_args.push(self.eval_expr(env, arg.value)?);
-                        }
-                        call_args.push(val);
-                    }
-
-                    val = self.call_value(&func_val, &call_args, step_expr.span)?;
-                }
-                _ => {
-                    return Err(InterpError::with_span(
-                        "threading step must be a function name or call",
-                        span,
-                    ));
-                }
-            }
-        }
-
-        Ok(val)
     }
 
     // ── Pattern matching ─────────────────────────────────────────
@@ -905,7 +826,10 @@ impl<'a> Interpreter<'a> {
 
             "-" => {
                 if args.is_empty() {
-                    return Err(InterpError::with_span("- requires at least 1 argument", span));
+                    return Err(InterpError::with_span(
+                        "- requires at least 1 argument",
+                        span,
+                    ));
                 }
                 if args.len() == 1 {
                     return match &args[0] {
@@ -919,7 +843,10 @@ impl<'a> Interpreter<'a> {
 
             "/" => {
                 if args.len() < 2 {
-                    return Err(InterpError::with_span("/ requires at least 2 arguments", span));
+                    return Err(InterpError::with_span(
+                        "/ requires at least 2 arguments",
+                        span,
+                    ));
                 }
                 // Check for division by zero
                 for arg in &args[1..] {
@@ -938,7 +865,10 @@ impl<'a> Interpreter<'a> {
 
             "mod" => {
                 if args.len() != 2 {
-                    return Err(InterpError::with_span("mod requires exactly 2 arguments", span));
+                    return Err(InterpError::with_span(
+                        "mod requires exactly 2 arguments",
+                        span,
+                    ));
                 }
                 match (&args[0], &args[1]) {
                     (Value::Int(a), Value::Int(b)) => {
@@ -950,7 +880,10 @@ impl<'a> Interpreter<'a> {
                     (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a % b)),
                     (Value::Int(a), Value::Float(b)) => Ok(Value::Float((*a as f64) % b)),
                     (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a % (*b as f64))),
-                    _ => Err(InterpError::with_span("mod expects numeric arguments", span)),
+                    _ => Err(InterpError::with_span(
+                        "mod expects numeric arguments",
+                        span,
+                    )),
                 }
             }
 
@@ -961,21 +894,30 @@ impl<'a> Interpreter<'a> {
 
             "=" => {
                 if args.len() != 2 {
-                    return Err(InterpError::with_span("= requires exactly 2 arguments", span));
+                    return Err(InterpError::with_span(
+                        "= requires exactly 2 arguments",
+                        span,
+                    ));
                 }
                 Ok(Value::Bool(args[0] == args[1]))
             }
 
             "!=" => {
                 if args.len() != 2 {
-                    return Err(InterpError::with_span("!= requires exactly 2 arguments", span));
+                    return Err(InterpError::with_span(
+                        "!= requires exactly 2 arguments",
+                        span,
+                    ));
                 }
                 Ok(Value::Bool(args[0] != args[1]))
             }
 
             "not" => {
                 if args.len() != 1 {
-                    return Err(InterpError::with_span("not requires exactly 1 argument", span));
+                    return Err(InterpError::with_span(
+                        "not requires exactly 1 argument",
+                        span,
+                    ));
                 }
                 Ok(Value::Bool(!args[0].is_truthy()))
             }
@@ -1062,10 +1004,7 @@ impl<'a> Interpreter<'a> {
                             ))
                         }
                     }
-                    _ => Err(InterpError::with_span(
-                        "nth expects (vector, int)",
-                        span,
-                    )),
+                    _ => Err(InterpError::with_span("nth expects (vector, int)", span)),
                 }
             }
 
@@ -1237,9 +1176,9 @@ impl<'a> Interpreter<'a> {
         }
         let ord = match (&args[0], &args[1]) {
             (Value::Int(a), Value::Int(b)) => a.cmp(b),
-            (Value::Float(a), Value::Float(b)) => a
-                .partial_cmp(b)
-                .unwrap_or(std::cmp::Ordering::Equal),
+            (Value::Float(a), Value::Float(b)) => {
+                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+            }
             (Value::Int(a), Value::Float(b)) => (*a as f64)
                 .partial_cmp(b)
                 .unwrap_or(std::cmp::Ordering::Equal),
@@ -1265,7 +1204,13 @@ mod tests {
     use super::*;
 
     fn run(source: &str) -> Result<String, InterpError> {
-        let (module, errors) = weir_parser::parse(source);
+        let expanded = weir_macros::expand(source);
+        assert!(
+            expanded.errors.is_empty(),
+            "macro errors: {:?}",
+            expanded.errors
+        );
+        let (module, errors) = weir_parser::parse(&expanded.source);
         assert!(errors.is_empty(), "parse errors: {:?}", errors);
         interpret(&module)
     }
@@ -1398,11 +1343,9 @@ mod tests {
 
     #[test]
     fn test_immutable_set_error() {
-        let result = run(
-            "(defn main ()
+        let result = run("(defn main ()
                (let ((x 0))
-                 (set! x 42)))",
-        );
+                 (set! x 42)))");
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -1639,24 +1582,24 @@ mod tests {
     }
 
     #[test]
-    fn test_threading_first() {
+    fn test_threading_first_expanded() {
+        // After macro expansion, (-> 5 add1 double) becomes (double (add1 5))
         let output = run_ok(
             "(defn add1 (x) (+ x 1))
              (defn double (x) (* x 2))
              (defn main ()
-               (println (-> 5 add1 double)))",
+               (println (double (add1 5))))",
         );
-        // (-> 5 add1 double) = (double (add1 5)) = (* (+ 5 1) 2) = 12
         assert_eq!(output, "12\n");
     }
 
     #[test]
-    fn test_threading_with_calls() {
+    fn test_threading_with_calls_expanded() {
+        // After macro expansion, (-> 10 (+ 5) (* 2)) becomes (* (+ 10 5) 2)
         let output = run_ok(
             "(defn main ()
-               (println (-> 10 (+ 5) (* 2))))",
+               (println (* (+ 10 5) 2)))",
         );
-        // (-> 10 (+ 5) (* 2)) = (* (+ 10 5) 2) = 30
         assert_eq!(output, "30\n");
     }
 
@@ -1702,7 +1645,14 @@ mod tests {
         );
         let source = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("could not read fixture {}: {}", path, e));
-        let (module, errors) = weir_parser::parse(&source);
+        let expanded = weir_macros::expand(&source);
+        assert!(
+            expanded.errors.is_empty(),
+            "macro errors in {}: {:?}",
+            name,
+            expanded.errors
+        );
+        let (module, errors) = weir_parser::parse(&expanded.source);
         assert!(errors.is_empty(), "parse errors in {}: {:?}", name, errors);
         interpret(&module).unwrap_or_else(|e| panic!("runtime error in {}: {}", name, e))
     }
@@ -1770,6 +1720,18 @@ mod tests {
         Hello World
         Goodbye World
         === Done ===
+        ");
+    }
+
+    #[test]
+    fn fixture_macros() {
+        insta::assert_snapshot!(run_fixture("macros"), @r"
+        12
+        30
+        33
+        100
+        200
+        300
         ");
     }
 }

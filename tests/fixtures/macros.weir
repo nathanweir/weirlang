@@ -1,0 +1,35 @@
+;; Macro system test fixture
+
+;; Thread-first: (-> x f g) = (g (f x))
+(defn add1 ((x : i32)) : i32 (+ x 1))
+(defn double ((x : i32)) : i32 (* x 2))
+
+(defn test-threading () : Unit
+  ;; Simple threading: (-> 5 add1 double) = (double (add1 5)) = 12
+  (println (-> 5 add1 double))
+
+  ;; Threading with calls: (-> 10 (+ 5) (* 2)) = (* (+ 10 5) 2) = 30
+  (println (-> 10 (+ 5) (* 2)))
+
+  ;; Thread-last: (->> 1 (+ 10) (* 3)) = (* 3 (+ 10 1)) = 33
+  (println (->> 1 (+ 10) (* 3))))
+
+;; User-defined macro: unless
+(defmacro unless (cond body)
+  (if (not ,cond) ,body))
+
+;; User-defined macro with &rest
+(defmacro my-do (&rest body)
+  (do ,@body))
+
+(defn test-user-macros () : Unit
+  ;; unless: expands to (if (not false) (println 100))
+  (unless false (println 100))
+  ;; my-do: expands to (do (println 200) (println 300))
+  (my-do
+    (println 200)
+    (println 300)))
+
+(defn main () : Unit
+  (test-threading)
+  (test-user-macros))

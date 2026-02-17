@@ -30,6 +30,11 @@ enum Command {
         /// Path to the .weir source file
         file: PathBuf,
     },
+    /// Expand macros and print the result (like cargo expand)
+    Expand {
+        /// Path to the .weir source file
+        file: PathBuf,
+    },
     /// Compile a .weir file to a standalone native binary
     Build {
         /// Path to the .weir source file
@@ -45,20 +50,44 @@ enum Command {
     },
 }
 
+fn read_file(file: &std::path::Path) -> String {
+    match std::fs::read_to_string(file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: could not read {}: {}", file.display(), e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Run macro expansion on source, returning the expanded source string.
+/// Exits on expansion errors.
+fn expand_source(source: &str, file: &std::path::Path) -> String {
+    let result = weir_macros::expand(source);
+    if !result.errors.is_empty() {
+        for error in &result.errors {
+            eprintln!(
+                "{}:{}:{}: macro error: {}",
+                file.display(),
+                error.span.start,
+                error.span.end,
+                error.message
+            );
+        }
+        std::process::exit(1);
+    }
+    result.source
+}
+
 fn main() {
     let cli = Cli::parse();
 
     match cli.command {
         Command::Parse { file } => {
-            let source = match std::fs::read_to_string(&file) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("error: could not read {}: {}", file.display(), e);
-                    std::process::exit(1);
-                }
-            };
+            let source = read_file(&file);
+            let expanded = expand_source(&source, &file);
 
-            let (module, errors) = weir_parser::parse(&source);
+            let (module, errors) = weir_parser::parse(&expanded);
 
             if !errors.is_empty() {
                 for error in &errors {
@@ -79,15 +108,10 @@ fn main() {
             }
         }
         Command::Check { file } => {
-            let source = match std::fs::read_to_string(&file) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("error: could not read {}: {}", file.display(), e);
-                    std::process::exit(1);
-                }
-            };
+            let source = read_file(&file);
+            let expanded = expand_source(&source, &file);
 
-            let (module, parse_errors) = weir_parser::parse(&source);
+            let (module, parse_errors) = weir_parser::parse(&expanded);
 
             if !parse_errors.is_empty() {
                 for error in &parse_errors {
@@ -120,15 +144,10 @@ fn main() {
             }
         }
         Command::Run { file } => {
-            let source = match std::fs::read_to_string(&file) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("error: could not read {}: {}", file.display(), e);
-                    std::process::exit(1);
-                }
-            };
+            let source = read_file(&file);
+            let expanded = expand_source(&source, &file);
 
-            let (module, parse_errors) = weir_parser::parse(&source);
+            let (module, parse_errors) = weir_parser::parse(&expanded);
 
             if !parse_errors.is_empty() {
                 for error in &parse_errors {
@@ -167,15 +186,10 @@ fn main() {
             }
         }
         Command::Build { file, output } => {
-            let source = match std::fs::read_to_string(&file) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("error: could not read {}: {}", file.display(), e);
-                    std::process::exit(1);
-                }
-            };
+            let source = read_file(&file);
+            let expanded = expand_source(&source, &file);
 
-            let (module, parse_errors) = weir_parser::parse(&source);
+            let (module, parse_errors) = weir_parser::parse(&expanded);
 
             if !parse_errors.is_empty() {
                 for error in &parse_errors {
@@ -205,9 +219,8 @@ fn main() {
                 std::process::exit(1);
             }
 
-            let output_path = output.unwrap_or_else(|| {
-                PathBuf::from(file.file_stem().unwrap_or_default())
-            });
+            let output_path =
+                output.unwrap_or_else(|| PathBuf::from(file.file_stem().unwrap_or_default()));
 
             match weir_codegen::build_executable(&module, &type_info, &output_path) {
                 Ok(()) => {}
@@ -218,17 +231,12 @@ fn main() {
             }
         }
         Command::Dev { file } => {
-            let source = match std::fs::read_to_string(&file) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("error: could not read {}: {}", file.display(), e);
-                    std::process::exit(1);
-                }
-            };
+            let source = read_file(&file);
+            let expanded = expand_source(&source, &file);
 
             let canonical = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
 
-            let session = match weir_codegen::DevSession::new(&source) {
+            let session = match weir_codegen::DevSession::new(&expanded) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("{}: {}", file.display(), e);
@@ -242,15 +250,10 @@ fn main() {
             }
         }
         Command::Interp { file } => {
-            let source = match std::fs::read_to_string(&file) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("error: could not read {}: {}", file.display(), e);
-                    std::process::exit(1);
-                }
-            };
+            let source = read_file(&file);
+            let expanded = expand_source(&source, &file);
 
-            let (module, errors) = weir_parser::parse(&source);
+            let (module, errors) = weir_parser::parse(&expanded);
 
             if !errors.is_empty() {
                 for error in &errors {
@@ -268,11 +271,20 @@ fn main() {
             match weir_interp::interpret(&module) {
                 Ok(output) => print!("{}", output),
                 Err(e) => {
-                    eprintln!("{}:{}: runtime error: {}", file.display(),
-                        e.span.map_or(0, |s| s.start), e.message);
+                    eprintln!(
+                        "{}:{}: runtime error: {}",
+                        file.display(),
+                        e.span.map_or(0, |s| s.start),
+                        e.message
+                    );
                     std::process::exit(1);
                 }
             }
+        }
+        Command::Expand { file } => {
+            let source = read_file(&file);
+            let expanded = expand_source(&source, &file);
+            print!("{}", expanded);
         }
     }
 }

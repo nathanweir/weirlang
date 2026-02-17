@@ -10,11 +10,7 @@ pub struct ParseError {
 
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(
-            f,
-            "{}:{}: {}",
-            self.span.start, self.span.end, self.message
-        )
+        write!(f, "{}:{}: {}", self.span.start, self.span.end, self.message)
     }
 }
 
@@ -110,7 +106,10 @@ impl Parser {
             Some(span)
         } else {
             let span = self.peek_span();
-            self.error(format!("expected {:?}, found {:?}", expected, self.peek()), span);
+            self.error(
+                format!("expected {:?}, found {:?}", expected, self.peek()),
+                span,
+            );
             None
         }
     }
@@ -213,7 +212,10 @@ impl Parser {
         } else {
             let span = self.peek_span();
             self.error(
-                format!("expected top-level form (defn, deftype, ...), found {:?}", self.peek()),
+                format!(
+                    "expected top-level form (defn, deftype, ...), found {:?}",
+                    self.peek()
+                ),
                 span,
             );
             self.recover_to_close_paren();
@@ -226,7 +228,12 @@ impl Parser {
             self.recover_to_close_paren();
         }
 
-        let span = start.merge(self.tokens.get(self.pos.saturating_sub(1)).map(|(_, s)| *s).unwrap_or(end));
+        let span = start.merge(
+            self.tokens
+                .get(self.pos.saturating_sub(1))
+                .map(|(_, s)| *s)
+                .unwrap_or(end),
+        );
         result.map(|item| (item, span))
     }
 
@@ -297,7 +304,11 @@ impl Parser {
             // Annotated param: (name : type), (mut name : type), (ref name : type)
             self.advance();
             let is_mut = self.eat_symbol("mut");
-            let is_ref = if !is_mut { self.eat_symbol("ref") } else { false };
+            let is_ref = if !is_mut {
+                self.eat_symbol("ref")
+            } else {
+                false
+            };
             let (name, _) = self.expect_symbol()?;
             let type_ann = if self.eat(&Token::Colon) {
                 Some(self.parse_type_expr()?)
@@ -829,12 +840,6 @@ impl Parser {
         } else if self.check_symbol("ann") {
             self.advance();
             self.parse_ann_body(start)
-        } else if self.check_symbol("->") {
-            self.advance();
-            self.parse_thread_body(start, true)
-        } else if self.check_symbol("->>") {
-            self.advance();
-            self.parse_thread_body(start, false)
         } else if self.check_symbol("unsafe") {
             self.advance();
             self.parse_unsafe_body(start)
@@ -1051,19 +1056,6 @@ impl Parser {
         Some(ExprKind::Ann { type_ann, expr })
     }
 
-    fn parse_thread_body(&mut self, _start: Span, is_first: bool) -> Option<ExprKind> {
-        let initial = self.parse_expr()?;
-        let mut steps = Vec::new();
-        while !self.at_end() && !self.check(&Token::RParen) {
-            steps.push(self.parse_expr()?);
-        }
-        if is_first {
-            Some(ExprKind::ThreadFirst { initial, steps })
-        } else {
-            Some(ExprKind::ThreadLast { initial, steps })
-        }
-    }
-
     fn parse_unsafe_body(&mut self, _start: Span) -> Option<ExprKind> {
         let mut body = Vec::new();
         while !self.at_end() && !self.check(&Token::RParen) {
@@ -1142,10 +1134,7 @@ impl Parser {
                 }
                 let end = self.peek_span();
                 self.expect(&Token::RParen)?;
-                Some(self.alloc_pattern(
-                    PatternKind::Constructor { name, args },
-                    start.merge(end),
-                ))
+                Some(self.alloc_pattern(PatternKind::Constructor { name, args }, start.merge(end)))
             }
             Token::LBrace => {
                 // Struct destructure: {field1 field2} or {field1 name1 field2 name2}
@@ -1154,17 +1143,17 @@ impl Parser {
                 while !self.at_end() && !self.check(&Token::RBrace) {
                     let (field_name, fspan) = self.expect_symbol()?;
                     // Check if there's a binding name (another symbol before next field/close)
-                    let binding =
-                        if !self.check(&Token::RBrace) && matches!(self.peek(), Some(Token::Symbol(_)))
-                        {
-                            let (b, _) = self.expect_symbol()?;
-                            // Heuristic: if it starts lowercase, it's a binding
-                            // If it starts uppercase, it's probably the next field
-                            // This is ambiguous; for now treat pairs as field+binding
-                            Some(b)
-                        } else {
-                            None
-                        };
+                    let binding = if !self.check(&Token::RBrace)
+                        && matches!(self.peek(), Some(Token::Symbol(_)))
+                    {
+                        let (b, _) = self.expect_symbol()?;
+                        // Heuristic: if it starts lowercase, it's a binding
+                        // If it starts uppercase, it's probably the next field
+                        // This is ambiguous; for now treat pairs as field+binding
+                        Some(b)
+                    } else {
+                        None
+                    };
                     fields.push(FieldPattern {
                         field_name,
                         binding,
@@ -1173,10 +1162,9 @@ impl Parser {
                 }
                 let end = self.peek_span();
                 self.expect(&Token::RBrace)?;
-                Some(self.alloc_pattern(
-                    PatternKind::StructDestructure { fields },
-                    start.merge(end),
-                ))
+                Some(
+                    self.alloc_pattern(PatternKind::StructDestructure { fields }, start.merge(end)),
+                )
             }
             Token::Symbol(s) if s.as_str() == "_" => {
                 let (_, span) = self.advance();
@@ -1293,10 +1281,7 @@ impl Parser {
                 result
             }
             _ => {
-                self.error(
-                    format!("expected type, found {:?}", self.peek()),
-                    start,
-                );
+                self.error(format!("expected type, found {:?}", self.peek()), start);
                 None
             }
         }
@@ -1393,9 +1378,7 @@ mod tests {
 
     #[test]
     fn test_parse_simple_defn() {
-        let result = parse_and_print(
-            "(defn add ((x : i32) (y : i32)) : i32\n  (+ x y))",
-        );
+        let result = parse_and_print("(defn add ((x : i32) (y : i32)) : i32\n  (+ x y))");
         insta::assert_snapshot!(result);
     }
 
@@ -1407,33 +1390,26 @@ mod tests {
 
     #[test]
     fn test_parse_deftype() {
-        let result = parse_and_print(
-            "(deftype (Option 'a)\n  (Some 'a)\n  None)",
-        );
+        let result = parse_and_print("(deftype (Option 'a)\n  (Some 'a)\n  None)");
         insta::assert_snapshot!(result);
     }
 
     #[test]
     fn test_parse_defstruct() {
-        let result = parse_and_print(
-            "(defstruct Vec2\n  (x : f32)\n  (y : f32))",
-        );
+        let result = parse_and_print("(defstruct Vec2\n  (x : f32)\n  (y : f32))");
         insta::assert_snapshot!(result);
     }
 
     #[test]
     fn test_parse_let() {
-        let result = parse_and_print(
-            "(defn main () : Unit\n  (let ((x 5)\n        (y 10))\n    (+ x y)))",
-        );
+        let result =
+            parse_and_print("(defn main () : Unit\n  (let ((x 5)\n        (y 10))\n    (+ x y)))");
         insta::assert_snapshot!(result);
     }
 
     #[test]
     fn test_parse_if() {
-        let result = parse_and_print(
-            "(defn abs ((x : i32)) : i32\n  (if (< x 0) (- 0 x) x))",
-        );
+        let result = parse_and_print("(defn abs ((x : i32)) : i32\n  (if (< x 0) (- 0 x) x))");
         insta::assert_snapshot!(result);
     }
 
@@ -1462,50 +1438,41 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_threading() {
-        let result = parse_and_print(
-            "(defn main () : Unit\n  (-> enemy .pos .x))",
-        );
+    fn test_parse_threading_as_call() {
+        // After Phase 7, -> is desugared by the macro expander before parsing.
+        // If it reaches the parser, it's treated as a regular call.
+        let result = parse_and_print("(defn main () : Unit\n  (-> enemy .pos .x))");
         insta::assert_snapshot!(result);
     }
 
     #[test]
     fn test_parse_defclass() {
-        let result = parse_and_print(
-            "(defclass (Show 'a)\n  (show : (Fn ['a] String)))",
-        );
+        let result = parse_and_print("(defclass (Show 'a)\n  (show : (Fn ['a] String)))");
         insta::assert_snapshot!(result);
     }
 
     #[test]
     fn test_parse_instance() {
-        let result = parse_and_print(
-            "(instance (Show i32)\n  (defn show (x) (str x)))",
-        );
+        let result = parse_and_print("(instance (Show i32)\n  (defn show (x) (str x)))");
         insta::assert_snapshot!(result);
     }
 
     #[test]
     fn test_parse_import() {
-        let result = parse_and_print(
-            "(import math.vec2 (add sub))",
-        );
+        let result = parse_and_print("(import math.vec2 (add sub))");
         insta::assert_snapshot!(result);
     }
 
     #[test]
     fn test_parse_pub() {
-        let result = parse_and_print(
-            "(pub defn add ((x : i32) (y : i32)) : i32\n  (+ x y))",
-        );
+        let result = parse_and_print("(pub defn add ((x : i32) (y : i32)) : i32\n  (+ x y))");
         insta::assert_snapshot!(result);
     }
 
     #[test]
     fn test_parse_mut_let() {
-        let result = parse_and_print(
-            "(defn main () : Unit\n  (let ((mut x 5))\n    (set! x 10)\n    x))",
-        );
+        let result =
+            parse_and_print("(defn main () : Unit\n  (let ((mut x 5))\n    (set! x 10)\n    x))");
         insta::assert_snapshot!(result);
     }
 
@@ -1527,9 +1494,8 @@ mod tests {
 
     #[test]
     fn test_parse_named_args() {
-        let result = parse_and_print(
-            "(defn main () : Unit\n  (spawn-enemy :pos origin :health 50))",
-        );
+        let result =
+            parse_and_print("(defn main () : Unit\n  (spawn-enemy :pos origin :health 50))");
         insta::assert_snapshot!(result);
     }
 }
