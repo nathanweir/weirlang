@@ -1,0 +1,218 @@
+================================================================================
+Simple function definition
+================================================================================
+
+(defn add (x y)
+  (+ x y))
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (list_expression
+    (defn_form
+      (defn_inner
+        keyword: (defn_keyword)
+        name: (symbol)
+        params: (param_list
+          (symbol)
+          (symbol))
+        (list_expression
+          (call_expr
+            function: (operator)
+            (symbol)
+            (symbol)))))))
+
+================================================================================
+Typed function definition
+================================================================================
+
+(defn add ((x : i32) (y : i32)) : i32
+  (+ x y))
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (list_expression
+    (defn_form
+      (defn_inner
+        keyword: (defn_keyword)
+        name: (symbol)
+        params: (param_list
+          (typed_param
+            name: (symbol)
+            type: (symbol))
+          (typed_param
+            name: (symbol)
+            type: (symbol)))
+        (return_type
+          (symbol))
+        (list_expression
+          (call_expr
+            function: (operator)
+            (symbol)
+            (symbol)))))))
+
+================================================================================
+Arrow-style function definition
+================================================================================
+
+(defn greet (-> Unit)
+  (println "hello"))
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (list_expression
+    (defn_form
+      (defn_inner
+        keyword: (defn_keyword)
+        name: (symbol)
+        (arrow_type
+          (symbol))
+        (list_expression
+          (call_expr
+            function: (symbol)
+            (string)))))))
+
+================================================================================
+Sum type definition
+================================================================================
+
+(deftype (Option 'a)
+  (Some 'a)
+  None)
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (list_expression
+    (deftype_form
+      (deftype_inner
+        keyword: (deftype_keyword)
+        name: (applied_type_name
+          (symbol)
+          (type_var))
+        (variant
+          name: (symbol)
+          (type_var))
+        (variant
+          (symbol))))))
+
+================================================================================
+Struct definition
+================================================================================
+
+(defstruct Vec2
+  (x : f32)
+  (y : f32))
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (list_expression
+    (defstruct_form
+      (defstruct_inner
+        keyword: (defstruct_keyword)
+        name: (symbol)
+        (struct_field
+          name: (symbol)
+          type: (symbol))
+        (struct_field
+          name: (symbol)
+          type: (symbol))))))
+
+================================================================================
+Typeclass definition
+================================================================================
+
+(defclass (Show 'a)
+  (show : (Fn ['a] String)))
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (list_expression
+    (defclass_form
+      (defclass_inner
+        keyword: (defclass_keyword)
+        name: (type_constructor
+          (symbol)
+          (type_var))
+        (method_signature
+          name: (symbol)
+          type: (fn_type
+            (fn_type_keyword)
+            (type_var)
+            (symbol)))))))
+
+================================================================================
+Instance definition
+================================================================================
+
+(instance (Show Vec2)
+  (defn show (v)
+    (str "vec")))
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (list_expression
+    (instance_form
+      keyword: (instance_keyword)
+      name: (instance_head
+        (symbol)
+        (symbol))
+      (defn_inner
+        keyword: (defn_keyword)
+        name: (symbol)
+        params: (param_list
+          (symbol))
+        (list_expression
+          (call_expr
+            function: (symbol)
+            (string)))))))
+
+================================================================================
+Public function
+================================================================================
+
+(pub defn add ((x : i32) (y : i32)) : i32
+  (+ x y))
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (list_expression
+    (pub_form
+      keyword: (pub_keyword)
+      (defn_inner
+        keyword: (defn_keyword)
+        name: (symbol)
+        params: (param_list
+          (typed_param
+            name: (symbol)
+            type: (symbol))
+          (typed_param
+            name: (symbol)
+            type: (symbol)))
+        (return_type
+          (symbol))
+        (list_expression
+          (call_expr
+            function: (operator)
+            (symbol)
+            (symbol)))))))
+
+================================================================================
+Import declaration
+================================================================================
+
+(import math)
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (list_expression
+    (import_form
+      keyword: (import_keyword)
+      module: (symbol))))

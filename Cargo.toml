@@ -9,6 +9,9 @@ members = [
     "crates/weir-codegen",
     "crates/weir-cli",
 ]
+exclude = [
+    "tree-sitter-weir",
+]
 
 [workspace.package]
 version = "0.1.0"

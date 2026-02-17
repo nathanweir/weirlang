@@ -1,0 +1,307 @@
+================================================================================
+Let expression
+================================================================================
+
+(let ((x 5))
+  x)
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (list_expression
+    (let_expr
+      (let_keyword)
+      (bindings
+        (binding
+          (symbol)
+          (number)))
+      (symbol))))
+
+================================================================================
+Let with mutation
+================================================================================
+
+(let ((mut x 0))
+  (set! x 1)
+  x)
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (list_expression
+    (let_expr
+      (let_keyword)
+      (bindings
+        (binding
+          (mut_keyword)
+          (symbol)
+          (number)))
+      (list_expression
+        (set_bang_expr
+          (set_bang_keyword)
+          place: (symbol)
+          value: (number)))
+      (symbol))))
+
+================================================================================
+Let with typed bindings
+================================================================================
+
+(let (((x : i32) 10))
+  x)
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (list_expression
+    (let_expr
+      (let_keyword)
+      (bindings
+        (binding
+          (typed_binding_name
+            (symbol)
+            (symbol))
+          (number)))
+      (symbol))))
+
+================================================================================
+If expression
+================================================================================
+
+(if (> x 0) 1 0)
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (list_expression
+    (if_expr
+      (if_keyword)
+      condition: (list_expression
+        (call_expr
+          function: (operator)
+          (symbol)
+          (number)))
+      then: (number)
+      else: (number))))
+
+================================================================================
+Cond expression
+================================================================================
+
+(cond
+  ((< x 0) "negative")
+  ((= x 0) "zero")
+  (else "positive"))
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (list_expression
+    (cond_expr
+      (cond_keyword)
+      (cond_clause
+        (list_expression
+          (call_expr
+            function: (operator)
+            (symbol)
+            (number)))
+        (string))
+      (cond_clause
+        (list_expression
+          (call_expr
+            function: (operator)
+            (symbol)
+            (number)))
+        (string))
+      (cond_clause
+        (else_keyword)
+        (string)))))
+
+================================================================================
+When expression
+================================================================================
+
+(when (> x 0)
+  (println "positive"))
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (list_expression
+    (when_expr
+      (when_keyword)
+      condition: (list_expression
+        (call_expr
+          function: (operator)
+          (symbol)
+          (number)))
+      (list_expression
+        (call_expr
+          function: (symbol)
+          (string))))))
+
+================================================================================
+Unless expression
+================================================================================
+
+(unless (= x 0)
+  (println "nonzero"))
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (list_expression
+    (unless_expr
+      (unless_keyword)
+      condition: (list_expression
+        (call_expr
+          function: (operator)
+          (symbol)
+          (number)))
+      (list_expression
+        (call_expr
+          function: (symbol)
+          (string))))))
+
+================================================================================
+Match expression
+================================================================================
+
+(match opt
+  ((Some val) (println val))
+  (None (println "nothing")))
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (list_expression
+    (match_expr
+      (match_keyword)
+      scrutinee: (symbol)
+      (match_arm
+        pattern: (constructor_pattern
+          constructor: (symbol)
+          (symbol))
+        (list_expression
+          (call_expr
+            function: (symbol)
+            (symbol))))
+      (match_arm
+        pattern: (symbol)
+        (list_expression
+          (call_expr
+            function: (symbol)
+            (string)))))))
+
+================================================================================
+Lambda expression
+================================================================================
+
+(fn (x) (+ x 1))
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (list_expression
+    (fn_expr
+      (fn_keyword)
+      params: (param_list
+        (symbol))
+      (list_expression
+        (call_expr
+          function: (operator)
+          (symbol)
+          (number))))))
+
+================================================================================
+Do expression
+================================================================================
+
+(do
+  (println "a")
+  (println "b"))
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (list_expression
+    (do_expr
+      (do_keyword)
+      (list_expression
+        (call_expr
+          function: (symbol)
+          (string)))
+      (list_expression
+        (call_expr
+          function: (symbol)
+          (string))))))
+
+================================================================================
+Set! expression
+================================================================================
+
+(set! x 42)
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (list_expression
+    (set_bang_expr
+      (set_bang_keyword)
+      place: (symbol)
+      value: (number))))
+
+================================================================================
+Threading expression
+================================================================================
+
+(-> x add add)
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (list_expression
+    (threading_expr
+      operator: (threading_operator)
+      (symbol)
+      (symbol)
+      (symbol))))
+
+================================================================================
+Function call
+================================================================================
+
+(println (+ 1 2))
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (list_expression
+    (call_expr
+      function: (symbol)
+      (list_expression
+        (call_expr
+          function: (operator)
+          (number)
+          (number))))))
+
+================================================================================
+Nested function calls
+================================================================================
+
+(println (str "result: " (factorial 5)))
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (list_expression
+    (call_expr
+      function: (symbol)
+      (list_expression
+        (call_expr
+          function: (symbol)
+          (string)
+          (list_expression
+            (call_expr
+              function: (symbol)
+              (number))))))))

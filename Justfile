@@ -35,3 +35,11 @@ clippy:
 # Review insta snapshots
 review:
     cargo insta review
+
+# Generate tree-sitter parser from grammar.js
+ts-generate:
+    cd tree-sitter-weir && tree-sitter generate
+
+# Run tree-sitter test corpus
+ts-test:
+    cd tree-sitter-weir && tree-sitter test
