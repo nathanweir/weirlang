@@ -49,8 +49,10 @@ fn parse_string(lex: &mut logos::Lexer<Token>) -> Option<String> {
 
 #[derive(Logos, Debug, Clone, PartialEq)]
 #[logos(skip r"[ \t\r\n]+")]
-#[logos(skip r";[^\n]*")]
 pub enum Token {
+    #[regex(r";[^\n]*", callback = |lex| SmolStr::new(lex.slice()))]
+    Comment(SmolStr),
+
     #[token("(")]
     LParen,
     #[token(")")]
@@ -105,8 +107,8 @@ pub enum Token {
     Symbol(SmolStr),
 }
 
-/// Lex source code into a list of (token, span) pairs.
-pub fn lex(source: &str) -> (Vec<(Token, Span)>, Vec<Span>) {
+/// Lex source code into a list of (token, span) pairs, including comments.
+pub fn lex_with_comments(source: &str) -> (Vec<(Token, Span)>, Vec<Span>) {
     let mut tokens = Vec::new();
     let mut errors = Vec::new();
     let mut lexer = Token::lexer(source);
@@ -120,6 +122,16 @@ pub fn lex(source: &str) -> (Vec<(Token, Span)>, Vec<Span>) {
         }
     }
 
+    (tokens, errors)
+}
+
+/// Lex source code into a list of (token, span) pairs, filtering out comments.
+pub fn lex(source: &str) -> (Vec<(Token, Span)>, Vec<Span>) {
+    let (tokens, errors) = lex_with_comments(source);
+    let tokens = tokens
+        .into_iter()
+        .filter(|(t, _)| !matches!(t, Token::Comment(_)))
+        .collect();
     (tokens, errors)
 }
 
@@ -379,5 +391,39 @@ mod tests {
         assert_eq!(tokens[2], (Token::Int(1), Span::new(3, 4)));
         assert_eq!(tokens[3], (Token::Int(2), Span::new(5, 6)));
         assert_eq!(tokens[4], (Token::RParen, Span::new(6, 7)));
+    }
+
+    #[test]
+    fn test_lex_with_comments() {
+        let (tokens, errors) = lex_with_comments("; a comment\n42");
+        assert!(errors.is_empty());
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(
+            tokens[0],
+            (Token::Comment("; a comment".into()), Span::new(0, 11))
+        );
+        assert_eq!(tokens[1], (Token::Int(42), Span::new(12, 14)));
+    }
+
+    #[test]
+    fn test_lex_with_comments_trailing() {
+        let (tokens, errors) = lex_with_comments("(+ 1 2) ; trailing");
+        assert!(errors.is_empty());
+        assert_eq!(tokens.len(), 6);
+        assert_eq!(
+            tokens[5],
+            (Token::Comment("; trailing".into()), Span::new(8, 18))
+        );
+    }
+
+    #[test]
+    fn test_lex_with_comments_preserves_text() {
+        let (tokens, errors) = lex_with_comments("; hello world");
+        assert!(errors.is_empty());
+        assert_eq!(tokens.len(), 1);
+        match &tokens[0].0 {
+            Token::Comment(text) => assert_eq!(text.as_str(), "; hello world"),
+            other => panic!("expected Comment, got {:?}", other),
+        }
     }
 }

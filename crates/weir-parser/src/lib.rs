@@ -243,7 +243,7 @@ impl Parser {
         let start = self.peek_span();
         let (name, name_span) = self.expect_symbol()?;
 
-        let params = self.parse_params()?;
+        let (params, params_end) = self.parse_params()?;
 
         let return_type = if self.eat(&Token::Colon) {
             Some(self.parse_type_expr()?)
@@ -276,6 +276,7 @@ impl Parser {
             name,
             name_span,
             params,
+            params_end,
             return_type,
             body,
             is_pub,
@@ -284,7 +285,9 @@ impl Parser {
         })
     }
 
-    fn parse_params(&mut self) -> Option<Vec<Param>> {
+    /// Parse a param list `(params...)`, returning the params and the byte
+    /// offset of the end of the closing `)`.
+    fn parse_params(&mut self) -> Option<(Vec<Param>, u32)> {
         self.expect(&Token::LParen)?;
         let mut params = Vec::new();
         while !self.at_end() && !self.check(&Token::RParen) {
@@ -294,8 +297,8 @@ impl Parser {
                 break;
             }
         }
-        self.expect(&Token::RParen)?;
-        Some(params)
+        let close_span = self.expect(&Token::RParen)?;
+        Some((params, close_span.end))
     }
 
     fn parse_param(&mut self) -> Option<Param> {
@@ -1033,7 +1036,7 @@ impl Parser {
     }
 
     fn parse_lambda_body(&mut self, _start: Span) -> Option<ExprKind> {
-        let params = self.parse_params()?;
+        let (params, _) = self.parse_params()?;
         let return_type = if self.eat(&Token::Colon) {
             Some(self.parse_type_expr()?)
         } else {

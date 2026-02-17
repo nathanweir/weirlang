@@ -77,32 +77,22 @@ fn collect_defn_hints(
             }
         }
 
-        // Return type hint
+        // Return type hint — positioned at the end of the params list
         if d.return_type.is_none() {
             let ret_ty = &fn_type.return_type;
-            if !should_skip(ret_ty) && *ret_ty != Ty::Unit {
-                // Position: just before the body start — avoids colliding with the
-                // last param's type hint (which shares the same offset).
-                let hint_offset = if let Some(&first_body) = d.body.first() {
-                    module.exprs[first_body].span.start
-                } else {
-                    0
-                };
-
-                if hint_offset > 0 {
-                    let pos = line_index.offset_to_position(hint_offset);
-                    if in_range(pos, range) {
-                        hints.push(InlayHint {
-                            position: pos,
-                            label: InlayHintLabel::String(format!("→ {}", ret_ty)),
-                            kind: Some(InlayHintKind::TYPE),
-                            text_edits: None,
-                            tooltip: None,
-                            padding_left: Some(true),
-                            padding_right: None,
-                            data: None,
-                        });
-                    }
+            if !should_skip(ret_ty) && *ret_ty != Ty::Unit && d.params_end > 0 {
+                let pos = line_index.offset_to_position(d.params_end);
+                if in_range(pos, range) {
+                    hints.push(InlayHint {
+                        position: pos,
+                        label: InlayHintLabel::String(format!("→ {}", ret_ty)),
+                        kind: Some(InlayHintKind::TYPE),
+                        text_edits: None,
+                        tooltip: None,
+                        padding_left: Some(true),
+                        padding_right: None,
+                        data: None,
+                    });
                 }
             }
         }

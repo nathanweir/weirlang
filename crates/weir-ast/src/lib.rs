@@ -56,6 +56,8 @@ pub struct Defn {
     pub name: SmolStr,
     pub name_span: Span,
     pub params: Vec<Param>,
+    /// Byte offset of the end of the params list `)`.
+    pub params_end: u32,
     pub return_type: Option<TypeExprId>,
     pub body: Vec<ExprId>,
     pub is_pub: bool,

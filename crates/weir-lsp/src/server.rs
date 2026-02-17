@@ -9,6 +9,7 @@ use crate::completion;
 use crate::definition;
 use crate::diagnostics;
 use crate::document::Document;
+use crate::formatting;
 use crate::hover;
 use crate::inlay_hints;
 use crate::symbols;
@@ -72,6 +73,7 @@ impl LanguageServer for WeirLspBackend {
                     work_done_progress_options: Default::default(),
                 })),
                 inlay_hint_provider: Some(OneOf::Left(true)),
+                document_formatting_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -288,6 +290,42 @@ impl LanguageServer for WeirLspBackend {
 
         let items = completion::completions(&analysis.module);
         Ok(Some(CompletionResponse::Array(items)))
+    }
+
+    async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
+        let uri = &params.text_document.uri;
+
+        let docs = self.documents.lock().unwrap();
+        let doc = match docs.get(uri) {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+
+        let line_width = 80;
+        let formatted = formatting::format_document(&doc.text, line_width);
+
+        if formatted == doc.text {
+            return Ok(None);
+        }
+
+        // Replace entire document
+        let last_line = doc.text.lines().count().saturating_sub(1) as u32;
+        let last_char = doc.text.lines().last().map_or(0, |l| l.len()) as u32;
+        let edit = TextEdit {
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: last_line,
+                    character: last_char,
+                },
+            },
+            new_text: formatted,
+        };
+
+        Ok(Some(vec![edit]))
     }
 
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {

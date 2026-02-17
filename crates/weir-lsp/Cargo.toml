@@ -11,3 +11,6 @@ weir-typeck.workspace = true
 weir-macros.workspace = true
 tower-lsp.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+insta.workspace = true

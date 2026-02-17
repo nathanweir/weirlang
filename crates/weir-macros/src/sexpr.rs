@@ -242,6 +242,12 @@ impl<'a> Reader<'a> {
                 Some(SExpr::Splice(Box::new(inner), start_span.merge(end_span)))
             }
 
+            // Comments should have been filtered by lex(), but skip defensively
+            Token::Comment(_) => {
+                self.advance();
+                self.read_sexpr()
+            }
+
             // All other tokens are atoms
             _ => {
                 let (token, span) = self.advance();

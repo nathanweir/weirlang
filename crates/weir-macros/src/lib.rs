@@ -134,6 +134,7 @@ fn reconstruct(tokens: &[(weir_lexer::Token, Span)], _original: &str) -> String 
                 buf.push_str(f);
             }
             Token::Symbol(s) => buf.push_str(s),
+            Token::Comment(c) => buf.push_str(c),
         }
     }
     buf

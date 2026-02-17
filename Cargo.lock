@@ -1839,6 +1839,7 @@ dependencies = [
 name = "weir-lsp"
 version = "0.1.0"
 dependencies = [
+ "insta",
  "tokio",
  "tower-lsp",
  "weir-ast",
