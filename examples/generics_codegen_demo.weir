@@ -1,0 +1,37 @@
+;; Codegen demo: generics + typeclasses via monomorphization
+;; (codegen only supports primitives — no strings/ADTs yet)
+
+;; ── Generic functions ─────────────────────────────────────────────
+;; Each call site produces a monomorphized copy:
+;;   id#i32,i32   id#Bool,Bool   const#i32,Bool,i32
+
+(defn id ((x : 'a)) : 'a x)
+(defn const ((x : 'a) (y : 'b)) : 'a x)
+(defn double ((x : 'a)) : 'a (+ x x))
+
+;; ── Typeclasses ───────────────────────────────────────────────────
+
+(defclass (Eq 'a)
+  (== : (Fn ['a 'a] Bool)))
+
+(instance (Eq i32)
+  (defn == ((x : i32) (y : i32)) : Bool (= x y)))
+
+(instance (Eq Bool)
+  (defn == ((a : Bool) (b : Bool)) : Bool
+    (if a b (not b))))
+
+;; ── Main ──────────────────────────────────────────────────────────
+
+(defn main () : Unit
+  ;; Generics: same function, different concrete types
+  (println (id 42))
+  (println (id true))
+  (println (const 99 false))
+  (println (double 21))
+
+  ;; Typeclass dispatch: == resolves to Eq#i32#== or Eq#Bool#==
+  (println (== 5 5))
+  (println (== 5 6))
+  (println (== true true))
+  (println (== true false)))

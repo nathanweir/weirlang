@@ -1,0 +1,28 @@
+;; Typeclass demonstration
+
+(defclass (Show 'a)
+  (show : (Fn ['a] String)))
+
+(defclass (Eq 'a)
+  (== : (Fn ['a 'a] Bool)))
+
+;; Show instances
+(instance (Show i32)
+  (defn show ((x : i32)) : String (str x)))
+
+(instance (Show Bool)
+  (defn show ((x : Bool)) : String
+    (if x "true" "false")))
+
+;; Eq instances
+(instance (Eq i32)
+  (defn == ((x : i32) (y : i32)) : Bool (= x y)))
+
+(defn main ()
+  ;; Show
+  (println (show 42))
+  (println (show true))
+
+  ;; Eq
+  (println (== 1 1))
+  (println (== 1 2)))

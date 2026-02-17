@@ -363,7 +363,12 @@ impl<'a, M: Module> Compiler<'a, M> {
     fn declare_user_functions(&mut self, linkage: Linkage) -> Result<(), CodegenError> {
         for (item, _span) in &self.ast_module.items {
             if let Item::Defn(defn) = item {
-                let (param_tys, ret_ty) = self.resolve_fn_signature(defn)?;
+                // Skip generic functions — they can't be compiled directly,
+                // only their monomorphized specializations are compiled.
+                let (param_tys, ret_ty) = match self.resolve_fn_signature(defn) {
+                    Ok(sig) => sig,
+                    Err(_) => continue,
+                };
 
                 let mut sig = self.module.make_signature();
                 sig.call_conv = CallConv::SystemV;
@@ -385,6 +390,53 @@ impl<'a, M: Module> Compiler<'a, M> {
                     .insert(defn.name.clone(), (func_id, param_tys, ret_ty));
             }
         }
+
+        // Declare specializations (instance methods + generic function instantiations)
+        self.declare_specializations(linkage)?;
+
+        Ok(())
+    }
+
+    /// Declare instance method specializations from type_info.specializations.
+    fn declare_specializations(&mut self, linkage: Linkage) -> Result<(), CodegenError> {
+        for spec in &self.type_info.specializations {
+            // Only handle specializations whose types are all primitives (codegen-able)
+            let all_primitive = spec
+                .param_types
+                .iter()
+                .all(|t| ty_to_cl(t).is_some() || *t == Ty::Unit)
+                && (ty_to_cl(&spec.return_type).is_some() || spec.return_type == Ty::Unit);
+
+            if !all_primitive {
+                continue;
+            }
+
+            let mut sig = self.module.make_signature();
+            sig.call_conv = CallConv::SystemV;
+            for pty in &spec.param_types {
+                if let Some(cl_ty) = ty_to_cl(pty) {
+                    sig.params.push(AbiParam::new(cl_ty));
+                }
+            }
+            if let Some(cl_ty) = ty_to_cl(&spec.return_type) {
+                sig.returns.push(AbiParam::new(cl_ty));
+            }
+
+            let func_id = self
+                .module
+                .declare_function(&spec.mangled_name, linkage, &sig)
+                .map_err(|e| {
+                    CodegenError::new(format!(
+                        "declare specialization '{}': {}",
+                        spec.mangled_name, e
+                    ))
+                })?;
+
+            self.user_fns.insert(
+                spec.mangled_name.clone(),
+                (func_id, spec.param_types.clone(), spec.return_type.clone()),
+            );
+        }
         Ok(())
     }
 
@@ -392,7 +444,11 @@ impl<'a, M: Module> Compiler<'a, M> {
     fn declare_user_functions_aot(&mut self) -> Result<(), CodegenError> {
         for (item, _span) in &self.ast_module.items {
             if let Item::Defn(defn) = item {
-                let (param_tys, ret_ty) = self.resolve_fn_signature(defn)?;
+                // Skip generic functions — only specializations are compiled.
+                let (param_tys, ret_ty) = match self.resolve_fn_signature(defn) {
+                    Ok(sig) => sig,
+                    Err(_) => continue,
+                };
 
                 let mut sig = self.module.make_signature();
                 sig.call_conv = CallConv::SystemV;
@@ -420,6 +476,10 @@ impl<'a, M: Module> Compiler<'a, M> {
                     .insert(defn.name.clone(), (func_id, param_tys, ret_ty));
             }
         }
+
+        // Declare specializations for AOT too
+        self.declare_specializations(Linkage::Local)?;
+
         Ok(())
     }
 
@@ -506,8 +566,58 @@ impl<'a, M: Module> Compiler<'a, M> {
             .collect();
 
         for defn in &defns {
+            // Skip generic functions not in user_fns (they were skipped during declaration)
+            if !self.user_fns.contains_key(&defn.name) {
+                continue;
+            }
             self.compile_function_with(defn, fn_table_slots, table_data_id)?;
         }
+
+        // Compile instance method specializations
+        self.compile_specializations(fn_table_slots, table_data_id)?;
+
+        Ok(())
+    }
+
+    /// Compile specialization bodies (instance methods + generic function instantiations).
+    fn compile_specializations(
+        &mut self,
+        fn_table_slots: Option<&HashMap<SmolStr, usize>>,
+        table_data_id: Option<DataId>,
+    ) -> Result<(), CodegenError> {
+        let items = &self.ast_module.items;
+        let mut to_compile: Vec<(SmolStr, Defn)> = Vec::new();
+
+        for spec in &self.type_info.specializations {
+            if !self.user_fns.contains_key(&spec.mangled_name) {
+                continue;
+            }
+
+            if let Some(item_idx) = spec.instance_item_index {
+                // Instance method: use the exact AST instance identified by the type checker
+                if let Some((Item::Instance(inst), _)) = items.get(item_idx) {
+                    for method_defn in &inst.methods {
+                        if method_defn.name == spec.original_name {
+                            to_compile.push((spec.mangled_name.clone(), method_defn.clone()));
+                        }
+                    }
+                }
+            } else {
+                // Generic user function: find the top-level defn
+                for (item, _) in items {
+                    if let Item::Defn(defn) = item {
+                        if defn.name == spec.original_name {
+                            to_compile.push((spec.mangled_name.clone(), defn.clone()));
+                        }
+                    }
+                }
+            }
+        }
+
+        for (mangled_name, defn) in &to_compile {
+            self.compile_function_named(mangled_name, defn, fn_table_slots, table_data_id)?;
+        }
+
         Ok(())
     }
 
@@ -517,10 +627,21 @@ impl<'a, M: Module> Compiler<'a, M> {
         fn_table_slots: Option<&HashMap<SmolStr, usize>>,
         table_data_id: Option<DataId>,
     ) -> Result<(), CodegenError> {
+        self.compile_function_named(&defn.name.clone(), defn, fn_table_slots, table_data_id)
+    }
+
+    /// Compile a function body, looking up the declaration under `lookup_name`.
+    fn compile_function_named(
+        &mut self,
+        lookup_name: &SmolStr,
+        defn: &Defn,
+        fn_table_slots: Option<&HashMap<SmolStr, usize>>,
+        table_data_id: Option<DataId>,
+    ) -> Result<(), CodegenError> {
         let (func_id, param_tys, ret_ty) = self
             .user_fns
-            .get(&defn.name)
-            .ok_or_else(|| CodegenError::new(format!("unknown function '{}'", defn.name)))?
+            .get(lookup_name)
+            .ok_or_else(|| CodegenError::new(format!("unknown function '{}'", lookup_name)))?
             .clone();
 
         let mut sig = self.module.make_signature();
@@ -806,6 +927,40 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
         let func_expr = &self.ast_module.exprs[func_id];
 
         if let ExprKind::Var(name) = &func_expr.kind {
+            // Check if this is a typeclass method call with a resolved instance
+            if let Some(instance_key) = self.type_info.method_resolutions.get(&func_id) {
+                let mangled_name = SmolStr::new(format!("{}#{}", instance_key, name));
+                if let Some((callee_id, param_tys, ret_ty)) =
+                    self.user_fns.get(&mangled_name).cloned()
+                {
+                    let mut arg_vals = Vec::new();
+                    for (i, arg) in args.iter().enumerate() {
+                        let pty = if i < param_tys.len() {
+                            &param_tys[i]
+                        } else {
+                            return Err(CodegenError::new(format!(
+                                "too many arguments for method '{}' (instance {})",
+                                name, instance_key
+                            )));
+                        };
+                        if let Some(val) = self.compile_expr(arg.value, pty)? {
+                            arg_vals.push(val);
+                        }
+                    }
+
+                    let func_ref = self
+                        .module
+                        .declare_func_in_func(callee_id, self.builder.func);
+                    let call_inst = self.builder.ins().call(func_ref, &arg_vals);
+                    if ty_to_cl(&ret_ty).is_some() {
+                        let results = self.builder.inst_results(call_inst);
+                        return Ok(Some(results[0]));
+                    } else {
+                        return Ok(None);
+                    }
+                }
+            }
+
             match name.as_str() {
                 "+" | "-" | "*" | "/" | "mod" => {
                     return self.compile_arith(name, args, result_ty);
@@ -832,6 +987,50 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                     return self.compile_sleep(args);
                 }
                 _ => {}
+            }
+
+            // Check if this is a call to a generic function — redirect to specialization.
+            // Generic functions are not in user_fns; find the mangled specialization name
+            // from the concrete type at this call site.
+            if !self.user_fns.contains_key(name) {
+                if let Some(Ty::Fn(param_tys, ret_ty)) = self.type_info.expr_types.get(func_id) {
+                    let type_key: String = param_tys
+                        .iter()
+                        .chain(std::iter::once(ret_ty.as_ref()))
+                        .map(|t| format!("{}", t))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let mangled = SmolStr::new(format!("{}#{}", name, type_key));
+                    if let Some((callee_id, spec_param_tys, spec_ret_ty)) =
+                        self.user_fns.get(&mangled).cloned()
+                    {
+                        let mut arg_vals = Vec::new();
+                        for (i, arg) in args.iter().enumerate() {
+                            let pty = if i < spec_param_tys.len() {
+                                &spec_param_tys[i]
+                            } else {
+                                return Err(CodegenError::new(format!(
+                                    "too many arguments for specialization '{}'",
+                                    mangled
+                                )));
+                            };
+                            if let Some(val) = self.compile_expr(arg.value, pty)? {
+                                arg_vals.push(val);
+                            }
+                        }
+
+                        let func_ref = self
+                            .module
+                            .declare_func_in_func(callee_id, self.builder.func);
+                        let call_inst = self.builder.ins().call(func_ref, &arg_vals);
+                        if ty_to_cl(&spec_ret_ty).is_some() {
+                            let results = self.builder.inst_results(call_inst);
+                            return Ok(Some(results[0]));
+                        } else {
+                            return Ok(None);
+                        }
+                    }
+                }
             }
 
             // User function call
@@ -2315,5 +2514,98 @@ mod tests {
                 name
             );
         }
+    }
+
+    // ── Typeclass codegen tests ──────────────────────────────────
+
+    #[test]
+    fn test_typeclass_eq_i32() {
+        let out = compile_run(
+            "(defclass (Eq 'a)
+               (== : (Fn ['a 'a] Bool)))
+             (instance (Eq i32)
+               (defn == ((x : i32) (y : i32)) : Bool (= x y)))
+             (defn main () : Unit
+               (println (== 1 1))
+               (println (== 1 2)))",
+        );
+        assert_eq!(out, "true\nfalse\n");
+    }
+
+    #[test]
+    fn oracle_typeclass_eq() {
+        oracle_test(
+            "(defclass (Eq 'a)
+               (== : (Fn ['a 'a] Bool)))
+             (instance (Eq i32)
+               (defn == ((x : i32) (y : i32)) : Bool (= x y)))
+             (defn main () : Unit
+               (println (== 1 1))
+               (println (== 1 2)))",
+        );
+    }
+
+    #[test]
+    fn test_generic_identity() {
+        let out = compile_run(
+            "(defn id ((x : 'a)) : 'a x)
+             (defn main () : i32 (id 42))",
+        );
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn test_generic_identity_println() {
+        let out = compile_run(
+            "(defn id ((x : 'a)) : 'a x)
+             (defn main () : Unit (println (id 42)))",
+        );
+        assert_eq!(out, "42\n");
+    }
+
+    #[test]
+    fn oracle_generic_identity() {
+        oracle_test(
+            "(defn id ((x : 'a)) : 'a x)
+             (defn main () : Unit (println (id 42)))",
+        );
+    }
+
+    #[test]
+    fn test_generic_const() {
+        let out = compile_run(
+            "(defn const ((x : 'a) (y : 'b)) : 'a x)
+             (defn main () : Unit (println (const 99 true)))",
+        );
+        assert_eq!(out, "99\n");
+    }
+
+    #[test]
+    fn oracle_generic_const() {
+        oracle_test(
+            "(defn const ((x : 'a) (y : 'b)) : 'a x)
+             (defn main () : Unit (println (const 99 true)))",
+        );
+    }
+
+    #[test]
+    fn test_generic_multiple_calls() {
+        let out = compile_run(
+            "(defn id ((x : 'a)) : 'a x)
+             (defn main () : Unit
+               (println (id 1))
+               (println (id true)))",
+        );
+        assert_eq!(out, "1\ntrue\n");
+    }
+
+    #[test]
+    fn oracle_generic_multiple_calls() {
+        oracle_test(
+            "(defn id ((x : 'a)) : 'a x)
+             (defn main () : Unit
+               (println (id 1))
+               (println (id true)))",
+        );
     }
 }

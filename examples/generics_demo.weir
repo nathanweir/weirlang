@@ -1,0 +1,118 @@
+;; ─── Phase 8 Demo: Generics + Typeclasses ───
+;;
+;; This file exercises parametric polymorphism, typeclasses with
+;; instance resolution, higher-kinded types, and monomorphization.
+
+;; ── 1. Generic functions ──────────────────────────────────────────
+;; The type variable 'a is universally quantified. Each call site
+;; gets its own monomorphized copy in codegen.
+
+(defn id ((x : 'a)) : 'a x)
+
+(defn const ((x : 'a) (y : 'b)) : 'a x)
+
+(defn apply ((f : (Fn ['a] 'b)) (x : 'a)) : 'b (f x))
+
+;; ── 2. Typeclasses ────────────────────────────────────────────────
+
+(defclass (Eq 'a)
+  (== : (Fn ['a 'a] Bool)))
+
+(defclass (Show 'a)
+  (show : (Fn ['a] String)))
+
+(defclass (Describable 'a)
+  (describe : (Fn ['a] String)))
+
+;; ── 3. Instances ──────────────────────────────────────────────────
+
+(instance (Eq i32)
+  (defn == ((x : i32) (y : i32)) : Bool (= x y)))
+
+(instance (Eq Bool)
+  (defn == ((a : Bool) (b : Bool)) : Bool
+    (if a b (not b))))
+
+(instance (Show i32)
+  (defn show ((x : i32)) : String (str x)))
+
+(instance (Show Bool)
+  (defn show ((x : Bool)) : String
+    (if x "true" "false")))
+
+(instance (Describable i32)
+  (defn describe ((x : i32)) : String
+    (if (= x 0)
+      "zero"
+      (if (> x 0) "positive" "negative"))))
+
+;; ── 4. ADTs + Generics ───────────────────────────────────────────
+
+(deftype (Option 'a)
+  (Some 'a)
+  None)
+
+(deftype (Pair 'a 'b)
+  (MkPair 'a 'b))
+
+;; ── 5. Higher-kinded types ────────────────────────────────────────
+
+(defclass (Functor 'f)
+  (fmap : (Fn [(Fn ['a] 'b) ('f 'a)] ('f 'b))))
+
+(instance (Functor Option)
+  (defn fmap ((f : (Fn ['a] 'b)) (opt : (Option 'a))) : (Option 'b)
+    (match opt
+      ((Some x) (Some (f x)))
+      (None None))))
+
+;; ── Main ──────────────────────────────────────────────────────────
+
+(defn main ()
+  ;; Generic functions
+  (println "─── Generic functions ───")
+  (println (id 42))
+  (println (id true))
+  (println (const 99 false))
+  (println (apply (fn (x) (+ x 10)) 5))
+
+  ;; Typeclass: Eq
+  (println "─── Eq typeclass ───")
+  (println (== 1 1))
+  (println (== 1 2))
+  (println (== true true))
+  (println (== true false))
+
+  ;; Typeclass: Show
+  (println "─── Show typeclass ───")
+  (println (show 42))
+  (println (show false))
+
+  ;; Typeclass: Describable
+  (println "─── Describable typeclass ───")
+  (println (describe 0))
+  (println (describe 7))
+  (println (describe (- 0 3)))
+
+  ;; ADT pattern matching
+  (println "─── ADTs + match ───")
+  (let ((x (Some 42))
+        (y None))
+    (match x
+      ((Some v) (println v))
+      (None (println "nothing")))
+    (match y
+      ((Some v) (println v))
+      (None (println "nothing"))))
+
+  ;; Higher-kinded types: Functor
+  (println "─── Functor (HKT) ───")
+  (let ((result (fmap (fn (x) (+ x 1)) (Some 10))))
+    (match result
+      ((Some v) (println v))
+      (None (println "nothing"))))
+
+  (let ((result (fmap (fn (x) (+ x 1)) None)))
+    (match result
+      ((Some v) (println v))
+      (None (println "nothing")))))

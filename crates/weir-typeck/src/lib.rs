@@ -33,6 +33,10 @@ pub enum Ty {
     Map(Box<Ty>, Box<Ty>),
     /// Unification variable
     Var(TyVarId),
+    /// Higher-kinded type application: `App(f, [a])` represents `('f 'a)`.
+    /// When `f` is resolved (e.g. to Option), `App(Con("Option", []), [Var(a)])` simplifies
+    /// to `Con("Option", [Var(a)])` during unification/apply.
+    App(Box<Ty>, Vec<Ty>),
     /// Error sentinel — unifies with anything, propagates silently
     Error,
 }
@@ -74,6 +78,13 @@ impl fmt::Display for Ty {
             Ty::Vector(elem) => write!(f, "(Vector {})", elem),
             Ty::Map(k, v) => write!(f, "(Map {} {})", k, v),
             Ty::Var(id) => write!(f, "?{}", id),
+            Ty::App(func, args) => {
+                write!(f, "({}", func)?;
+                for a in args {
+                    write!(f, " {}", a)?;
+                }
+                write!(f, ")")
+            }
             Ty::Error => write!(f, "<error>"),
         }
     }
@@ -134,12 +145,32 @@ pub struct FnType {
     pub return_type: Ty,
 }
 
+/// A monomorphized specialization of a generic function for codegen.
+#[derive(Clone, Debug)]
+pub struct Specialization {
+    /// Original function name (e.g., "id" or "==")
+    pub original_name: SmolStr,
+    /// Mangled name for the specialization (e.g., "id#i32" or "Eq#i32#==")
+    pub mangled_name: SmolStr,
+    /// Concrete parameter types
+    pub param_types: Vec<Ty>,
+    /// Concrete return type
+    pub return_type: Ty,
+    /// For instance methods: index of the source `Item::Instance` in the AST items list.
+    /// `None` for generic user function specializations.
+    pub instance_item_index: Option<usize>,
+}
+
 pub struct TypeCheckResult {
     pub errors: Vec<TypeError>,
     /// Resolved type for every expression, after substitution + numeric defaulting.
     pub expr_types: ArenaMap<ExprId, Ty>,
     /// Resolved function types for each named function, after substitution.
     pub fn_types: HashMap<SmolStr, FnType>,
+    /// For each call site that invokes a class method, the resolved concrete function name.
+    pub method_resolutions: HashMap<ExprId, SmolStr>,
+    /// Monomorphized specializations needed for codegen.
+    pub specializations: Vec<Specialization>,
 }
 
 // ── Public API ───────────────────────────────────────────────────
@@ -173,10 +204,110 @@ pub fn check(module: &Module) -> TypeCheckResult {
         );
     }
 
+    // Collect specializations from instance methods.
+    // Map type checker instances to AST item indices (they're collected in the same order).
+    let instance_item_indices: Vec<usize> = module
+        .items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (item, _))| {
+            if matches!(item, Item::Instance(_)) {
+                Some(i)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let mut specializations = Vec::new();
+    for (inst_idx, inst) in checker.instances.iter().enumerate() {
+        let item_index = instance_item_indices.get(inst_idx).copied();
+        for (method_name, mangled_name) in &inst.methods {
+            if let Some(scheme) = checker.fn_schemes.get(mangled_name) {
+                let param_types = scheme
+                    .param_types
+                    .iter()
+                    .map(|t| checker.apply(t))
+                    .collect();
+                let return_type = checker.apply(&scheme.return_type);
+                specializations.push(Specialization {
+                    original_name: method_name.clone(),
+                    mangled_name: mangled_name.clone(),
+                    param_types,
+                    return_type,
+                    instance_item_index: item_index,
+                });
+            }
+        }
+    }
+
+    // Collect specializations for generic user function calls.
+    // Walk all expressions looking for calls where the function type has concrete types
+    // but the function's scheme has quantified type variables.
+    let mut seen_specs: HashMap<SmolStr, Vec<SmolStr>> = HashMap::new();
+    for (id, _ty) in expr_types.iter() {
+        let expr = &module.exprs[id];
+        if let ExprKind::Call { func, .. } = &expr.kind {
+            let func_expr = &module.exprs[*func];
+            if let ExprKind::Var(name) = &func_expr.kind {
+                if let Some(scheme) = checker.fn_schemes.get(name) {
+                    if scheme.quantified.is_empty() || !scheme.constraints.is_empty() {
+                        continue; // not a generic user function (or is a class method)
+                    }
+                    // Get the instantiated type at this call site
+                    if let Some(Ty::Fn(param_tys, ret_ty)) = expr_types.get(*func) {
+                        // Check all types are concrete (no remaining Var)
+                        let all_concrete =
+                            param_tys.iter().all(|t| !has_type_var(t)) && !has_type_var(ret_ty);
+                        if !all_concrete {
+                            continue;
+                        }
+                        // Build mangled name from concrete types
+                        let type_key: String = param_tys
+                            .iter()
+                            .chain(std::iter::once(ret_ty.as_ref()))
+                            .map(|t| format!("{}", t))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        let mangled = SmolStr::new(format!("{}#{}", name, type_key));
+
+                        // Avoid duplicate specializations
+                        let entry = seen_specs.entry(name.clone()).or_default();
+                        if !entry.contains(&mangled) {
+                            entry.push(mangled.clone());
+                            specializations.push(Specialization {
+                                original_name: name.clone(),
+                                mangled_name: mangled,
+                                param_types: param_tys.clone(),
+                                return_type: *ret_ty.clone(),
+                                instance_item_index: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     TypeCheckResult {
         errors: checker.errors,
         expr_types,
         fn_types,
+        method_resolutions: checker.method_resolutions,
+        specializations,
+    }
+}
+
+/// Check if a type contains any unresolved type variables.
+fn has_type_var(ty: &Ty) -> bool {
+    match ty {
+        Ty::Var(_) => true,
+        Ty::Con(_, args) => args.iter().any(has_type_var),
+        Ty::Fn(params, ret) => params.iter().any(has_type_var) || has_type_var(ret),
+        Ty::Vector(e) => has_type_var(e),
+        Ty::Map(k, v) => has_type_var(k) || has_type_var(v),
+        Ty::App(f, args) => has_type_var(f) || args.iter().any(has_type_var),
+        _ => false,
     }
 }
 
@@ -205,13 +336,87 @@ struct StructDef {
     fields: Vec<(SmolStr, TypeExprId)>,
 }
 
-/// A polymorphic function type: quantified type vars + param/return types.
+/// A polymorphic function type: quantified type vars + constraints + param/return types.
 #[derive(Clone)]
 struct FnScheme {
     /// Type variable IDs that should be freshened at each call site.
     quantified: Vec<TyVarId>,
+    /// Typeclass constraints (e.g., `(Eq 'a)`)
+    constraints: Vec<ClassConstraint>,
     param_types: Vec<Ty>,
     return_type: Ty,
+}
+
+/// A resolved typeclass constraint: (Eq 'a), (Show i32), etc.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ClassConstraint {
+    class_name: SmolStr,
+    type_args: Vec<Ty>,
+}
+
+/// Typeclass definition stored during collection.
+#[derive(Clone)]
+struct ClassDef {
+    #[allow(dead_code)]
+    name: SmolStr,
+    type_params: Vec<SmolStr>,
+    /// Expected kind for each type param (e.g., `* -> *` for Functor's 'f)
+    type_param_kinds: Vec<TyKind>,
+    /// (method_name, method_type_expr_id)
+    methods: Vec<(SmolStr, TypeExprId)>,
+}
+
+/// A registered typeclass instance.
+#[derive(Clone)]
+struct InstanceEntry {
+    class_name: SmolStr,
+    /// Concrete or partially-concrete type args, e.g., [Ty::I32] or [Ty::Con("Option", [Ty::Var(x)])]
+    type_args: Vec<Ty>,
+    /// Prerequisites: e.g., (Eq 'a) for instance (Eq (Option 'a))
+    #[allow(dead_code)]
+    constraints: Vec<ClassConstraint>,
+    /// method_name -> mangled impl function name (e.g., "Eq#i32#==")
+    #[allow(dead_code)]
+    methods: HashMap<SmolStr, SmolStr>,
+}
+
+/// Kind of a type: `*` for concrete types, `* -> *` for type constructors like Option, etc.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TyKind {
+    /// Concrete type kind: `*`
+    Star,
+    /// Higher-kinded: `k1 -> k2`
+    Arrow(Box<TyKind>, Box<TyKind>),
+}
+
+impl fmt::Display for TyKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TyKind::Star => write!(f, "*"),
+            TyKind::Arrow(a, b) => {
+                if matches!(**a, TyKind::Arrow(_, _)) {
+                    write!(f, "({}) -> {}", a, b)
+                } else {
+                    write!(f, "{} -> {}", a, b)
+                }
+            }
+        }
+    }
+}
+
+impl TyKind {
+    /// Create a kind from a number of type parameters.
+    /// 0 params → `*`, 1 param → `* -> *`, 2 params → `* -> * -> *`, etc.
+    fn from_param_count(n: usize) -> TyKind {
+        if n == 0 {
+            TyKind::Star
+        } else {
+            TyKind::Arrow(
+                Box::new(TyKind::Star),
+                Box::new(TyKind::from_param_count(n - 1)),
+            )
+        }
+    }
 }
 
 /// Kind of a type variable — used for numeric literal defaulting.
@@ -238,6 +443,16 @@ struct TypeChecker<'a> {
     /// Constructor name → (type_name, type_params, field_type_exprs)
     constructors: HashMap<SmolStr, (SmolStr, Vec<SmolStr>, Vec<TypeExprId>)>,
 
+    // Typeclass definitions and instances
+    class_defs: HashMap<SmolStr, ClassDef>,
+    instances: Vec<InstanceEntry>,
+    /// Deferred constraints to check after function body is fully typed
+    deferred_constraints: Vec<(ClassConstraint, ExprId, Span)>,
+
+    // Kind system
+    /// Maps type constructor names to their kinds (e.g., "Option" → `* -> *`)
+    type_kinds: HashMap<SmolStr, TyKind>,
+
     // Scope stack for variable types
     scopes: Vec<HashMap<SmolStr, Ty>>,
 
@@ -248,6 +463,9 @@ struct TypeChecker<'a> {
 
     /// Records the type of every expression (pre-substitution).
     expr_types: ArenaMap<ExprId, Ty>,
+
+    /// For each call site that invokes a class method, the resolved concrete function name.
+    method_resolutions: HashMap<ExprId, SmolStr>,
 }
 
 impl<'a> TypeChecker<'a> {
@@ -260,10 +478,15 @@ impl<'a> TypeChecker<'a> {
             struct_defs: HashMap::new(),
             fn_schemes: HashMap::new(),
             constructors: HashMap::new(),
+            class_defs: HashMap::new(),
+            instances: Vec::new(),
+            deferred_constraints: Vec::new(),
+            type_kinds: HashMap::new(),
             scopes: vec![HashMap::new()],
             type_param_scope: HashMap::new(),
             errors: Vec::new(),
             expr_types: ArenaMap::default(),
+            method_resolutions: HashMap::new(),
         }
     }
 
@@ -308,6 +531,19 @@ impl<'a> TypeChecker<'a> {
             ),
             Ty::Vector(elem) => Ty::Vector(Box::new(self.apply(elem))),
             Ty::Map(k, v) => Ty::Map(Box::new(self.apply(k)), Box::new(self.apply(v))),
+            Ty::App(func, args) => {
+                let applied_func = self.apply(func);
+                let applied_args: Vec<Ty> = args.iter().map(|a| self.apply(a)).collect();
+                // If the function resolved to a Con, flatten into Con(name, args)
+                match applied_func {
+                    Ty::Con(name, existing_args) => {
+                        let mut all_args = existing_args;
+                        all_args.extend(applied_args);
+                        Ty::Con(name, all_args)
+                    }
+                    _ => Ty::App(Box::new(applied_func), applied_args),
+                }
+            }
             _ => ty.clone(),
         }
     }
@@ -360,6 +596,54 @@ impl<'a> TypeChecker<'a> {
                 self.unify(v1, v2, span);
             }
 
+            // HKT application: App(f1, a1) vs App(f2, a2)
+            (Ty::App(f1, a1), Ty::App(f2, a2)) if a1.len() == a2.len() => {
+                self.unify(f1, f2, span);
+                for (x, y) in a1.iter().zip(a2.iter()) {
+                    self.unify(x, y, span);
+                }
+            }
+
+            // App(f, args) vs Con(name, args2): bind f to the constructor, unify args
+            (Ty::App(f, a1), Ty::Con(name, a2)) => {
+                // f should unify with the bare constructor (zero-arg Con)
+                self.unify(f, &Ty::Con(name.clone(), vec![]), span);
+                if a1.len() == a2.len() {
+                    for (x, y) in a1.iter().zip(a2.iter()) {
+                        self.unify(x, y, span);
+                    }
+                } else {
+                    self.error(
+                        format!(
+                            "type constructor arity mismatch: {} applied to {} args, expected {}",
+                            name,
+                            a1.len(),
+                            a2.len()
+                        ),
+                        span,
+                    );
+                }
+            }
+
+            (Ty::Con(name, a1), Ty::App(f, a2)) => {
+                self.unify(f, &Ty::Con(name.clone(), vec![]), span);
+                if a1.len() == a2.len() {
+                    for (x, y) in a1.iter().zip(a2.iter()) {
+                        self.unify(x, y, span);
+                    }
+                } else {
+                    self.error(
+                        format!(
+                            "type constructor arity mismatch: {} applied to {} args, expected {}",
+                            name,
+                            a2.len(),
+                            a1.len()
+                        ),
+                        span,
+                    );
+                }
+            }
+
             _ => {
                 self.error(format!("type mismatch: expected {}, got {}", a, b), span);
             }
@@ -376,6 +660,9 @@ impl<'a> TypeChecker<'a> {
             }
             Ty::Vector(e) => self.occurs_in(var, e),
             Ty::Map(k, v) => self.occurs_in(var, k) || self.occurs_in(var, v),
+            Ty::App(func, args) => {
+                self.occurs_in(var, func) || args.iter().any(|a| self.occurs_in(var, a))
+            }
             _ => false,
         }
     }
@@ -428,7 +715,8 @@ impl<'a> TypeChecker<'a> {
     }
 
     /// Instantiate a function scheme with fresh type variables.
-    fn instantiate(&mut self, scheme: &FnScheme) -> (Vec<Ty>, Ty) {
+    /// Returns (param_types, return_type, instantiated_constraints).
+    fn instantiate(&mut self, scheme: &FnScheme) -> (Vec<Ty>, Ty, Vec<ClassConstraint>) {
         let mapping: HashMap<TyVarId, Ty> = scheme
             .quantified
             .iter()
@@ -441,7 +729,19 @@ impl<'a> TypeChecker<'a> {
             .map(|t| self.subst_vars(t, &mapping))
             .collect();
         let ret = self.subst_vars(&scheme.return_type, &mapping);
-        (params, ret)
+        let constraints = scheme
+            .constraints
+            .iter()
+            .map(|c| ClassConstraint {
+                class_name: c.class_name.clone(),
+                type_args: c
+                    .type_args
+                    .iter()
+                    .map(|t| self.subst_vars(t, &mapping))
+                    .collect(),
+            })
+            .collect();
+        (params, ret, constraints)
     }
 
     fn subst_vars(&self, ty: &Ty, mapping: &HashMap<TyVarId, Ty>) -> Ty {
@@ -459,6 +759,10 @@ impl<'a> TypeChecker<'a> {
             Ty::Map(k, v) => Ty::Map(
                 Box::new(self.subst_vars(k, mapping)),
                 Box::new(self.subst_vars(v, mapping)),
+            ),
+            Ty::App(func, args) => Ty::App(
+                Box::new(self.subst_vars(func, mapping)),
+                args.iter().map(|a| self.subst_vars(a, mapping)).collect(),
             ),
             _ => ty.clone(),
         }
@@ -516,23 +820,42 @@ impl<'a> TypeChecker<'a> {
 
             TypeExprKind::Applied { constructor, args } => {
                 let con_expr = &self.module.type_exprs[*constructor];
-                if let TypeExprKind::Named(name) = &con_expr.kind {
-                    let name = name.clone();
-                    let arg_tys: Vec<Ty> =
-                        args.iter().map(|&id| self.resolve_type_expr(id)).collect();
+                match &con_expr.kind {
+                    TypeExprKind::Named(name) => {
+                        let name = name.clone();
+                        let arg_tys: Vec<Ty> =
+                            args.iter().map(|&id| self.resolve_type_expr(id)).collect();
 
-                    // Special cases
-                    if name == "Vector" && arg_tys.len() == 1 {
-                        return Ty::Vector(Box::new(arg_tys[0].clone()));
-                    }
-                    if name == "Map" && arg_tys.len() == 2 {
-                        return Ty::Map(Box::new(arg_tys[0].clone()), Box::new(arg_tys[1].clone()));
-                    }
+                        // Special cases
+                        if name == "Vector" && arg_tys.len() == 1 {
+                            return Ty::Vector(Box::new(arg_tys[0].clone()));
+                        }
+                        if name == "Map" && arg_tys.len() == 2 {
+                            return Ty::Map(
+                                Box::new(arg_tys[0].clone()),
+                                Box::new(arg_tys[1].clone()),
+                            );
+                        }
 
-                    Ty::Con(name, arg_tys)
-                } else {
-                    self.error("expected type name in type application", span);
-                    Ty::Error
+                        Ty::Con(name, arg_tys)
+                    }
+                    TypeExprKind::TypeVar(name) => {
+                        // HKT application: ('f 'a) where 'f is a type variable
+                        let func_ty = if let Some(ty) = self.type_param_scope.get(name.as_str()) {
+                            ty.clone()
+                        } else {
+                            let ty = self.fresh_var();
+                            self.type_param_scope.insert(name.clone(), ty.clone());
+                            ty
+                        };
+                        let arg_tys: Vec<Ty> =
+                            args.iter().map(|&id| self.resolve_type_expr(id)).collect();
+                        Ty::App(Box::new(func_ty), arg_tys)
+                    }
+                    _ => {
+                        self.error("expected type name in type application", span);
+                        Ty::Error
+                    }
                 }
             }
 
@@ -593,6 +916,7 @@ impl<'a> TypeChecker<'a> {
             .map(|(item, _)| item.clone())
             .collect();
 
+        // Pass 1: type and struct definitions
         for item in &items {
             match item {
                 Item::Deftype(d) => self.collect_deftype(d),
@@ -601,9 +925,33 @@ impl<'a> TypeChecker<'a> {
             }
         }
 
+        // Pass 2: typeclass definitions
+        for item in &items {
+            if let Item::Defclass(d) = item {
+                self.collect_defclass(d);
+            }
+        }
+
+        // Pass 3: declare forms (constrained function signatures)
+        for item in &items {
+            if let Item::Declare(d) = item {
+                self.collect_declare(d);
+            }
+        }
+
+        // Pass 4: function signatures (skips those already declared)
         for item in &items {
             if let Item::Defn(d) = item {
-                self.collect_defn_sig(d);
+                if !self.fn_schemes.contains_key(&d.name) {
+                    self.collect_defn_sig(d);
+                }
+            }
+        }
+
+        // Pass 5: instance definitions
+        for item in &items {
+            if let Item::Instance(d) = item {
+                self.collect_instance(d);
             }
         }
     }
@@ -628,6 +976,12 @@ impl<'a> TypeChecker<'a> {
                 variants,
             },
         );
+
+        // Register kind: number of type params determines the kind
+        self.type_kinds.insert(
+            d.name.clone(),
+            TyKind::from_param_count(d.type_params.len()),
+        );
     }
 
     fn collect_defstruct(&mut self, d: &Defstruct) {
@@ -643,6 +997,12 @@ impl<'a> TypeChecker<'a> {
                 params: d.type_params.clone(),
                 fields,
             },
+        );
+
+        // Register kind
+        self.type_kinds.insert(
+            d.name.clone(),
+            TyKind::from_param_count(d.type_params.len()),
         );
     }
 
@@ -682,12 +1042,499 @@ impl<'a> TypeChecker<'a> {
             d.name.clone(),
             FnScheme {
                 quantified,
+                constraints: Vec::new(),
                 param_types,
                 return_type,
             },
         );
 
         self.type_param_scope = saved;
+    }
+
+    fn collect_defclass(&mut self, d: &Defclass) {
+        if self.class_defs.contains_key(&d.name) {
+            self.error(
+                format!("duplicate typeclass definition '{}'", d.name),
+                d.span,
+            );
+            return;
+        }
+
+        let saved = self.type_param_scope.clone();
+        self.type_param_scope.clear();
+
+        // Create fresh type vars for class type params
+        for param in &d.type_params {
+            let v = self.fresh_var();
+            self.type_param_scope.insert(param.clone(), v);
+        }
+
+        // Collect quantified vars from the class type params
+        let quantified: Vec<TyVarId> = self
+            .type_param_scope
+            .values()
+            .filter_map(|ty| {
+                if let Ty::Var(id) = ty {
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Build the class constraint for this class
+        let class_constraint = ClassConstraint {
+            class_name: d.name.clone(),
+            type_args: d
+                .type_params
+                .iter()
+                .map(|p| self.type_param_scope[p].clone())
+                .collect(),
+        };
+
+        let mut methods = Vec::new();
+
+        for m in &d.methods {
+            // Resolve the method type in the scope of the class type params
+            let method_ty = self.resolve_type_expr(m.type_ann);
+
+            // Create a function scheme for the method with the class constraint
+            if let Ty::Fn(params, ret) = method_ty {
+                self.fn_schemes.insert(
+                    m.name.clone(),
+                    FnScheme {
+                        quantified: quantified.clone(),
+                        constraints: vec![class_constraint.clone()],
+                        param_types: params,
+                        return_type: *ret,
+                    },
+                );
+            } else {
+                self.error(
+                    format!("method '{}' must have function type", m.name),
+                    m.span,
+                );
+            }
+
+            methods.push((m.name.clone(), m.type_ann));
+        }
+
+        // Infer kind for each class type param from usage in method types.
+        // A type param used as `('f 'a)` (Ty::App) has kind `* -> *`, etc.
+        let type_param_kinds: Vec<TyKind> = d
+            .type_params
+            .iter()
+            .map(|param| {
+                if let Some(Ty::Var(var_id)) = self.type_param_scope.get(param.as_str()) {
+                    let var_id = *var_id;
+                    // Scan all method types for App nodes using this var
+                    let mut max_arity = 0usize;
+                    for m in &d.methods {
+                        let method_ty = self.resolve_type_expr(m.type_ann);
+                        max_arity = max_arity.max(self.infer_var_arity(var_id, &method_ty));
+                    }
+                    TyKind::from_param_count(max_arity)
+                } else {
+                    TyKind::Star
+                }
+            })
+            .collect();
+
+        self.class_defs.insert(
+            d.name.clone(),
+            ClassDef {
+                name: d.name.clone(),
+                type_params: d.type_params.clone(),
+                type_param_kinds,
+                methods,
+            },
+        );
+
+        self.type_param_scope = saved;
+    }
+
+    fn collect_declare(&mut self, d: &Declare) {
+        let saved = self.type_param_scope.clone();
+        self.type_param_scope.clear();
+
+        // Resolve the type expression — this handles Constrained types
+        let ty = self.resolve_type_expr_with_constraints(d.type_ann);
+
+        match ty {
+            (Ty::Fn(params, ret), constraints) => {
+                let quantified: Vec<TyVarId> = self
+                    .type_param_scope
+                    .values()
+                    .filter_map(|ty| {
+                        if let Ty::Var(id) = ty {
+                            Some(*id)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                self.fn_schemes.insert(
+                    d.name.clone(),
+                    FnScheme {
+                        quantified,
+                        constraints,
+                        param_types: params,
+                        return_type: *ret,
+                    },
+                );
+            }
+            (ty, constraints) => {
+                // If there are no params, treat as a zero-arg function
+                let quantified: Vec<TyVarId> = self
+                    .type_param_scope
+                    .values()
+                    .filter_map(|t| if let Ty::Var(id) = t { Some(*id) } else { None })
+                    .collect();
+
+                self.fn_schemes.insert(
+                    d.name.clone(),
+                    FnScheme {
+                        quantified,
+                        constraints,
+                        param_types: vec![],
+                        return_type: ty,
+                    },
+                );
+            }
+        }
+
+        self.type_param_scope = saved;
+    }
+
+    /// Resolve a type expression, extracting any Constrained wrapper into separate constraints.
+    fn resolve_type_expr_with_constraints(&mut self, id: TypeExprId) -> (Ty, Vec<ClassConstraint>) {
+        let texpr = &self.module.type_exprs[id];
+        if let TypeExprKind::Constrained { constraints, inner } = &texpr.kind {
+            let constraints = constraints.clone();
+            let inner = *inner;
+            let class_constraints: Vec<ClassConstraint> = constraints
+                .iter()
+                .map(|c| ClassConstraint {
+                    class_name: c.class_name.clone(),
+                    type_args: c
+                        .type_args
+                        .iter()
+                        .map(|&t| self.resolve_type_expr(t))
+                        .collect(),
+                })
+                .collect();
+            let ty = self.resolve_type_expr(inner);
+            (ty, class_constraints)
+        } else {
+            let ty = self.resolve_type_expr(id);
+            (ty, Vec::new())
+        }
+    }
+
+    fn collect_instance(&mut self, d: &InstanceDef) {
+        // Validate class exists
+        let class_def = match self.class_defs.get(&d.class_name) {
+            Some(cd) => cd.clone(),
+            None => {
+                self.error(format!("unknown typeclass '{}'", d.class_name), d.span);
+                return;
+            }
+        };
+
+        // Check type arg count
+        if d.type_args.len() != class_def.type_params.len() {
+            self.error(
+                format!(
+                    "typeclass '{}' expects {} type arguments, got {}",
+                    d.class_name,
+                    class_def.type_params.len(),
+                    d.type_args.len()
+                ),
+                d.span,
+            );
+            return;
+        }
+
+        let saved = self.type_param_scope.clone();
+        self.type_param_scope.clear();
+
+        // Resolve instance type args (e.g., i32, or (Option 'a))
+        let instance_type_args: Vec<Ty> = d
+            .type_args
+            .iter()
+            .map(|&t| self.resolve_type_expr(t))
+            .collect();
+
+        // Kind-check each instance type arg against what the class expects
+        for (i, inst_ty) in instance_type_args.iter().enumerate() {
+            let expected_kind = &class_def.type_param_kinds[i];
+            let actual_kind = self.kind_of(inst_ty);
+            if *expected_kind != actual_kind {
+                self.error(
+                    format!(
+                        "kind mismatch in instance of '{}': expected kind `{}`, got `{}`",
+                        d.class_name, expected_kind, actual_kind
+                    ),
+                    d.span,
+                );
+                self.type_param_scope = saved;
+                return;
+            }
+        }
+
+        // Resolve instance constraints (e.g., (Eq 'a))
+        let instance_constraints: Vec<ClassConstraint> = d
+            .constraints
+            .iter()
+            .map(|c| ClassConstraint {
+                class_name: c.class_name.clone(),
+                type_args: c
+                    .type_args
+                    .iter()
+                    .map(|&t| self.resolve_type_expr(t))
+                    .collect(),
+            })
+            .collect();
+
+        // Check for duplicate instance
+        for existing in &self.instances {
+            if existing.class_name == d.class_name {
+                // Simple duplicate check: same concrete head type
+                let existing_head = existing.type_args.first();
+                let new_head = instance_type_args.first();
+                if let (Some(eh), Some(nh)) = (existing_head, new_head) {
+                    if self.types_structurally_equal(eh, nh) {
+                        self.error(
+                            format!("duplicate instance of {} for {}", d.class_name, nh),
+                            d.span,
+                        );
+                        self.type_param_scope = saved;
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Build the type param mapping from class params to instance types
+        let class_param_mapping: HashMap<SmolStr, Ty> = class_def
+            .type_params
+            .iter()
+            .zip(instance_type_args.iter())
+            .map(|(p, t)| (p.clone(), t.clone()))
+            .collect();
+
+        let mut method_impls = HashMap::new();
+
+        // Type-check each method implementation
+        for method_defn in &d.methods {
+            let class_method = class_def
+                .methods
+                .iter()
+                .find(|(n, _)| *n == method_defn.name);
+            if class_method.is_none() {
+                self.error(
+                    format!(
+                        "'{}' is not a method of typeclass '{}'",
+                        method_defn.name, d.class_name
+                    ),
+                    method_defn.span,
+                );
+                continue;
+            }
+
+            // Generate mangled name for this instance method
+            let mangled = format!(
+                "{}#{}#{}",
+                d.class_name,
+                instance_type_args
+                    .iter()
+                    .map(|t| format!("{}", t))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                method_defn.name
+            );
+            let mangled = SmolStr::new(&mangled);
+
+            // Register the method defn as a regular function under the mangled name
+            self.collect_instance_method_sig(method_defn, &mangled);
+
+            method_impls.insert(method_defn.name.clone(), mangled);
+        }
+
+        self.instances.push(InstanceEntry {
+            class_name: d.class_name.clone(),
+            type_args: instance_type_args,
+            constraints: instance_constraints,
+            methods: method_impls,
+        });
+
+        let _ = class_param_mapping; // used for future type-checking of method bodies against class sig
+        self.type_param_scope = saved;
+    }
+
+    /// Register an instance method under a mangled name.
+    fn collect_instance_method_sig(&mut self, d: &Defn, mangled_name: &SmolStr) {
+        let saved = self.type_param_scope.clone();
+        // Don't clear — we need the instance type param scope
+
+        let param_types: Vec<Ty> = d
+            .params
+            .iter()
+            .map(|p| {
+                if let Some(type_id) = p.type_ann {
+                    self.resolve_type_expr(type_id)
+                } else {
+                    self.fresh_var()
+                }
+            })
+            .collect();
+
+        let return_type = if let Some(ret_id) = d.return_type {
+            self.resolve_type_expr(ret_id)
+        } else {
+            self.fresh_var()
+        };
+
+        let quantified: Vec<TyVarId> = self
+            .type_param_scope
+            .values()
+            .filter_map(|ty| {
+                if let Ty::Var(id) = ty {
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        self.fn_schemes.insert(
+            mangled_name.clone(),
+            FnScheme {
+                quantified,
+                constraints: Vec::new(),
+                param_types,
+                return_type,
+            },
+        );
+
+        self.type_param_scope = saved;
+    }
+
+    /// Determine the kind of a concrete type.
+    /// Primitive types have kind `*`. Named type constructors look up `type_kinds`.
+    /// A bare type constructor name (e.g., `Option` with no args applied) gets its
+    /// registered kind. A fully-applied constructor (e.g., `(Option i32)`) has kind `*`.
+    fn kind_of(&self, ty: &Ty) -> TyKind {
+        match ty {
+            Ty::I8
+            | Ty::I16
+            | Ty::I32
+            | Ty::I64
+            | Ty::U8
+            | Ty::U16
+            | Ty::U32
+            | Ty::U64
+            | Ty::F32
+            | Ty::F64
+            | Ty::Bool
+            | Ty::Str
+            | Ty::Unit
+            | Ty::Error => TyKind::Star,
+            Ty::Con(name, args) => {
+                if let Some(registered) = self.type_kinds.get(name) {
+                    // Strip applied args from the kind
+                    let mut kind = registered.clone();
+                    for _ in 0..args.len() {
+                        if let TyKind::Arrow(_, result) = kind {
+                            kind = *result;
+                        } else {
+                            // Over-applied — kind is `*` (error elsewhere)
+                            return TyKind::Star;
+                        }
+                    }
+                    kind
+                } else {
+                    // Unknown — assume `*`
+                    TyKind::Star
+                }
+            }
+            Ty::Fn(_, _) => TyKind::Star,
+            Ty::Vector(_) | Ty::Map(_, _) => TyKind::Star, // fully applied
+            Ty::Var(_) => TyKind::Star,                    // type variables default to kind `*`
+            Ty::App(_, _) => TyKind::Star,                 // applied HKT is kind `*`
+        }
+    }
+
+    /// Infer the arity of a type variable from its usage as a type constructor.
+    /// If `var_id` appears as the function in `App(Var(var_id), args)`, return `args.len()`.
+    /// Otherwise return 0 (kind `*`).
+    fn infer_var_arity(&self, var_id: TyVarId, ty: &Ty) -> usize {
+        match ty {
+            Ty::App(func, args) => {
+                let from_func = if let Ty::Var(id) = func.as_ref() {
+                    if *id == var_id {
+                        args.len()
+                    } else {
+                        0
+                    }
+                } else {
+                    self.infer_var_arity(var_id, func)
+                };
+                let from_args = args
+                    .iter()
+                    .map(|a| self.infer_var_arity(var_id, a))
+                    .max()
+                    .unwrap_or(0);
+                from_func.max(from_args)
+            }
+            Ty::Con(_, args) => args
+                .iter()
+                .map(|a| self.infer_var_arity(var_id, a))
+                .max()
+                .unwrap_or(0),
+            Ty::Fn(params, ret) => {
+                let from_params = params
+                    .iter()
+                    .map(|p| self.infer_var_arity(var_id, p))
+                    .max()
+                    .unwrap_or(0);
+                from_params.max(self.infer_var_arity(var_id, ret))
+            }
+            Ty::Vector(e) => self.infer_var_arity(var_id, e),
+            Ty::Map(k, v) => self
+                .infer_var_arity(var_id, k)
+                .max(self.infer_var_arity(var_id, v)),
+            _ => 0,
+        }
+    }
+
+    /// Check if two types are structurally equal (ignoring unification variables).
+    fn types_structurally_equal(&self, a: &Ty, b: &Ty) -> bool {
+        match (a, b) {
+            (Ty::I8, Ty::I8)
+            | (Ty::I16, Ty::I16)
+            | (Ty::I32, Ty::I32)
+            | (Ty::I64, Ty::I64)
+            | (Ty::U8, Ty::U8)
+            | (Ty::U16, Ty::U16)
+            | (Ty::U32, Ty::U32)
+            | (Ty::U64, Ty::U64)
+            | (Ty::F32, Ty::F32)
+            | (Ty::F64, Ty::F64)
+            | (Ty::Bool, Ty::Bool)
+            | (Ty::Str, Ty::Str)
+            | (Ty::Unit, Ty::Unit) => true,
+            (Ty::Con(n1, a1), Ty::Con(n2, a2)) => {
+                n1 == n2
+                    && a1.len() == a2.len()
+                    && a1
+                        .iter()
+                        .zip(a2.iter())
+                        .all(|(x, y)| self.types_structurally_equal(x, y))
+            }
+            _ => false,
+        }
     }
 
     fn register_builtin_schemes(&mut self) {
@@ -703,6 +1550,13 @@ impl<'a> TypeChecker<'a> {
                 Ty::Fn(vec![], Box::new(Ty::Unit)), // placeholder
             );
         }
+
+        // Register kinds for built-in type constructors
+        // Vector : * -> *, Map : * -> * -> *
+        self.type_kinds
+            .insert(SmolStr::new("Vector"), TyKind::from_param_count(1));
+        self.type_kinds
+            .insert(SmolStr::new("Map"), TyKind::from_param_count(2));
     }
 
     // ── Second pass: check items ─────────────────────────────────
@@ -726,7 +1580,7 @@ impl<'a> TypeChecker<'a> {
             self.define_var(name.clone(), Ty::Fn(vec![], Box::new(Ty::Unit))); // placeholder
         }
 
-        // Check each function
+        // Check each top-level function
         let items: Vec<_> = self
             .module
             .items
@@ -743,10 +1597,32 @@ impl<'a> TypeChecker<'a> {
         for defn in &items {
             self.check_defn(defn);
         }
+
+        // Check instance method bodies
+        let instance_items: Vec<_> = self
+            .module
+            .items
+            .iter()
+            .filter_map(|(item, _)| {
+                if let Item::Instance(d) = item {
+                    Some(d.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for inst in &instance_items {
+            self.check_instance_methods(inst);
+        }
     }
 
     fn check_defn(&mut self, d: &Defn) {
-        let scheme = match self.fn_schemes.get(&d.name) {
+        self.check_defn_with_name(&d.name, d);
+    }
+
+    fn check_defn_with_name(&mut self, name: &SmolStr, d: &Defn) {
+        let scheme = match self.fn_schemes.get(name) {
             Some(s) => s.clone(),
             None => return,
         };
@@ -768,8 +1644,124 @@ impl<'a> TypeChecker<'a> {
 
         self.pop_scope();
 
-        // Default unresolved numeric literals
+        // Default unresolved numeric literals first so constraints have concrete types
         self.default_numeric_vars();
+
+        // Resolve deferred constraints
+        self.resolve_constraints();
+    }
+
+    fn check_instance_methods(&mut self, inst: &InstanceDef) {
+        let instance_type_args_str = inst
+            .type_args
+            .iter()
+            .map(|&t| {
+                let saved = self.type_param_scope.clone();
+                self.type_param_scope.clear();
+                let ty = self.resolve_type_expr(t);
+                self.type_param_scope = saved;
+                format!("{}", ty)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+
+        for method_defn in &inst.methods {
+            let mangled = SmolStr::new(format!(
+                "{}#{}#{}",
+                inst.class_name, instance_type_args_str, method_defn.name
+            ));
+            self.check_defn_with_name(&mangled, method_defn);
+        }
+    }
+
+    /// Resolve all deferred typeclass constraints.
+    fn resolve_constraints(&mut self) {
+        let constraints: Vec<_> = self.deferred_constraints.drain(..).collect();
+        for (constraint, expr_id, span) in constraints {
+            let resolved = ClassConstraint {
+                class_name: constraint.class_name.clone(),
+                type_args: constraint.type_args.iter().map(|t| self.apply(t)).collect(),
+            };
+
+            // Check if any type args are still unresolved variables
+            let has_vars = resolved.type_args.iter().any(|t| matches!(t, Ty::Var(_)));
+
+            if has_vars {
+                // Can't resolve yet — might be inside a polymorphic function
+                // If this function itself has the constraint in its scheme, that's fine
+                continue;
+            }
+
+            match self.find_instance(&resolved) {
+                Some(mangled_method) => {
+                    self.method_resolutions.insert(expr_id, mangled_method);
+                }
+                None => {
+                    // Check if there's an error type in the args — suppress error
+                    let has_error = resolved.type_args.iter().any(|t| matches!(t, Ty::Error));
+                    if !has_error {
+                        self.error(
+                            format!(
+                                "no instance of {} for {}",
+                                resolved.class_name,
+                                resolved
+                                    .type_args
+                                    .iter()
+                                    .map(|t| format!("{}", t))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                            span,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Find a matching instance for a concrete constraint.
+    /// Returns the mangled method name if found.
+    fn find_instance(&self, constraint: &ClassConstraint) -> Option<SmolStr> {
+        for inst in &self.instances {
+            if inst.class_name != constraint.class_name {
+                continue;
+            }
+            if inst.type_args.len() != constraint.type_args.len() {
+                continue;
+            }
+
+            // Check if the instance type args match the constraint type args
+            let matches =
+                inst.type_args.iter().zip(constraint.type_args.iter()).all(
+                    |(inst_ty, constraint_ty)| self.instance_type_matches(inst_ty, constraint_ty),
+                );
+
+            if matches {
+                // For now, return the first method name found — caller will need
+                // to resolve specific method. We just confirm the instance exists.
+                // The actual method resolution happens during call checking.
+                return Some(SmolStr::new(format!(
+                    "{}#{}",
+                    inst.class_name,
+                    inst.type_args
+                        .iter()
+                        .map(|t| format!("{}", t))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )));
+            }
+        }
+        None
+    }
+
+    /// Check if an instance type matches a concrete constraint type.
+    fn instance_type_matches(&self, inst_ty: &Ty, constraint_ty: &Ty) -> bool {
+        match (inst_ty, constraint_ty) {
+            // Instance has a type variable — matches anything (conditional instance)
+            (Ty::Var(_), _) => true,
+            // Both concrete — must be equal
+            (a, b) => self.types_structurally_equal(a, b),
+        }
     }
 
     fn check_body(&mut self, body: &[ExprId]) -> Ty {
@@ -807,7 +1799,7 @@ impl<'a> TypeChecker<'a> {
                 }
                 // Check if it's a known function (instantiate its scheme)
                 if let Some(scheme) = self.fn_schemes.get(name).cloned() {
-                    let (params, ret) = self.instantiate(&scheme);
+                    let (params, ret, _constraints) = self.instantiate(&scheme);
                     return Ty::Fn(params, Box::new(ret));
                 }
                 if let Some(ty) = self.lookup_var(name) {
@@ -1079,7 +2071,7 @@ impl<'a> TypeChecker<'a> {
 
             // Regular function call — instantiate the scheme
             if let Some(scheme) = self.fn_schemes.get(name).cloned() {
-                let (param_tys, ret_ty) = self.instantiate(&scheme);
+                let (param_tys, ret_ty, constraints) = self.instantiate(&scheme);
                 let arg_tys: Vec<Ty> = args.iter().map(|a| self.check_expr(a.value)).collect();
 
                 // Record the function's type so hover works on the Var expression
@@ -1102,6 +2094,12 @@ impl<'a> TypeChecker<'a> {
                 for (p, a) in param_tys.iter().zip(arg_tys.iter()) {
                     self.unify(p, a, span);
                 }
+
+                // Defer any constraints for resolution after body check
+                for c in constraints {
+                    self.deferred_constraints.push((c, func_id, span));
+                }
+
                 return ret_ty;
             }
         }
@@ -1830,6 +2828,46 @@ mod tests {
         );
     }
 
+    // ── Generic functions (Phase 8a) ────────────────────────────
+
+    #[test]
+    fn generic_identity() {
+        check_ok(
+            "(defn id ((x : 'a)) : 'a x)
+             (defn main () (let ((a (id 42)) (b (id \"hello\"))) a))",
+        );
+    }
+
+    #[test]
+    fn generic_function_calling_generic_constructor() {
+        check_ok(
+            "(deftype (Option 'a) (Some 'a) None)
+             (defn wrap ((x : 'a)) : (Option 'a) (Some x))
+             (defn main () (wrap 42))",
+        );
+    }
+
+    #[test]
+    fn generic_multiple_type_params() {
+        check_ok(
+            "(defn const ((x : 'a) (y : 'b)) : 'a x)
+             (defn main () (const 1 \"hello\"))",
+        );
+    }
+
+    #[test]
+    fn error_type_mismatch_through_generic() {
+        let msg = check_err(
+            "(defn id ((x : 'a)) : 'a x)
+             (defn main () : i32 (id \"hello\"))",
+        );
+        assert!(
+            msg.contains("type mismatch"),
+            "expected type mismatch, got: {}",
+            msg
+        );
+    }
+
     // ── Failing programs (type errors) ───────────────────────────
 
     #[test]
@@ -1938,5 +2976,156 @@ mod tests {
              (defn main () (id 3.5))",
         );
         insta::assert_snapshot!(msg, @"type mismatch: expected float type, got i32");
+    }
+
+    // ── Typeclasses (Phase 8b) ──────────────────────────────────
+
+    #[test]
+    fn typeclass_basic_instance() {
+        check_ok(
+            "(defclass (Eq 'a)
+               (== : (Fn ['a 'a] Bool)))
+             (instance (Eq i32)
+               (defn == ((x : i32) (y : i32)) : Bool (= x y)))
+             (defn main () (== 1 2))",
+        );
+    }
+
+    #[test]
+    fn typeclass_missing_instance() {
+        let msg = check_err(
+            "(defclass (Eq 'a)
+               (== : (Fn ['a 'a] Bool)))
+             (defn main () (== 1 2))",
+        );
+        assert!(
+            msg.contains("no instance of Eq"),
+            "expected 'no instance', got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn typeclass_constrained_function() {
+        check_ok(
+            "(defclass (Eq 'a)
+               (== : (Fn ['a 'a] Bool)))
+             (instance (Eq i32)
+               (defn == ((x : i32) (y : i32)) : Bool (= x y)))
+             (declare equal? (=> (Eq 'a) (Fn ['a 'a] Bool)))
+             (defn equal? ((x : 'a) (y : 'a)) : Bool (== x y))
+             (defn main () (equal? 1 2))",
+        );
+    }
+
+    #[test]
+    fn typeclass_multiple_methods() {
+        check_ok(
+            "(defclass (Show 'a)
+               (show : (Fn ['a] String)))
+             (instance (Show i32)
+               (defn show ((x : i32)) : String (str x)))
+             (defn main () (show 42))",
+        );
+    }
+
+    #[test]
+    fn error_duplicate_instance() {
+        let msg = check_err(
+            "(defclass (Eq 'a)
+               (== : (Fn ['a 'a] Bool)))
+             (instance (Eq i32)
+               (defn == ((x : i32) (y : i32)) : Bool (= x y)))
+             (instance (Eq i32)
+               (defn == ((x : i32) (y : i32)) : Bool (= x y)))
+             (defn main () (== 1 2))",
+        );
+        assert!(
+            msg.contains("duplicate instance"),
+            "expected 'duplicate instance', got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn error_unknown_typeclass() {
+        let msg = check_err(
+            "(instance (Foo i32)
+               (defn bar ((x : i32)) : i32 x))
+             (defn main () 42)",
+        );
+        assert!(
+            msg.contains("unknown typeclass"),
+            "expected 'unknown typeclass', got: {}",
+            msg
+        );
+    }
+
+    // ── Kind system + HKTs (Phase 8d) ────────────────────────────
+
+    #[test]
+    fn kind_functor_class() {
+        // Functor uses 'f as a type constructor (* -> *), applied as ('f 'a)
+        check_ok(
+            "(deftype (Option 'a) (Some 'a) None)
+             (defclass (Functor 'f)
+               (fmap : (Fn [(Fn ['a] 'b) ('f 'a)] ('f 'b))))
+             (instance (Functor Option)
+               (defn fmap ((f : (Fn ['a] 'b)) (opt : (Option 'a))) : (Option 'b)
+                 (match opt
+                   ((Some x) (Some (f x)))
+                   (None None))))
+             (defn main () (fmap (fn (x) (+ x 1)) (Some 5)))",
+        );
+    }
+
+    #[test]
+    fn error_kind_mismatch_star_for_hkt() {
+        // i32 has kind *, but Functor expects * -> *
+        let msg = check_err(
+            "(deftype (Option 'a) (Some 'a) None)
+             (defclass (Functor 'f)
+               (fmap : (Fn [(Fn ['a] 'b) ('f 'a)] ('f 'b))))
+             (instance (Functor i32)
+               (defn fmap ((f : (Fn ['a] 'b)) (x : i32)) : i32 x))
+             (defn main () 42)",
+        );
+        assert!(
+            msg.contains("kind mismatch"),
+            "expected 'kind mismatch', got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn kind_type_constructor_registration() {
+        // Option has kind * -> * (1 type param)
+        // Using it bare in an instance that expects * -> * should work
+        check_ok(
+            "(deftype (Option 'a) (Some 'a) None)
+             (defclass (Wrapper 'f)
+               (wrap : (Fn ['a] ('f 'a))))
+             (instance (Wrapper Option)
+               (defn wrap ((x : 'a)) : (Option 'a) (Some x)))
+             (defn main () (wrap 42))",
+        );
+    }
+
+    #[test]
+    fn hkt_type_application_unification() {
+        // HKT type application should unify correctly:
+        // ('f 'a) with (Option i32) should bind 'f=Option, 'a=i32
+        check_ok(
+            "(deftype (Option 'a) (Some 'a) None)
+             (defclass (Functor 'f)
+               (fmap : (Fn [(Fn ['a] 'b) ('f 'a)] ('f 'b))))
+             (instance (Functor Option)
+               (defn fmap ((f : (Fn ['a] 'b)) (opt : (Option 'a))) : (Option 'b)
+                 (match opt
+                   ((Some x) (Some (f x)))
+                   (None None))))
+             (defn main () : (Option i32)
+               (fmap (fn (x) (+ x 1)) (Some 5)))",
+        );
     }
 }

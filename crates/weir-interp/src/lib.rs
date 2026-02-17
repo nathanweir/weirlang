@@ -1,5 +1,6 @@
 use smol_str::SmolStr;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
 use weir_ast::*;
@@ -268,15 +269,26 @@ pub fn interpret(module: &Module) -> Result<String, InterpError> {
         module,
         global_env: Env::new(),
         output: String::new(),
+        method_to_class: HashMap::new(),
+        class_instances: HashMap::new(),
     };
     interp.run()?;
     Ok(interp.output)
+}
+
+struct RuntimeInstance {
+    type_tag: SmolStr,
+    methods: HashMap<SmolStr, Value>,
 }
 
 struct Interpreter<'a> {
     module: &'a Module,
     global_env: Env,
     output: String,
+    /// method_name -> class_name (reverse lookup for dispatch)
+    method_to_class: HashMap<SmolStr, SmolStr>,
+    /// class_name -> Vec<RuntimeInstance>
+    class_instances: HashMap<SmolStr, Vec<RuntimeInstance>>,
 }
 
 impl<'a> Interpreter<'a> {
@@ -318,10 +330,8 @@ impl<'a> Interpreter<'a> {
             Item::Defn(d) => self.process_defn(d),
             Item::Deftype(d) => self.process_deftype(d),
             Item::Defstruct(d) => self.process_defstruct(d),
-            Item::Defclass(_) | Item::Instance(_) => {
-                // Skip typeclasses/instances for now (Phase 8)
-                Ok(())
-            }
+            Item::Defclass(d) => self.process_defclass(d),
+            Item::Instance(d) => self.process_instance(d),
             Item::Import(_) | Item::Declare(_) | Item::ExternC(_) => {
                 // Skip for now
                 Ok(())
@@ -366,6 +376,130 @@ impl<'a> Interpreter<'a> {
         Ok(())
     }
 
+    fn process_defclass(&mut self, d: &Defclass) -> Result<(), InterpError> {
+        // Register method names in the method_to_class reverse lookup
+        for m in &d.methods {
+            self.method_to_class.insert(m.name.clone(), d.name.clone());
+        }
+        Ok(())
+    }
+
+    fn process_instance(&mut self, d: &InstanceDef) -> Result<(), InterpError> {
+        // Determine the head type tag from the instance's type args
+        let type_tag = if d.type_args.is_empty() {
+            SmolStr::new("()")
+        } else {
+            // Resolve the first type arg to get the type tag
+            let texpr = &self.module.type_exprs[d.type_args[0]];
+            self.type_expr_to_tag(texpr)
+        };
+
+        // Evaluate each method definition into a closure
+        let mut methods = HashMap::new();
+        for method_defn in &d.methods {
+            let params: Vec<SmolStr> = method_defn.params.iter().map(|p| p.name.clone()).collect();
+            let closure = Value::Closure {
+                name: Some(method_defn.name.clone()),
+                params,
+                body: method_defn.body.clone(),
+                env: self.global_env.clone(),
+            };
+            methods.insert(method_defn.name.clone(), closure);
+        }
+
+        let entry = self
+            .class_instances
+            .entry(d.class_name.clone())
+            .or_default();
+        entry.push(RuntimeInstance { type_tag, methods });
+
+        Ok(())
+    }
+
+    /// Extract a type tag string from a type expression (for instance dispatch).
+    fn type_expr_to_tag(&self, texpr: &TypeExpr) -> SmolStr {
+        match &texpr.kind {
+            TypeExprKind::Named(name) => name.clone(),
+            TypeExprKind::Applied { constructor, .. } => {
+                let con_expr = &self.module.type_exprs[*constructor];
+                if let TypeExprKind::Named(name) = &con_expr.kind {
+                    name.clone()
+                } else {
+                    SmolStr::new("<unknown>")
+                }
+            }
+            _ => SmolStr::new("<unknown>"),
+        }
+    }
+
+    /// Get the type tag of a runtime value for dispatch.
+    fn value_type_tag(value: &Value) -> SmolStr {
+        match value {
+            Value::Int(_) => SmolStr::new("i32"),
+            Value::Float(_) => SmolStr::new("f64"),
+            Value::Bool(_) => SmolStr::new("Bool"),
+            Value::String(_) => SmolStr::new("String"),
+            Value::Unit => SmolStr::new("Unit"),
+            Value::Vector(_) => SmolStr::new("Vector"),
+            Value::Map(_) => SmolStr::new("Map"),
+            Value::Constructor { type_name, .. } => type_name.clone(),
+            Value::StructInstance { type_name, .. } => type_name.clone(),
+            _ => SmolStr::new("<unknown>"),
+        }
+    }
+
+    /// Try to dispatch a typeclass method call.
+    fn dispatch_method(
+        &mut self,
+        method_name: &str,
+        args: &[Value],
+        span: Span,
+    ) -> Result<Option<Value>, InterpError> {
+        let class_name = match self.method_to_class.get(method_name) {
+            Some(cn) => cn.clone(),
+            None => return Ok(None),
+        };
+
+        if args.is_empty() {
+            return Err(InterpError::with_span(
+                format!(
+                    "typeclass method '{}' requires at least one argument for dispatch",
+                    method_name
+                ),
+                span,
+            ));
+        }
+
+        // Try each argument for dispatch (not just the first).
+        // This handles HKT cases like Functor where the dispatching argument
+        // (e.g., `(Some 5)`) may not be the first argument.
+        for arg in args {
+            let type_tag = Self::value_type_tag(arg);
+
+            // Clone the method value to release the borrow on self
+            let method_val = self.class_instances.get(&class_name).and_then(|instances| {
+                instances.iter().find_map(|inst| {
+                    if inst.type_tag == type_tag {
+                        inst.methods.get(method_name).cloned()
+                    } else {
+                        None
+                    }
+                })
+            });
+
+            if let Some(method_val) = method_val {
+                let result = self.call_value(&method_val, args, span)?;
+                return Ok(Some(result));
+            }
+        }
+
+        let type_tag = Self::value_type_tag(&args[0]);
+        Err(InterpError::with_span(
+            format!("no instance of {} for type '{}'", class_name, type_tag),
+            span,
+        ))
+    }
+
     // ── Expression evaluation ────────────────────────────────────
 
     fn eval_expr(&mut self, env: &Env, expr_id: ExprId) -> Result<Value, InterpError> {
@@ -391,6 +525,21 @@ impl<'a> Interpreter<'a> {
                     }
                     let obj = self.eval_expr(env, args[0].value)?;
                     return self.field_access(&obj, field, span);
+                }
+
+                // Check for typeclass method dispatch
+                if let ExprKind::Var(name) = &func_expr.kind {
+                    if self.method_to_class.contains_key(name.as_str()) {
+                        let name = name.clone();
+                        let arg_vals: Vec<Value> = args
+                            .iter()
+                            .map(|a| self.eval_expr(env, a.value))
+                            .collect::<Result<_, _>>()?;
+                        if let Some(result) = self.dispatch_method(&name, &arg_vals, span)? {
+                            return Ok(result);
+                        }
+                        // Fall through if dispatch failed (shouldn't normally happen)
+                    }
                 }
 
                 let func_val = self.eval_expr(env, *func)?;
@@ -1635,6 +1784,87 @@ mod tests {
         assert_eq!(output, "Int\nFloat\nBool\nString\nVector\n");
     }
 
+    // ── Generic functions (Phase 8a) ────────────────────────────
+
+    #[test]
+    fn test_generic_identity() {
+        let output = run_ok(
+            "(defn id (x) x)
+             (defn main ()
+               (println (id 42))
+               (println (id \"hello\")))",
+        );
+        assert_eq!(output, "42\nhello\n");
+    }
+
+    #[test]
+    fn test_generic_wrap() {
+        let output = run_ok(
+            "(deftype (Option 'a) (Some 'a) None)
+             (defn wrap (x) (Some x))
+             (defn main ()
+               (println (wrap 42))
+               (println (wrap \"hello\")))",
+        );
+        assert_eq!(output, "(Some 42)\n(Some hello)\n");
+    }
+
+    #[test]
+    fn test_generic_const() {
+        let output = run_ok(
+            "(defn const-fn (x y) x)
+             (defn main ()
+               (println (const-fn 1 \"hello\"))
+               (println (const-fn \"world\" 99)))",
+        );
+        assert_eq!(output, "1\nworld\n");
+    }
+
+    // ── Typeclasses (Phase 8c) ────────────────────────────────
+
+    #[test]
+    fn test_typeclass_basic() {
+        let output = run_ok(
+            "(defclass (Eq 'a)
+               (== : (Fn ['a 'a] Bool)))
+             (instance (Eq i32)
+               (defn == ((x : i32) (y : i32)) : Bool (= x y)))
+             (defn main ()
+               (println (== 1 1))
+               (println (== 1 2)))",
+        );
+        assert_eq!(output, "true\nfalse\n");
+    }
+
+    #[test]
+    fn test_typeclass_show() {
+        let output = run_ok(
+            "(defclass (Show 'a)
+               (show : (Fn ['a] String)))
+             (instance (Show i32)
+               (defn show ((x : i32)) : String (str x)))
+             (defn main ()
+               (println (show 42)))",
+        );
+        assert_eq!(output, "42\n");
+    }
+
+    #[test]
+    fn test_typeclass_multiple_instances() {
+        let output = run_ok(
+            "(defclass (Show 'a)
+               (show : (Fn ['a] String)))
+             (instance (Show i32)
+               (defn show ((x : i32)) : String (str \"Int:\" x)))
+             (instance (Show Bool)
+               (defn show ((x : Bool)) : String (str \"Bool:\" x)))
+             (defn main ()
+               (println (show 42))
+               (println (show true)))",
+        );
+        assert_eq!(output, "Int:42\nBool:true\n");
+    }
+
     // ── Fixture-based end-to-end tests ───────────────────────────
 
     fn run_fixture(name: &str) -> String {
@@ -1732,6 +1962,36 @@ mod tests {
         100
         200
         300
+        ");
+    }
+
+    #[test]
+    fn fixture_typeclasses() {
+        insta::assert_snapshot!(run_fixture("typeclasses"), @r"
+        42
+        true
+        true
+        false
+        ");
+    }
+
+    #[test]
+    fn test_functor_fmap() {
+        insta::assert_snapshot!(run_ok(
+            "(deftype (Option 'a) (Some 'a) None)
+             (defclass (Functor 'f)
+               (fmap : (Fn [(Fn ['a] 'b) ('f 'a)] ('f 'b))))
+             (instance (Functor Option)
+               (defn fmap ((f : (Fn ['a] 'b)) (opt : (Option 'a))) : (Option 'b)
+                 (match opt
+                   ((Some x) (Some (f x)))
+                   (None None))))
+             (defn main ()
+               (println (fmap (fn (x) (+ x 1)) (Some 5)))
+               (println (fmap (fn (x) (+ x 10)) None)))"
+        ), @r"
+        (Some 6)
+        None
         ");
     }
 }
