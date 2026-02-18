@@ -1,6 +1,6 @@
 use la_arena::ArenaMap;
 use smol_str::SmolStr;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use weir_ast::*;
 
@@ -176,7 +176,14 @@ pub struct TypeCheckResult {
 // ── Public API ───────────────────────────────────────────────────
 
 pub fn check(module: &Module) -> TypeCheckResult {
-    let mut checker = TypeChecker::new(module);
+    check_with_externals(module, &HashSet::new())
+}
+
+/// Type-check a module, treating `externals` as known symbols from other files.
+/// Variables and constructors in `externals` won't produce "undefined" errors;
+/// they'll be assigned fresh type variables (opaque types).
+pub fn check_with_externals(module: &Module, externals: &HashSet<SmolStr>) -> TypeCheckResult {
+    let mut checker = TypeChecker::new(module, externals);
     checker.collect_definitions();
     checker.check_items();
 
@@ -466,10 +473,14 @@ struct TypeChecker<'a> {
 
     /// For each call site that invokes a class method, the resolved concrete function name.
     method_resolutions: HashMap<ExprId, SmolStr>,
+
+    /// Known symbol names from other workspace files.
+    /// Variables/constructors in this set produce fresh type variables instead of errors.
+    external_names: HashSet<SmolStr>,
 }
 
 impl<'a> TypeChecker<'a> {
-    fn new(module: &'a Module) -> Self {
+    fn new(module: &'a Module, externals: &HashSet<SmolStr>) -> Self {
         Self {
             module,
             subst: Vec::new(),
@@ -487,6 +498,7 @@ impl<'a> TypeChecker<'a> {
             errors: Vec::new(),
             expr_types: ArenaMap::default(),
             method_resolutions: HashMap::new(),
+            external_names: externals.clone(),
         }
     }
 
@@ -1804,6 +1816,9 @@ impl<'a> TypeChecker<'a> {
                 }
                 if let Some(ty) = self.lookup_var(name) {
                     ty
+                } else if self.external_names.contains(name.as_str()) {
+                    // Known external symbol — return a fresh type variable
+                    self.fresh_var()
                 } else {
                     self.error(format!("undefined variable '{}'", name), span);
                     Ty::Error
@@ -2326,6 +2341,17 @@ impl<'a> TypeChecker<'a> {
                             vec![]
                         }
                     }
+                } else if self.external_names.contains(name.as_str()) {
+                    // Known external constructor — unify expected with a fresh var
+                    let ext_ty = self.fresh_var();
+                    self.unify(expected, &ext_ty, span);
+                    // Bind sub-pattern variables to fresh vars
+                    let mut bindings = Vec::new();
+                    for sub_pat in &args {
+                        let arg_ty = self.fresh_var();
+                        bindings.extend(self.check_pattern(*sub_pat, &arg_ty));
+                    }
+                    bindings
                 } else {
                     self.error(format!("unknown constructor '{}'", name), span);
                     vec![]
@@ -3127,5 +3153,61 @@ mod tests {
              (defn main () : (Option i32)
                (fmap (fn (x) (+ x 1)) (Some 5)))",
         );
+    }
+
+    // ── External symbol awareness ────────────────────────────────
+
+    fn check_with_ext(source: &str, externals: &[&str]) -> Vec<TypeError> {
+        let (module, parse_errors) = weir_parser::parse(source);
+        assert!(parse_errors.is_empty(), "parse errors: {:?}", parse_errors);
+        let ext: HashSet<SmolStr> = externals.iter().map(|s| SmolStr::from(*s)).collect();
+        let result = check_with_externals(&module, &ext);
+        result.errors
+    }
+
+    #[test]
+    fn external_variable_no_error() {
+        // Calling an external function should not produce "undefined variable"
+        let errors = check_with_ext("(defn main () (square 5))", &["square"]);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+    }
+
+    #[test]
+    fn unknown_variable_still_errors_without_external() {
+        // Without declaring it external, the error should remain
+        let errors = check_with_ext("(defn main () (square 5))", &[]);
+        assert!(!errors.is_empty());
+        assert!(errors[0].message.contains("undefined variable 'square'"));
+    }
+
+    #[test]
+    fn external_constructor_in_pattern_no_error() {
+        // Matching on an external constructor should not error
+        let errors = check_with_ext(
+            "(defn main ((x : i32))
+               (match x
+                 ((ExternalCon y) y)
+                 (_ 0)))",
+            &["ExternalCon"],
+        );
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+    }
+
+    #[test]
+    fn external_constructor_in_expr_no_error() {
+        // Using an external constructor as a value should not error
+        let errors = check_with_ext("(defn main () (Some 42))", &["Some"]);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+    }
+
+    #[test]
+    fn mixed_local_and_external() {
+        // Local definitions coexist with external names
+        let errors = check_with_ext(
+            "(defn helper () 42)
+             (defn main () (+ (helper) (remote-fn 10)))",
+            &["remote-fn"],
+        );
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
     }
 }

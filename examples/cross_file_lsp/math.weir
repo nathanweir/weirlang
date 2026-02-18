@@ -1,0 +1,36 @@
+;; ─── math.weir ───────────────────────────────────────────────────
+;; Shared math utilities used by other files in this project.
+;; Open this file alongside main.weir to see cross-file LSP features.
+
+;; ── Arithmetic helpers ──────────────────────────────────────────
+
+(defn square ((x : i32)) : i32
+  "Return x squared."
+  (* x x))
+
+(defn cube ((x : i32)) : i32
+  "Return x cubed."
+  (* x (* x x)))
+
+(defn abs ((x : i32)) : i32
+  "Absolute value."
+  (if (< x 0) (- 0 x) x))
+
+(defn clamp ((val : i32) (lo : i32) (hi : i32)) : i32
+  "Clamp val to the range [lo, hi]."
+  (if (< val lo) lo
+    (if (> val hi) hi val)))
+
+;; ── Predicates ──────────────────────────────────────────────────
+
+(defn positive? ((x : i32)) : Bool
+  "True if x > 0."
+  (> x 0))
+
+(defn negative? ((x : i32)) : Bool
+  "True if x < 0."
+  (< x 0))
+
+(defn zero? ((x : i32)) : Bool
+  "True if x is zero."
+  (= x 0))

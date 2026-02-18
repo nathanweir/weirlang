@@ -1,0 +1,28 @@
+;; ─── types.weir ──────────────────────────────────────────────────
+;; Shared type definitions used across the project.
+
+;; ── Sum types ───────────────────────────────────────────────────
+
+(deftype (Option 'a)
+  (Some 'a)
+  None)
+
+(deftype (Result 'a 'e)
+  (Ok 'a)
+  (Err 'e))
+
+(deftype Ordering
+  LessThan
+  Equal
+  GreaterThan)
+
+;; ── Structs ─────────────────────────────────────────────────────
+
+(defstruct Point
+  (x : i32)
+  (y : i32))
+
+;; ── Typeclasses ─────────────────────────────────────────────────
+
+(defclass (Compare 'a)
+  (compare : (Fn ['a 'a] Ordering)))

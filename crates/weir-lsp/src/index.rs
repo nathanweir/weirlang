@@ -184,6 +184,16 @@ impl SymbolIndex {
         result
     }
 
+    /// Return all occurrence spans (definitions + references) for a given name.
+    /// Used by cross-file references/rename to find all uses of a symbol in a file.
+    pub fn get_all_occurrences_of(&self, name: &str) -> Vec<Span> {
+        self.occurrences
+            .iter()
+            .filter(|o| o.name == name)
+            .map(|o| o.name_span)
+            .collect()
+    }
+
     fn innermost_scope_at(&self, offset: u32) -> Option<ScopeId> {
         let mut best: Option<(ScopeId, u32)> = None;
         for (i, scope) in self.scopes.iter().enumerate() {
@@ -855,5 +865,21 @@ mod tests {
         let res = idx.resolve_at(bar_offset).unwrap();
         assert_eq!(res.name, "bar");
         assert_eq!(res.all_name_spans.len(), 1); // just the def, no calls to bar
+    }
+
+    #[test]
+    fn get_all_occurrences_of_returns_def_and_refs() {
+        let source = "(defn foo () 42) (defn main () (foo))";
+        let idx = build_index(source);
+        let spans = idx.get_all_occurrences_of("foo");
+        assert_eq!(spans.len(), 2); // def + call
+    }
+
+    #[test]
+    fn get_all_occurrences_of_unknown_name() {
+        let source = "(defn foo () 42)";
+        let idx = build_index(source);
+        let spans = idx.get_all_occurrences_of("nonexistent");
+        assert!(spans.is_empty());
     }
 }

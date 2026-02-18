@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
@@ -8,17 +9,45 @@ use tower_lsp::{Client, LanguageServer};
 use crate::completion;
 use crate::definition;
 use crate::diagnostics;
-use crate::document::Document;
+use crate::document::{Document, LineIndex};
 use crate::formatting;
 use crate::hover;
+use crate::index::SymbolIndex;
 use crate::inlay_hints;
 use crate::semantic_tokens;
 use crate::signature_help;
 use crate::symbols;
+use crate::workspace::WorkspaceIndex;
+
+/// Parse source text using the same macro-aware logic as diagnostics.
+/// Returns the parsed module and a LineIndex that matches its spans.
+fn parse_for_cross_file(text: &str) -> (weir_ast::Module, LineIndex) {
+    let expand_result = weir_macros::expand(text);
+    let macros_expanded = expand_result.errors.is_empty() && {
+        let (orig_tokens, _) = weir_lexer::lex(text);
+        let (exp_tokens, _) = weir_lexer::lex(&expand_result.source);
+        orig_tokens.len() != exp_tokens.len()
+            || orig_tokens
+                .iter()
+                .zip(exp_tokens.iter())
+                .any(|((t1, _), (t2, _))| t1 != t2)
+    };
+
+    let (parse_source, line_index) = if macros_expanded {
+        let li = LineIndex::new(&expand_result.source);
+        (expand_result.source, li)
+    } else {
+        (text.to_string(), LineIndex::new(text))
+    };
+
+    let (module, _) = weir_parser::parse(&parse_source);
+    (module, line_index)
+}
 
 pub struct WeirLspBackend {
     pub client: Client,
     pub documents: Mutex<HashMap<Url, Document>>,
+    pub workspace: Arc<tokio::sync::RwLock<WorkspaceIndex>>,
 }
 
 impl WeirLspBackend {
@@ -26,37 +55,67 @@ impl WeirLspBackend {
         Self {
             client,
             documents: Mutex::new(HashMap::new()),
+            workspace: Arc::new(tokio::sync::RwLock::new(
+                WorkspaceIndex::new(PathBuf::new()),
+            )),
         }
     }
 
-    fn analyze_and_publish(&self, uri: Url) {
-        let mut docs = self.documents.lock().unwrap();
-        let doc = match docs.get_mut(&uri) {
-            Some(d) => d,
-            None => return,
+    async fn analyze_and_publish(&self, uri: Url) {
+        // 1. Gather external symbol names from other workspace files (async lock)
+        let external_names = {
+            let ws = self.workspace.read().await;
+            ws.all_top_level_symbols()
+                .into_iter()
+                .filter(|s| s.uri != uri)
+                .map(|s| smol_str::SmolStr::from(s.name.as_str()))
+                .collect::<std::collections::HashSet<_>>()
         };
 
-        let (analysis, diagnostics) = diagnostics::analyze(&doc.text, &doc.line_index);
-        doc.analysis = Some(analysis);
+        // 2. Run analysis with external names — MutexGuard confined to this block
+        let result = {
+            let mut docs = self.documents.lock().unwrap();
+            let doc = match docs.get_mut(&uri) {
+                Some(d) => d,
+                None => return,
+            };
+            let (analysis, diagnostics) =
+                diagnostics::analyze(&doc.text, &doc.line_index, &external_names);
+            let version = doc.version;
+            doc.analysis = Some(analysis);
+            Some((diagnostics, version))
+        };
 
-        let version = doc.version;
-        let client = self.client.clone();
-        let uri_clone = uri.clone();
-
-        // Drop the lock before sending diagnostics
-        drop(docs);
-
-        tokio::spawn(async move {
-            client
-                .publish_diagnostics(uri_clone, diagnostics, Some(version))
+        // 3. Publish diagnostics
+        if let Some((diagnostics, version)) = result {
+            self.client
+                .publish_diagnostics(uri, diagnostics, Some(version))
                 .await;
+        }
+    }
+
+    /// Update the workspace index with the current file's symbols.
+    fn update_workspace_symbols(&self, uri: Url, text: &str, is_open: bool) {
+        let workspace = self.workspace.clone();
+        let text = text.to_string();
+        tokio::spawn(async move {
+            let mut ws = workspace.write().await;
+            ws.analyze_file(uri, &text, is_open);
         });
     }
 }
 
 #[tower_lsp::async_trait]
 impl LanguageServer for WeirLspBackend {
-    async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        // Capture workspace root
+        if let Some(root_uri) = params.root_uri {
+            if let Ok(path) = root_uri.to_file_path() {
+                let mut ws = self.workspace.write().await;
+                ws.root = path;
+            }
+        }
+
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
@@ -104,6 +163,56 @@ impl LanguageServer for WeirLspBackend {
         self.client
             .log_message(MessageType::INFO, "weir-lsp initialized")
             .await;
+
+        // Register for workspace file watching
+        let registration = Registration {
+            id: "workspace/didChangeWatchedFiles".into(),
+            method: "workspace/didChangeWatchedFiles".into(),
+            register_options: Some(
+                serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
+                    watchers: vec![FileSystemWatcher {
+                        glob_pattern: GlobPattern::String("**/*.weir".into()),
+                        kind: Some(WatchKind::all()),
+                    }],
+                })
+                .unwrap(),
+            ),
+        };
+        let _ = self.client.register_capability(vec![registration]).await;
+
+        // Background task: discover and analyze all workspace files
+        let workspace = self.workspace.clone();
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            let paths = {
+                let ws = workspace.read().await;
+                ws.discover_files()
+            };
+
+            client
+                .log_message(
+                    MessageType::INFO,
+                    format!("Indexing {} workspace files", paths.len()),
+                )
+                .await;
+
+            for path in paths {
+                let uri = match Url::from_file_path(&path) {
+                    Ok(u) => u,
+                    Err(_) => continue,
+                };
+                let text = match std::fs::read_to_string(&path) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                let mut ws = workspace.write().await;
+                ws.analyze_file(uri, &text, false);
+            }
+
+            client
+                .log_message(MessageType::INFO, "Workspace indexing complete")
+                .await;
+        });
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -112,18 +221,22 @@ impl LanguageServer for WeirLspBackend {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri.clone();
+        let text = params.text_document.text.clone();
         let doc = Document::new(params.text_document.text, params.text_document.version);
         self.documents.lock().unwrap().insert(uri.clone(), doc);
-        self.analyze_and_publish(uri);
+        self.analyze_and_publish(uri.clone()).await;
+        self.update_workspace_symbols(uri, &text, true);
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri.clone();
         // Full text sync — take the last change
         if let Some(change) = params.content_changes.into_iter().last() {
+            let text = change.text.clone();
             let doc = Document::new(change.text, params.text_document.version);
             self.documents.lock().unwrap().insert(uri.clone(), doc);
-            self.analyze_and_publish(uri);
+            self.analyze_and_publish(uri.clone()).await;
+            self.update_workspace_symbols(uri, &text, true);
         }
     }
 
@@ -131,8 +244,49 @@ impl LanguageServer for WeirLspBackend {
         let uri = params.text_document.uri.clone();
         self.documents.lock().unwrap().remove(&uri);
 
+        // Mark as not open in workspace; re-analyze from disk to keep symbols current
+        let workspace = self.workspace.clone();
+        let uri_for_ws = uri.clone();
+        tokio::spawn(async move {
+            if let Ok(path) = uri_for_ws.to_file_path() {
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    let mut ws = workspace.write().await;
+                    ws.analyze_file(uri_for_ws, &text, false);
+                    return;
+                }
+            }
+            // File doesn't exist on disk anymore — remove from index
+            let mut ws = workspace.write().await;
+            ws.remove_file(&uri_for_ws);
+        });
+
         // Clear diagnostics
         self.client.publish_diagnostics(uri, vec![], None).await;
+    }
+
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        let workspace = self.workspace.clone();
+        tokio::spawn(async move {
+            let mut ws = workspace.write().await;
+            for change in params.changes {
+                match change.typ {
+                    FileChangeType::CREATED | FileChangeType::CHANGED => {
+                        // Only re-analyze if the file is not currently open
+                        if ws.files.get(&change.uri).is_none_or(|f| !f.is_open) {
+                            if let Ok(path) = change.uri.to_file_path() {
+                                if let Ok(text) = std::fs::read_to_string(&path) {
+                                    ws.analyze_file(change.uri, &text, false);
+                                }
+                            }
+                        }
+                    }
+                    FileChangeType::DELETED => {
+                        ws.remove_file(&change.uri);
+                    }
+                    _ => {}
+                }
+            }
+        });
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
@@ -187,57 +341,140 @@ impl LanguageServer for WeirLspBackend {
         &self,
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
-        let uri = &params.text_document_position_params.text_document.uri;
+        let uri = params
+            .text_document_position_params
+            .text_document
+            .uri
+            .clone();
         let position = params.text_document_position_params.position;
 
-        let docs = self.documents.lock().unwrap();
-        let doc = match docs.get(uri) {
-            Some(d) => d,
+        // Try in-file resolution first
+        let (in_file_result, symbol_name) = {
+            let docs = self.documents.lock().unwrap();
+            let doc = match docs.get(&uri) {
+                Some(d) => d,
+                None => return Ok(None),
+            };
+            let analysis = match &doc.analysis {
+                Some(a) => a,
+                None => return Ok(None),
+            };
+            let offset = analysis.expanded_line_index.position_to_offset(position);
+            let result = definition::goto_definition(
+                &analysis.symbol_index,
+                &analysis.expanded_line_index,
+                offset,
+                &uri,
+            );
+            let name = analysis.symbol_index.symbol_at(offset).map(String::from);
+            (result, name)
+        };
+        // documents lock dropped here
+
+        if in_file_result.is_some() {
+            return Ok(in_file_result);
+        }
+
+        // Cross-file fallback: search workspace for the symbol
+        let name = match symbol_name {
+            Some(n) => n,
             None => return Ok(None),
         };
 
-        let analysis = match &doc.analysis {
-            Some(a) => a,
-            None => return Ok(None),
-        };
+        let ws = self.workspace.read().await;
+        let matches = ws.find_symbols_by_name(&name);
+        for sym in matches {
+            if sym.uri == uri {
+                continue;
+            }
+            if let Some(line_index) = ws.line_index_for(&sym.uri) {
+                return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                    uri: sym.uri.clone(),
+                    range: line_index.span_to_range(sym.name_span),
+                })));
+            }
+        }
 
-        let offset = analysis.expanded_line_index.position_to_offset(position);
-        Ok(definition::goto_definition(
-            &analysis.symbol_index,
-            &analysis.expanded_line_index,
-            offset,
-            uri,
-        ))
+        Ok(None)
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
-        let uri = &params.text_document_position.text_document.uri;
+        let uri = params.text_document_position.text_document.uri.clone();
         let position = params.text_document_position.position;
+        let include_declaration = params.context.include_declaration;
 
-        let docs = self.documents.lock().unwrap();
-        let doc = match docs.get(uri) {
-            Some(d) => d,
-            None => return Ok(None),
+        // Get in-file references and symbol name
+        let (in_file_refs, symbol_name) = {
+            let docs = self.documents.lock().unwrap();
+            let doc = match docs.get(&uri) {
+                Some(d) => d,
+                None => return Ok(None),
+            };
+            let analysis = match &doc.analysis {
+                Some(a) => a,
+                None => return Ok(None),
+            };
+            let offset = analysis.expanded_line_index.position_to_offset(position);
+            let refs = definition::find_references(
+                &analysis.symbol_index,
+                &analysis.expanded_line_index,
+                offset,
+                &uri,
+                include_declaration,
+            );
+            let name = analysis.symbol_index.symbol_at(offset).map(String::from);
+            (refs, name)
+        };
+        // documents lock dropped here
+
+        let name = match symbol_name {
+            Some(n) => n,
+            None => {
+                if in_file_refs.is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(in_file_refs));
+            }
         };
 
-        let analysis = match &doc.analysis {
-            Some(a) => a,
-            None => return Ok(None),
-        };
+        let mut all_refs = in_file_refs;
 
-        let offset = analysis.expanded_line_index.position_to_offset(position);
-        let refs = definition::find_references(
-            &analysis.symbol_index,
-            &analysis.expanded_line_index,
-            offset,
-            uri,
-            params.context.include_declaration,
-        );
+        // Cross-file: search other workspace files for occurrences
+        let ws = self.workspace.read().await;
+        for file_uri in ws.files.keys() {
+            if *file_uri == uri {
+                continue;
+            }
+            // Quick text check: skip files that don't contain the name
+            let text = if let Ok(path) = file_uri.to_file_path() {
+                match std::fs::read_to_string(&path) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                }
+            } else {
+                continue;
+            };
 
-        if refs.is_empty() {
+            if !text.contains(&name) {
+                continue;
+            }
+
+            // Parse with matching line index for correct spans
+            let (module, line_index) = parse_for_cross_file(&text);
+            let idx = SymbolIndex::build(&module);
+
+            for span in idx.get_all_occurrences_of(&name) {
+                all_refs.push(Location {
+                    uri: file_uri.clone(),
+                    range: line_index.span_to_range(span),
+                });
+            }
+        }
+
+        if all_refs.is_empty() {
             Ok(None)
         } else {
-            Ok(Some(refs))
+            Ok(Some(all_refs))
         }
     }
 
@@ -269,28 +506,89 @@ impl LanguageServer for WeirLspBackend {
     }
 
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
-        let uri = &params.text_document_position.text_document.uri;
+        let uri = params.text_document_position.text_document.uri.clone();
         let position = params.text_document_position.position;
+        let new_name = params.new_name.clone();
 
-        let docs = self.documents.lock().unwrap();
-        let doc = match docs.get(uri) {
-            Some(d) => d,
-            None => return Ok(None),
+        // Get in-file rename edits and symbol name
+        let (in_file_edit, symbol_name) = {
+            let docs = self.documents.lock().unwrap();
+            let doc = match docs.get(&uri) {
+                Some(d) => d,
+                None => return Ok(None),
+            };
+            let analysis = match &doc.analysis {
+                Some(a) => a,
+                None => return Ok(None),
+            };
+            let offset = analysis.expanded_line_index.position_to_offset(position);
+            let edit = definition::rename(
+                &analysis.symbol_index,
+                &analysis.expanded_line_index,
+                offset,
+                &uri,
+                &new_name,
+            );
+            let name = analysis.symbol_index.symbol_at(offset).map(String::from);
+            (edit, name)
+        };
+        // documents lock dropped here
+
+        let name = match symbol_name {
+            Some(n) => n,
+            None => return Ok(in_file_edit),
         };
 
-        let analysis = match &doc.analysis {
-            Some(a) => a,
-            None => return Ok(None),
+        let mut all_changes: HashMap<Url, Vec<TextEdit>> = match &in_file_edit {
+            Some(edit) => edit.changes.clone().unwrap_or_default(),
+            None => HashMap::new(),
         };
 
-        let offset = analysis.expanded_line_index.position_to_offset(position);
-        Ok(definition::rename(
-            &analysis.symbol_index,
-            &analysis.expanded_line_index,
-            offset,
-            uri,
-            &params.new_name,
-        ))
+        // Cross-file: find occurrences in other workspace files
+        let ws = self.workspace.read().await;
+        for file_uri in ws.files.keys() {
+            if *file_uri == uri {
+                continue;
+            }
+            let text = if let Ok(path) = file_uri.to_file_path() {
+                match std::fs::read_to_string(&path) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                }
+            } else {
+                continue;
+            };
+
+            if !text.contains(&name) {
+                continue;
+            }
+
+            // Parse with matching line index for correct spans
+            let (module, line_index) = parse_for_cross_file(&text);
+            let idx = SymbolIndex::build(&module);
+
+            let edits: Vec<TextEdit> = idx
+                .get_all_occurrences_of(&name)
+                .iter()
+                .map(|span| TextEdit {
+                    range: line_index.span_to_range(*span),
+                    new_text: new_name.clone(),
+                })
+                .collect();
+
+            if !edits.is_empty() {
+                all_changes.insert(file_uri.clone(), edits);
+            }
+        }
+
+        if all_changes.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(WorkspaceEdit {
+                changes: Some(all_changes),
+                ..Default::default()
+            }))
+        }
     }
 
     async fn document_symbol(
@@ -315,26 +613,36 @@ impl LanguageServer for WeirLspBackend {
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
-        let uri = &params.text_document_position.text_document.uri;
+        let uri = params.text_document_position.text_document.uri.clone();
         let position = params.text_document_position.position;
 
+        // Gather workspace symbols first (async lock, must be done before sync lock)
+        let ws = self.workspace.read().await;
+        let ws_symbols: Vec<_> = ws
+            .all_top_level_symbols()
+            .into_iter()
+            .filter(|s| s.uri != uri)
+            .cloned()
+            .collect();
+        drop(ws);
+
+        // Now get in-file data and produce completions
         let docs = self.documents.lock().unwrap();
-        let doc = match docs.get(uri) {
+        let doc = match docs.get(&uri) {
             Some(d) => d,
             None => return Ok(None),
         };
-
         let analysis = match &doc.analysis {
             Some(a) => a,
             None => return Ok(None),
         };
-
         let offset = analysis.expanded_line_index.position_to_offset(position);
         let items = completion::completions(
             &analysis.module,
             Some(&analysis.type_result),
             Some(&analysis.symbol_index),
             Some(offset),
+            Some(&ws_symbols),
         );
         Ok(Some(CompletionResponse::Array(items)))
     }

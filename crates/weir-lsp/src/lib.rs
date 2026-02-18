@@ -10,6 +10,7 @@ mod semantic_tokens;
 mod server;
 mod signature_help;
 mod symbols;
+pub mod workspace;
 
 use tower_lsp::{LspService, Server};
 

@@ -8,7 +8,7 @@ use weir_typeck::TypeCheckResult;
 use crate::index::SymbolIndex;
 
 /// Maps between byte offsets (used by Weir compiler spans) and LSP positions (line/character).
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct LineIndex {
     /// Byte offset of the start of each line.
     line_starts: Vec<u32>,

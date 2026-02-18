@@ -3,14 +3,16 @@ use weir_ast::{Item, Module};
 use weir_typeck::TypeCheckResult;
 
 use crate::index::{SymbolIndex, SymbolKind};
+use crate::workspace::WorkspaceSymbol;
 
 /// Collect completion items from module definitions, builtins, keywords,
-/// and local variables visible at `offset` (when a symbol index is provided).
+/// local variables visible at `offset`, and workspace symbols from other files.
 pub fn completions(
     module: &Module,
     type_result: Option<&TypeCheckResult>,
     symbol_index: Option<&SymbolIndex>,
     offset: Option<u32>,
+    workspace_symbols: Option<&[WorkspaceSymbol]>,
 ) -> Vec<CompletionItem> {
     let mut items = Vec::new();
 
@@ -167,6 +169,33 @@ pub fn completions(
         }
     }
 
+    // Workspace symbols from other files
+    if let Some(ws_symbols) = workspace_symbols {
+        let existing: std::collections::HashSet<String> =
+            items.iter().map(|i| i.label.clone()).collect();
+        for sym in ws_symbols {
+            if existing.contains(&sym.name) {
+                continue;
+            }
+            let item_kind = match sym.kind {
+                SymbolKind::Function => CompletionItemKind::FUNCTION,
+                SymbolKind::Type => CompletionItemKind::ENUM,
+                SymbolKind::Variant => CompletionItemKind::ENUM_MEMBER,
+                SymbolKind::Struct => CompletionItemKind::STRUCT,
+                SymbolKind::Class => CompletionItemKind::INTERFACE,
+                SymbolKind::Parameter | SymbolKind::LetBinding => continue,
+            };
+            let filename = sym.uri.path().rsplit('/').next().unwrap_or("").to_string();
+            items.push(CompletionItem {
+                label: sym.name.clone(),
+                kind: Some(item_kind),
+                detail: Some(format!("from {}", filename)),
+                sort_text: Some("2".into()), // after locals "0" and in-file defs
+                ..Default::default()
+            });
+        }
+    }
+
     items
 }
 
@@ -282,7 +311,7 @@ mod tests {
     #[test]
     fn includes_user_defined_functions() {
         let (module, tr) = parse_module("(defn foo () 42) (defn bar () 0)");
-        let items = completions(&module, Some(&tr), None, None);
+        let items = completions(&module, Some(&tr), None, None, None);
         let l = labels(&items);
         assert!(l.contains(&"foo".to_string()));
         assert!(l.contains(&"bar".to_string()));
@@ -291,7 +320,7 @@ mod tests {
     #[test]
     fn function_detail_shows_type_signature() {
         let (module, tr) = parse_module("(defn add ((x : i32) (y : i32)) : i32 (+ x y))");
-        let items = completions(&module, Some(&tr), None, None);
+        let items = completions(&module, Some(&tr), None, None, None);
         let add = items.iter().find(|i| i.label == "add").unwrap();
         assert_eq!(add.detail.as_deref(), Some("(Fn [i32 i32] i32)"));
     }
@@ -299,7 +328,7 @@ mod tests {
     #[test]
     fn includes_user_defined_types_and_variants() {
         let (module, tr) = parse_module("(deftype Color Red Green Blue)");
-        let items = completions(&module, Some(&tr), None, None);
+        let items = completions(&module, Some(&tr), None, None, None);
         let l = labels(&items);
         assert!(l.contains(&"Color".to_string()));
         assert!(l.contains(&"Red".to_string()));
@@ -310,7 +339,7 @@ mod tests {
     #[test]
     fn user_type_has_correct_kind() {
         let (module, tr) = parse_module("(deftype Color Red)");
-        let items = completions(&module, Some(&tr), None, None);
+        let items = completions(&module, Some(&tr), None, None, None);
         let color = items.iter().find(|i| i.label == "Color").unwrap();
         assert_eq!(color.kind, Some(CompletionItemKind::ENUM));
         let red = items.iter().find(|i| i.label == "Red").unwrap();
@@ -320,7 +349,7 @@ mod tests {
     #[test]
     fn variant_detail_shows_parent_type() {
         let (module, tr) = parse_module("(deftype Color Red Green Blue)");
-        let items = completions(&module, Some(&tr), None, None);
+        let items = completions(&module, Some(&tr), None, None, None);
         let red = items.iter().find(|i| i.label == "Red").unwrap();
         assert_eq!(red.detail.as_deref(), Some("Color"));
     }
@@ -328,7 +357,7 @@ mod tests {
     #[test]
     fn includes_user_defined_structs() {
         let (module, tr) = parse_module("(defstruct Point (x : f64) (y : f64))");
-        let items = completions(&module, Some(&tr), None, None);
+        let items = completions(&module, Some(&tr), None, None, None);
         let point = items.iter().find(|i| i.label == "Point").unwrap();
         assert_eq!(point.kind, Some(CompletionItemKind::STRUCT));
         assert_eq!(point.detail.as_deref(), Some("{ x, y }"));
@@ -337,7 +366,7 @@ mod tests {
     #[test]
     fn includes_user_defined_classes() {
         let (module, tr) = parse_module("(defclass (Show 'a) (show : (Fn ['a] String)))");
-        let items = completions(&module, Some(&tr), None, None);
+        let items = completions(&module, Some(&tr), None, None, None);
         let show_class = items.iter().find(|i| i.label == "Show").unwrap();
         assert_eq!(show_class.kind, Some(CompletionItemKind::INTERFACE));
         assert_eq!(show_class.detail.as_deref(), Some("class: show"));
@@ -349,7 +378,7 @@ mod tests {
             "(defclass (Eq 'a)
                (== : (Fn ['a 'a] Bool)))",
         );
-        let items = completions(&module, Some(&tr), None, None);
+        let items = completions(&module, Some(&tr), None, None, None);
         let l = labels(&items);
         assert!(l.contains(&"==".to_string()));
         let eq_method = items.iter().find(|i| i.label == "==").unwrap();
@@ -359,7 +388,7 @@ mod tests {
     #[test]
     fn includes_builtin_functions() {
         let (module, tr) = parse_module("");
-        let items = completions(&module, Some(&tr), None, None);
+        let items = completions(&module, Some(&tr), None, None, None);
         let l = labels(&items);
         assert!(l.contains(&"print".to_string()));
         assert!(l.contains(&"println".to_string()));
@@ -370,7 +399,7 @@ mod tests {
     #[test]
     fn builtins_have_type_signatures() {
         let (module, tr) = parse_module("");
-        let items = completions(&module, Some(&tr), None, None);
+        let items = completions(&module, Some(&tr), None, None, None);
         let print = items.iter().find(|i| i.label == "println").unwrap();
         assert_eq!(print.detail.as_deref(), Some("(Fn [a] Unit)"));
         let add = items.iter().find(|i| i.label == "+").unwrap();
@@ -380,7 +409,7 @@ mod tests {
     #[test]
     fn includes_primitive_types() {
         let (module, tr) = parse_module("");
-        let items = completions(&module, Some(&tr), None, None);
+        let items = completions(&module, Some(&tr), None, None, None);
         let l = labels(&items);
         assert!(l.contains(&"i32".to_string()), "should include i32");
         assert!(l.contains(&"i64".to_string()), "should include i64");
@@ -394,7 +423,7 @@ mod tests {
     #[test]
     fn primitive_types_have_correct_detail() {
         let (module, tr) = parse_module("");
-        let items = completions(&module, Some(&tr), None, None);
+        let items = completions(&module, Some(&tr), None, None, None);
         let string = items.iter().find(|i| i.label == "String").unwrap();
         assert_eq!(string.detail.as_deref(), Some("primitive type"));
         assert_eq!(string.kind, Some(CompletionItemKind::CLASS));
@@ -403,7 +432,7 @@ mod tests {
     #[test]
     fn includes_keywords() {
         let (module, tr) = parse_module("");
-        let items = completions(&module, Some(&tr), None, None);
+        let items = completions(&module, Some(&tr), None, None, None);
         let l = labels(&items);
         assert!(l.contains(&"defn".to_string()));
         assert!(l.contains(&"let".to_string()));
@@ -415,7 +444,7 @@ mod tests {
     #[test]
     fn keywords_have_correct_kind() {
         let (module, tr) = parse_module("");
-        let items = completions(&module, Some(&tr), None, None);
+        let items = completions(&module, Some(&tr), None, None, None);
         let defn = items.iter().find(|i| i.label == "defn").unwrap();
         assert_eq!(defn.kind, Some(CompletionItemKind::KEYWORD));
     }
@@ -423,7 +452,7 @@ mod tests {
     #[test]
     fn empty_module_still_has_builtins_types_and_keywords() {
         let (module, tr) = parse_module("");
-        let items = completions(&module, Some(&tr), None, None);
+        let items = completions(&module, Some(&tr), None, None, None);
         let expected_min = BUILTINS.len() + PRIMITIVE_TYPES.len() + KEYWORDS.len();
         assert!(
             items.len() >= expected_min,
@@ -436,7 +465,7 @@ mod tests {
     #[test]
     fn works_without_type_result() {
         let (module, _errors) = weir_parser::parse("(defn foo () 42)");
-        let items = completions(&module, None, None, None);
+        let items = completions(&module, None, None, None, None);
         let l = labels(&items);
         assert!(l.contains(&"foo".to_string()));
         // Without type result, detail should be None for user fns
@@ -460,7 +489,7 @@ mod tests {
         let (module, tr, idx) = setup_with_index(source);
         // Cursor inside the body, at "+" (offset ~33)
         let offset = source.find("+ x").unwrap() as u32;
-        let items = completions(&module, Some(&tr), Some(&idx), Some(offset));
+        let items = completions(&module, Some(&tr), Some(&idx), Some(offset), None);
         let l = labels(&items);
         assert!(l.contains(&"x".to_string()), "should include param x");
         assert!(l.contains(&"y".to_string()), "should include param y");
@@ -472,7 +501,7 @@ mod tests {
         let (module, tr, idx) = setup_with_index(source);
         // Cursor in the let body (at "count" reference)
         let body_offset = source.rfind("count").unwrap() as u32;
-        let items = completions(&module, Some(&tr), Some(&idx), Some(body_offset));
+        let items = completions(&module, Some(&tr), Some(&idx), Some(body_offset), None);
         let l = labels(&items);
         assert!(
             l.contains(&"count".to_string()),
@@ -485,7 +514,7 @@ mod tests {
         let source = "(defn f (x) x)";
         let (module, tr, idx) = setup_with_index(source);
         let offset = source.rfind('x').unwrap() as u32;
-        let items = completions(&module, Some(&tr), Some(&idx), Some(offset));
+        let items = completions(&module, Some(&tr), Some(&idx), Some(offset), None);
         let x = items.iter().find(|i| i.label == "x").unwrap();
         assert_eq!(x.kind, Some(CompletionItemKind::VARIABLE));
         assert_eq!(x.detail.as_deref(), Some("parameter"));
@@ -496,7 +525,7 @@ mod tests {
         let source = "(defn main () (let ((val 1)) val))";
         let (module, tr, idx) = setup_with_index(source);
         let offset = source.rfind("val").unwrap() as u32;
-        let items = completions(&module, Some(&tr), Some(&idx), Some(offset));
+        let items = completions(&module, Some(&tr), Some(&idx), Some(offset), None);
         let val = items.iter().find(|i| i.label == "val").unwrap();
         assert_eq!(val.kind, Some(CompletionItemKind::VARIABLE));
         assert_eq!(val.detail.as_deref(), Some("let binding"));
@@ -508,7 +537,7 @@ mod tests {
         let source = "(defn f (x) x)   ";
         let (module, tr, idx) = setup_with_index(source);
         // Offset 17 is in trailing whitespace, outside any item
-        let items = completions(&module, Some(&tr), Some(&idx), Some(17));
+        let items = completions(&module, Some(&tr), Some(&idx), Some(17), None);
         let l = labels(&items);
         assert!(
             !l.contains(&"x".to_string()),
@@ -522,7 +551,7 @@ mod tests {
         let (module, tr, idx) = setup_with_index(source);
         // Cursor in the inner let body
         let offset = source.find("(+ a b)").unwrap() as u32 + 3;
-        let items = completions(&module, Some(&tr), Some(&idx), Some(offset));
+        let items = completions(&module, Some(&tr), Some(&idx), Some(offset), None);
         let l = labels(&items);
         assert!(
             l.contains(&"a".to_string()),
@@ -539,8 +568,66 @@ mod tests {
         let source = "(defn main (myvar) myvar)";
         let (module, tr, idx) = setup_with_index(source);
         let offset = source.rfind("myvar").unwrap() as u32;
-        let items = completions(&module, Some(&tr), Some(&idx), Some(offset));
+        let items = completions(&module, Some(&tr), Some(&idx), Some(offset), None);
         let myvar = items.iter().find(|i| i.label == "myvar").unwrap();
         assert_eq!(myvar.sort_text.as_deref(), Some("0"));
+    }
+
+    // ── Workspace completion tests ──────────────────────────────
+
+    fn make_ws_symbol(name: &str, kind: SymbolKind, uri_str: &str) -> WorkspaceSymbol {
+        WorkspaceSymbol {
+            name: name.to_string(),
+            kind,
+            name_span: weir_lexer::Span::new(0, name.len() as u32),
+            uri: tower_lsp::lsp_types::Url::parse(uri_str).unwrap(),
+        }
+    }
+
+    #[test]
+    fn workspace_symbols_in_completion() {
+        let (module, tr) = parse_module("(defn local-fn () 1)");
+        let ws_syms = vec![make_ws_symbol(
+            "remote-fn",
+            SymbolKind::Function,
+            "file:///other.weir",
+        )];
+        let items = completions(&module, Some(&tr), None, None, Some(&ws_syms));
+        let l = labels(&items);
+        assert!(l.contains(&"remote-fn".to_string()));
+        let remote = items.iter().find(|i| i.label == "remote-fn").unwrap();
+        assert_eq!(remote.kind, Some(CompletionItemKind::FUNCTION));
+        assert_eq!(remote.detail.as_deref(), Some("from other.weir"));
+    }
+
+    #[test]
+    fn workspace_symbols_shadowed_by_local() {
+        let (module, tr) = parse_module("(defn foo () 1)");
+        let ws_syms = vec![make_ws_symbol(
+            "foo",
+            SymbolKind::Function,
+            "file:///other.weir",
+        )];
+        let items = completions(&module, Some(&tr), None, None, Some(&ws_syms));
+        // "foo" should only appear once (from local module, not workspace)
+        let foo_count = items.iter().filter(|i| i.label == "foo").count();
+        assert_eq!(foo_count, 1);
+    }
+
+    #[test]
+    fn workspace_symbols_sorted_after_locals() {
+        let source = "(defn main (myvar) myvar)";
+        let (module, tr, idx) = setup_with_index(source);
+        let offset = source.rfind("myvar").unwrap() as u32;
+        let ws_syms = vec![make_ws_symbol(
+            "remote-fn",
+            SymbolKind::Function,
+            "file:///other.weir",
+        )];
+        let items = completions(&module, Some(&tr), Some(&idx), Some(offset), Some(&ws_syms));
+        let local = items.iter().find(|i| i.label == "myvar").unwrap();
+        let remote = items.iter().find(|i| i.label == "remote-fn").unwrap();
+        assert_eq!(local.sort_text.as_deref(), Some("0"));
+        assert_eq!(remote.sort_text.as_deref(), Some("2"));
     }
 }

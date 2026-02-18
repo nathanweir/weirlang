@@ -1,3 +1,6 @@
+use std::collections::HashSet;
+
+use smol_str::SmolStr;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
 use crate::document::{AnalysisResult, LineIndex};
@@ -20,8 +23,14 @@ fn macros_changed_source(original: &str, expanded: &str) -> bool {
 }
 
 /// Run the full analysis pipeline: expand → parse → typecheck.
+/// `external_names` contains known symbols from other workspace files;
+/// the type checker will treat them as valid (opaque) rather than erroring.
 /// Returns the analysis result and a list of LSP diagnostics.
-pub fn analyze(text: &str, original_line_index: &LineIndex) -> (AnalysisResult, Vec<Diagnostic>) {
+pub fn analyze(
+    text: &str,
+    original_line_index: &LineIndex,
+    external_names: &HashSet<SmolStr>,
+) -> (AnalysisResult, Vec<Diagnostic>) {
     let mut diagnostics = Vec::new();
 
     // 1. Expand macros
@@ -67,7 +76,7 @@ pub fn analyze(text: &str, original_line_index: &LineIndex) -> (AnalysisResult, 
 
     // 3. Typecheck only if no macro/parse errors
     let type_result = if macro_errors.is_empty() && parse_errors.is_empty() {
-        let result = weir_typeck::check(&module);
+        let result = weir_typeck::check_with_externals(&module, external_names);
         for error in &result.errors {
             diagnostics.push(Diagnostic {
                 range: parse_line_index.span_to_range(error.span),
@@ -79,7 +88,7 @@ pub fn analyze(text: &str, original_line_index: &LineIndex) -> (AnalysisResult, 
         }
         result
     } else {
-        weir_typeck::check(&module)
+        weir_typeck::check_with_externals(&module, external_names)
     };
 
     let symbol_index = SymbolIndex::build(&module);

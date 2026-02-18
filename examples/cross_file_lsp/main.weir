@@ -1,0 +1,69 @@
+;; ─── main.weir ───────────────────────────────────────────────────
+;; Cross-File LSP Demo
+;;
+;; This file uses functions and types defined in math.weir and
+;; types.weir. With cross-file LSP support, you can:
+;;
+;;   GOTO DEFINITION
+;;     Place your cursor on `square` or `Point` below and use
+;;     go-to-definition. The LSP will jump to the definition in
+;;     math.weir or types.weir respectively.
+;;
+;;   FIND REFERENCES
+;;     Place your cursor on `square` in math.weir and use
+;;     find-all-references. You'll see references from both
+;;     math.weir (the definition) and this file (the calls).
+;;
+;;   RENAME
+;;     Rename `clamp` from either file — the LSP will update
+;;     the definition in math.weir and all call sites here.
+;;
+;;   COMPLETION
+;;     Start typing `sq` or `pos` anywhere in this file and
+;;     workspace symbols from math.weir will appear in the
+;;     completion list, annotated with "from math.weir".
+
+(defn describe-number ((n : i32)) : Unit
+  ;; Uses functions from math.weir:
+  ;;   - zero?, positive?, negative? (predicates)
+  ;;   - square, abs (arithmetic)
+  (if (zero? n)
+    (println "zero")
+    (if (positive? n)
+      (do (println "positive") (println (square n)))
+      (do (println "negative") (println (abs n))))))
+
+(defn classify ((x : i32)) : Unit
+  ;; Uses clamp from math.weir
+  (let ((clamped (clamp x 0 100))) (println clamped)))
+
+(defn main ()
+  ;; ── Cross-file function calls ─────────────────────────────────
+  ;; All of these resolve to definitions in math.weir.
+  ;; Try go-to-definition on any of them!
+  
+  
+  (println (square 5))
+  ;; → 25 (defined in math.weir)
+  (println (cube 3))
+  ;; → 27 (defined in math.weir)
+  (println (abs (- 0 42)))
+  ;; → 42 (defined in math.weir)
+  (println (clamp 150 0 100))
+  ;; → 100 (defined in math.weir)
+  
+  
+  ;; ── Cross-file type usage ─────────────────────────────────────
+  ;; Option, Some, None, Point are all from types.weir.
+  
+  
+  (let ((val (Some 42)))
+    (match val ((Some x) (println (square x))) (None (println "nothing"))))
+  
+  
+  ;; ── Combining both files ──────────────────────────────────────
+  (describe-number 7)
+  (describe-number 0)
+  (describe-number (- 0 3))
+  (classify 200))
+
