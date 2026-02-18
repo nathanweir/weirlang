@@ -7,7 +7,7 @@ use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{DataId, FuncId, Linkage, Module};
+use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use smol_str::SmolStr;
 use std::collections::HashMap;
@@ -102,11 +102,58 @@ extern "C" fn weir_sleep_ms(ms: i64) {
     std::thread::sleep(std::time::Duration::from_millis(ms as u64));
 }
 
+extern "C" fn weir_print_str(ptr: i64) {
+    let c_str = unsafe { std::ffi::CStr::from_ptr(ptr as *const std::ffi::c_char) };
+    let s = c_str.to_str().unwrap_or("<invalid utf8>");
+    OUTPUT_BUF.with(|buf| buf.borrow_mut().push_str(s));
+}
+
+extern "C" fn weir_i64_to_str(val: i64) -> i64 {
+    let s = format!("{}", val);
+    let c_string = std::ffi::CString::new(s).unwrap();
+    c_string.into_raw() as i64
+}
+
+extern "C" fn weir_f64_to_str(val: f64) -> i64 {
+    let s = if val.fract() == 0.0 {
+        format!("{:.1}", val)
+    } else {
+        format!("{}", val)
+    };
+    let c_string = std::ffi::CString::new(s).unwrap();
+    c_string.into_raw() as i64
+}
+
+extern "C" fn weir_bool_to_str(val: i8) -> i64 {
+    let s = if val != 0 { "true" } else { "false" };
+    let c_string = std::ffi::CString::new(s).unwrap();
+    c_string.into_raw() as i64
+}
+
+extern "C" fn weir_str_concat(a: i64, b: i64) -> i64 {
+    let a_str = unsafe { std::ffi::CStr::from_ptr(a as *const _) }
+        .to_str()
+        .unwrap_or("");
+    let b_str = unsafe { std::ffi::CStr::from_ptr(b as *const _) }
+        .to_str()
+        .unwrap_or("");
+    let combined = format!("{}{}", a_str, b_str);
+    std::ffi::CString::new(combined).unwrap().into_raw() as i64
+}
+
+extern "C" fn weir_str_eq(a: i64, b: i64) -> i8 {
+    let a_str = unsafe { std::ffi::CStr::from_ptr(a as *const _) };
+    let b_str = unsafe { std::ffi::CStr::from_ptr(b as *const _) };
+    if a_str == b_str { 1 } else { 0 }
+}
+
 // ── C runtime for AOT binaries ──────────────────────────────────
 
 const AOT_RUNTIME_C: &str = r#"
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 
 extern void weir_main(void);
 
@@ -118,6 +165,31 @@ void weir_print_f64(double val) {
 void weir_print_bool(int8_t val) { printf("%s", val ? "true" : "false"); }
 void weir_print_unit(void) { printf("()"); }
 void weir_print_newline(void) { printf("\n"); }
+void weir_print_str(int64_t ptr) { printf("%s", (const char*)ptr); }
+
+int64_t weir_i64_to_str(int64_t val) {
+    char buf[32]; snprintf(buf, sizeof(buf), "%lld", (long long)val);
+    char *s = strdup(buf); return (int64_t)s;
+}
+int64_t weir_f64_to_str(double val) {
+    char buf[64];
+    if (val == (double)(long long)val) snprintf(buf, sizeof(buf), "%.1f", val);
+    else snprintf(buf, sizeof(buf), "%g", val);
+    char *s = strdup(buf); return (int64_t)s;
+}
+int64_t weir_bool_to_str(int8_t val) {
+    char *s = strdup(val ? "true" : "false"); return (int64_t)s;
+}
+int64_t weir_str_concat(int64_t a, int64_t b) {
+    const char *sa = (const char*)a, *sb = (const char*)b;
+    size_t la = strlen(sa), lb = strlen(sb);
+    char *out = malloc(la + lb + 1);
+    memcpy(out, sa, la); memcpy(out + la, sb, lb + 1);
+    return (int64_t)out;
+}
+int64_t weir_str_eq(int64_t a, int64_t b) {
+    return strcmp((const char*)a, (const char*)b) == 0 ? 1 : 0;
+}
 
 int main(void) { weir_main(); return 0; }
 "#;
@@ -132,6 +204,7 @@ fn ty_to_cl_with(ty: &Ty, tagged_adts: Option<&HashMap<SmolStr, TaggedAdt>>) -> 
         Ty::I64 | Ty::U64 => Some(types::I64),
         Ty::F32 => Some(types::F32),
         Ty::F64 => Some(types::F64),
+        Ty::Str => Some(types::I64), // pointer to null-terminated C string
         Ty::Unit => None, // void — no value
         Ty::Con(name, _) => {
             if let Some(adts) = tagged_adts {
@@ -193,6 +266,12 @@ pub fn compile_and_run(
     builder.symbol("weir_print_unit", weir_print_unit as *const u8);
     builder.symbol("weir_print_newline", weir_print_newline as *const u8);
     builder.symbol("weir_sleep_ms", weir_sleep_ms as *const u8);
+    builder.symbol("weir_print_str", weir_print_str as *const u8);
+    builder.symbol("weir_i64_to_str", weir_i64_to_str as *const u8);
+    builder.symbol("weir_f64_to_str", weir_f64_to_str as *const u8);
+    builder.symbol("weir_bool_to_str", weir_bool_to_str as *const u8);
+    builder.symbol("weir_str_concat", weir_str_concat as *const u8);
+    builder.symbol("weir_str_eq", weir_str_eq as *const u8);
 
     let jit_module = JITModule::new(builder);
 
@@ -440,6 +519,73 @@ impl<'a, M: Module> Compiler<'a, M> {
             .map_err(|e| CodegenError::new(format!("declare weir_sleep_ms: {}", e)))?;
         self.runtime_fns.insert("sleep_ms", id);
 
+        // weir_print_str(i64) -> void
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.call_conv = CallConv::SystemV;
+        let id = self
+            .module
+            .declare_function("weir_print_str", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::new(format!("declare weir_print_str: {}", e)))?;
+        self.runtime_fns.insert("print_str", id);
+
+        // weir_i64_to_str(i64) -> i64
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.call_conv = CallConv::SystemV;
+        let id = self
+            .module
+            .declare_function("weir_i64_to_str", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::new(format!("declare weir_i64_to_str: {}", e)))?;
+        self.runtime_fns.insert("i64_to_str", id);
+
+        // weir_f64_to_str(f64) -> i64
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::F64));
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.call_conv = CallConv::SystemV;
+        let id = self
+            .module
+            .declare_function("weir_f64_to_str", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::new(format!("declare weir_f64_to_str: {}", e)))?;
+        self.runtime_fns.insert("f64_to_str", id);
+
+        // weir_bool_to_str(i8) -> i64
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I8));
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.call_conv = CallConv::SystemV;
+        let id = self
+            .module
+            .declare_function("weir_bool_to_str", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::new(format!("declare weir_bool_to_str: {}", e)))?;
+        self.runtime_fns.insert("bool_to_str", id);
+
+        // weir_str_concat(i64, i64) -> i64
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.call_conv = CallConv::SystemV;
+        let id = self
+            .module
+            .declare_function("weir_str_concat", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::new(format!("declare weir_str_concat: {}", e)))?;
+        self.runtime_fns.insert("str_concat", id);
+
+        // weir_str_eq(i64, i64) -> i8
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I8));
+        sig.call_conv = CallConv::SystemV;
+        let id = self
+            .module
+            .declare_function("weir_str_eq", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::new(format!("declare weir_str_eq: {}", e)))?;
+        self.runtime_fns.insert("str_eq", id);
+
         Ok(())
     }
 
@@ -618,6 +764,7 @@ impl<'a, M: Module> Compiler<'a, M> {
                 "f32" => Ok(Ty::F32),
                 "f64" => Ok(Ty::F64),
                 "Bool" | "bool" => Ok(Ty::Bool),
+                "String" => Ok(Ty::Str),
                 "Unit" => Ok(Ty::Unit),
                 other => {
                     // Check if it's a tagged ADT type
@@ -1059,9 +1206,23 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                 let val = self.builder.ins().iconst(types::I8, if *b { 1 } else { 0 });
                 Ok(Some(val))
             }
-            Literal::String(_) => Err(CodegenError::new(
-                "string literals not yet supported in codegen",
-            )),
+            Literal::String(s) => {
+                // Embed string as null-terminated data in a Cranelift data section
+                let mut bytes = s.as_bytes().to_vec();
+                bytes.push(0); // null terminator
+                let mut data_desc = DataDescription::new();
+                data_desc.define(bytes.into_boxed_slice());
+                let data_id = self
+                    .module
+                    .declare_anonymous_data(false, false)
+                    .map_err(|e| CodegenError::new(format!("declare string data: {}", e)))?;
+                self.module
+                    .define_data(data_id, &data_desc)
+                    .map_err(|e| CodegenError::new(format!("define string data: {}", e)))?;
+                let gv = self.module.declare_data_in_func(data_id, self.builder.func);
+                let ptr = self.builder.ins().global_value(types::I64, gv);
+                Ok(Some(ptr))
+            }
         }
     }
 
@@ -1171,6 +1332,9 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                 }
                 "sleep" => {
                     return self.compile_sleep(args);
+                }
+                "str" => {
+                    return self.compile_str_builtin(args);
                 }
                 _ => {}
             }
@@ -1391,6 +1555,27 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
         let rhs_ty = self.expr_ty(args[1].value);
         let rhs = self.compile_expr(args[1].value, &rhs_ty)?.unwrap();
 
+        // String equality/inequality via runtime helper
+        if lhs_ty == Ty::Str && rhs_ty == Ty::Str {
+            if op != "=" && op != "!=" {
+                return Err(CodegenError::new(format!(
+                    "operator {} not supported for strings (only = and !=)",
+                    op
+                )));
+            }
+            let func_id = self.runtime_fns["str_eq"];
+            let func_ref = self
+                .module
+                .declare_func_in_func(func_id, self.builder.func);
+            let call = self.builder.ins().call(func_ref, &[lhs, rhs]);
+            let eq_val = self.builder.inst_results(call)[0];
+            if op == "!=" {
+                let one = self.builder.ins().iconst(types::I8, 1);
+                return Ok(Some(self.builder.ins().bxor(eq_val, one)));
+            }
+            return Ok(Some(eq_val));
+        }
+
         let float = is_float(&lhs_ty);
 
         let result = if float {
@@ -1498,6 +1683,7 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
             Ty::F64 => ("print_f64", false),
             Ty::Bool => ("print_bool", false),
             Ty::Unit => ("print_unit", false),
+            Ty::Str => ("print_str", false),
             _ => {
                 return Err(CodegenError::new(format!(
                     "cannot print type {} in codegen",
@@ -1552,6 +1738,77 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
         let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
         self.builder.ins().call(func_ref, &[arg_val]);
         Ok(None)
+    }
+
+    // ── str builtin ─────────────────────────────────────────────
+
+    /// Convert a single value to a string pointer (i64).
+    fn compile_to_str(&mut self, arg: &Arg) -> Result<Value, CodegenError> {
+        let arg_ty = self.expr_ty(arg.value);
+        let val = self.compile_expr(arg.value, &arg_ty)?;
+        match &arg_ty {
+            Ty::Str => Ok(val.unwrap()),
+            Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 => {
+                let val = val.unwrap();
+                let extended = match &arg_ty {
+                    Ty::I8 | Ty::I16 | Ty::I32 => self.builder.ins().sextend(types::I64, val),
+                    Ty::U8 | Ty::U16 | Ty::U32 => self.builder.ins().uextend(types::I64, val),
+                    _ => val,
+                };
+                let func_id = self.runtime_fns["i64_to_str"];
+                let func_ref = self
+                    .module
+                    .declare_func_in_func(func_id, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[extended]);
+                Ok(self.builder.inst_results(call)[0])
+            }
+            Ty::F32 | Ty::F64 => {
+                let val = val.unwrap();
+                let promoted = if arg_ty == Ty::F32 {
+                    self.builder.ins().fpromote(types::F64, val)
+                } else {
+                    val
+                };
+                let func_id = self.runtime_fns["f64_to_str"];
+                let func_ref = self
+                    .module
+                    .declare_func_in_func(func_id, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[promoted]);
+                Ok(self.builder.inst_results(call)[0])
+            }
+            Ty::Bool => {
+                let val = val.unwrap();
+                let func_id = self.runtime_fns["bool_to_str"];
+                let func_ref = self
+                    .module
+                    .declare_func_in_func(func_id, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[val]);
+                Ok(self.builder.inst_results(call)[0])
+            }
+            _ => Err(CodegenError::new(format!(
+                "str: cannot convert type {} to string",
+                arg_ty
+            ))),
+        }
+    }
+
+    fn compile_str_builtin(&mut self, args: &[Arg]) -> Result<Option<Value>, CodegenError> {
+        if args.is_empty() {
+            return Err(CodegenError::new("str expects at least 1 argument"));
+        }
+        // Convert first arg to string
+        let mut acc = self.compile_to_str(&args[0])?;
+        // Convert and concatenate remaining args
+        for arg in &args[1..] {
+            let s = self.compile_to_str(arg)?;
+            let func_id = self.runtime_fns["str_concat"];
+            let func_ref = self
+                .module
+                .declare_func_in_func(func_id, self.builder.func);
+            let call = self.builder.ins().call(func_ref, &[acc, s]);
+            acc = self.builder.inst_results(call)[0];
+        }
+        Ok(Some(acc))
     }
 
     // ── If/else ─────────────────────────────────────────────────
@@ -2003,6 +2260,12 @@ fn register_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol("weir_print_unit", weir_print_unit as *const u8);
     builder.symbol("weir_print_newline", weir_print_newline as *const u8);
     builder.symbol("weir_sleep_ms", weir_sleep_ms as *const u8);
+    builder.symbol("weir_print_str", weir_print_str as *const u8);
+    builder.symbol("weir_i64_to_str", weir_i64_to_str as *const u8);
+    builder.symbol("weir_f64_to_str", weir_f64_to_str as *const u8);
+    builder.symbol("weir_bool_to_str", weir_bool_to_str as *const u8);
+    builder.symbol("weir_str_concat", weir_str_concat as *const u8);
+    builder.symbol("weir_str_eq", weir_str_eq as *const u8);
 }
 
 pub struct DevSession {
@@ -3261,6 +3524,101 @@ mod tests {
         assert_eq!(
             compiled, interpreted,
             "result: compiler and interpreter disagree"
+        );
+    }
+
+    // ── String tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_string_literal_print() {
+        let out = compile_run(
+            "(defn main () (println \"hello\"))",
+        );
+        assert_eq!(out, "hello\n");
+    }
+
+    #[test]
+    fn test_string_literal_in_function() {
+        let out = compile_run(
+            "(defn greet ((name : String)) : String name)
+             (defn main () (println (greet \"world\")))",
+        );
+        assert_eq!(out, "world\n");
+    }
+
+    #[test]
+    fn test_str_builtin_i64() {
+        let out = compile_run(
+            "(defn main () (println (str 42)))",
+        );
+        assert_eq!(out, "42\n");
+    }
+
+    #[test]
+    fn test_str_builtin_f64() {
+        let out = compile_run(
+            "(defn main () (println (str 3.14)))",
+        );
+        assert_eq!(out, "3.14\n");
+    }
+
+    #[test]
+    fn test_str_builtin_bool() {
+        let out = compile_run(
+            "(defn main () (println (str true)))",
+        );
+        assert_eq!(out, "true\n");
+    }
+
+    #[test]
+    fn test_str_concat() {
+        let out = compile_run(
+            "(defn main () (println (str \"hello \" \"world\")))",
+        );
+        assert_eq!(out, "hello world\n");
+    }
+
+    #[test]
+    fn test_str_mixed_concat() {
+        let out = compile_run(
+            "(defn main () (println (str \"x=\" 42)))",
+        );
+        assert_eq!(out, "x=42\n");
+    }
+
+    #[test]
+    fn test_string_equality() {
+        let out = compile_run(
+            "(defn main ()
+               (println (= \"foo\" \"foo\"))
+               (println (= \"foo\" \"bar\"))
+               (println (!= \"foo\" \"bar\")))",
+        );
+        assert_eq!(out, "true\nfalse\ntrue\n");
+    }
+
+    #[test]
+    fn oracle_strings() {
+        oracle_test(
+            "(defn main ()
+               (println \"hello\")
+               (println (str 42))
+               (println (str 3.14))
+               (println (str true))
+               (println (str \"hello \" \"world\"))
+               (println (str \"x=\" 42))
+               (println (= \"foo\" \"foo\"))
+               (println (= \"foo\" \"bar\")))",
+        );
+    }
+
+    #[test]
+    fn fixture_strings() {
+        let compiled = run_fixture_compiled("strings");
+        let interpreted = run_fixture_interpreted("strings");
+        assert_eq!(
+            compiled, interpreted,
+            "strings: compiler and interpreter disagree"
         );
     }
 

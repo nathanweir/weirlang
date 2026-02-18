@@ -1,0 +1,10 @@
+(defn greet ((name : String)) : String
+  (str "Hello, " name "!"))
+
+(defn main ()
+  (println "literal string")
+  (println (str 42))
+  (println (str 3.14))
+  (println (greet "world"))
+  (println (= "foo" "foo"))
+  (println (= "foo" "bar")))

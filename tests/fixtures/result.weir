@@ -4,16 +4,14 @@
   (if (= y 0) (Err y) (Ok (/ x y))))
 
 (defn unwrap-or ((r : (Result i32 i32)) (default : i32)) : i32
-  (match r
-    ((Ok val) val)
-    ((Err _) default)))
+  (match r ((Ok val) val) ((Err _) default)))
 
 (defn try-add-one ((x : i32) (y : i32)) : (Result i32 i32)
-  (let ((result (safe-div x y)?))
-    (Ok (+ result 1))))
+  (let ((result (safe-div x y) ?)) (Ok (+ result 1))))
 
 (defn main ()
   (println (unwrap-or (safe-div 10 2) 0))
   (println (unwrap-or (safe-div 10 0) 99))
   (println (unwrap-or (try-add-one 10 2) 0))
   (println (unwrap-or (try-add-one 10 0) 99)))
+

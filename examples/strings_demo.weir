@@ -1,0 +1,52 @@
+;; Strings in codegen: heap-allocated, pointer-as-i64
+;; String literals live in static data sections; dynamic strings are malloc'd.
+
+;; ── String literals ─────────────────────────────────────────────
+
+(defn main ()
+  (println "Strings are alive in codegen!")
+  (println "")
+
+  ;; ── str builtin: value-to-string conversion ───────────────────
+
+  (println "Converting values to strings:")
+  (println (str "  integer: " 42))
+  (println (str "  float:   " 3.14))
+  (println (str "  bool:    " true))
+  (println "")
+
+  ;; ── Multi-arg concatenation ───────────────────────────────────
+
+  (println (str "Coordinates: (" 10 ", " 20 ")"))
+  (println (str "The answer is " (+ 40 2) ", obviously."))
+  (println "")
+
+  ;; ── Strings as function args and return values ────────────────
+
+  (println (greet "world"))
+  (println (greet "Weir"))
+  (println "")
+
+  ;; ── String equality ───────────────────────────────────────────
+
+  (println "Equality checks:")
+  (println (str "  \"foo\" = \"foo\" -> " (= "foo" "foo")))
+  (println (str "  \"foo\" = \"bar\" -> " (= "foo" "bar")))
+  (println (str "  \"foo\" != \"bar\" -> " (!= "foo" "bar")))
+  (println "")
+
+  ;; ── Strings in control flow ───────────────────────────────────
+
+  (println (describe 0))
+  (println (describe 1))
+  (println (describe 42)))
+
+(defn greet ((name : String)) : String
+  (str "Hello, " name "!"))
+
+(defn describe ((n : i32)) : String
+  (if (= n 0)
+    "zero"
+    (if (> n 10)
+      (str n " is big")
+      (str n " is small"))))
