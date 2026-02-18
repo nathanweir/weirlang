@@ -1,0 +1,9 @@
+{
+  "weir": {
+    "command": "/home/nathan/dev/weirlang/target/debug/weir",
+    "args": ["lsp"],
+    "extensionToLanguage": {
+      ".weir": "weir"
+    }
+  }
+}

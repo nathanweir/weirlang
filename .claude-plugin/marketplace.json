@@ -1,0 +1,28 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "weir-marketplace",
+  "description": "Local marketplace for Weir language server",
+  "owner": {
+    "name": "Nathan"
+  },
+  "plugins": [
+    {
+      "name": "weir-lsp",
+      "description": "Weir language server providing diagnostics, hover, completion, go-to-definition, and more for .weir files",
+      "version": "0.1.0",
+      "author": {
+        "name": "Nathan"
+      },
+      "source": "./",
+      "lspServers": {
+        "weir": {
+          "command": "/home/nathan/dev/weirlang/target/debug/weir",
+          "args": ["lsp"],
+          "extensionToLanguage": {
+            ".weir": "weir"
+          }
+        }
+      }
+    }
+  ]
+}

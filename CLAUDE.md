@@ -44,5 +44,6 @@ When processing a new transcript, ingest it into the existing design documents i
   - `syntax.md` — Syntax decisions, type annotation style, collection literals
   - `open-questions.md` — Index of all decisions and remaining open questions
   - `implementation-plan.md` — Phased implementation roadmap, technology choices, test strategy
+  - `lsp-status.md` — LSP feature inventory: what's implemented, known limitations, and candidate next features. **Keep this up to date** when adding, changing, or removing LSP features.
 - `.transcripts/` — Raw voice memo transcripts (gitignored, not committed)
 - `README.md` — Project description and workflow explanation

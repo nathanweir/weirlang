@@ -1,0 +1,9 @@
+{
+  "name": "weir-lsp",
+  "description": "Weir language server providing diagnostics, hover, completion, go-to-definition, and more for .weir files",
+  "version": "0.1.0",
+  "author": {
+    "name": "Nathan"
+  },
+  "lspServers": "./.lsp.json"
+}
