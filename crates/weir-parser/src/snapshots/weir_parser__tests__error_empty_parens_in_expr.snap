@@ -1,0 +1,12 @@
+---
+source: crates/weir-parser/src/lib.rs
+assertion_line: 1560
+expression: result
+---
+ERRORS:
+  14:16: empty parentheses
+
+(defn main
+  params:
+  body:
+)

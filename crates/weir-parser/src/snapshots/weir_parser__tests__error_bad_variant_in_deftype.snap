@@ -1,0 +1,11 @@
+---
+source: crates/weir-parser/src/lib.rs
+assertion_line: 1572
+expression: result
+---
+ERRORS:
+  15:17: expected variant, found Some(Int(42))
+  15:17: expected ')' to close top-level form
+
+(deftype Color
+)

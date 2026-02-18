@@ -1,0 +1,15 @@
+---
+source: crates/weir-parser/src/lib.rs
+assertion_line: 1590
+expression: result
+---
+ERRORS:
+  19:20: unexpected token Some(RBracket)
+  21:22: expected RParen, found Some(Int(2))
+  21:22: expected ')' to close top-level form
+  23:24: expected '(' to start a top-level form
+
+(defn main
+  params:
+  body:
+)

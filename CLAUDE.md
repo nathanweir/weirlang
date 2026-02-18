@@ -32,6 +32,10 @@ When processing a new transcript, ingest it into the existing design documents i
 - **Shell commands**: Use `nix develop --command <cmd>` to run commands (e.g. `nix develop --command cargo test --workspace`). Do NOT use `direnv export bash` — it does not work in this context.
 - **Task runner**: Uses `just` (Justfile) for dev commands — run `just` to list available recipes
 
+## Temporary Files
+
+Use the project-local `tmp/` directory (gitignored) for any scratch files, test outputs, or temporary artifacts. Do not use the system `/tmp` or other directories outside this project.
+
 ## Repository Structure
 
 - `design/` — Design documents:

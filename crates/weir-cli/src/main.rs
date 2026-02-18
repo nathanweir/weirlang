@@ -52,6 +52,12 @@ enum Command {
     Lsp,
 }
 
+const PRELUDE_SOURCE: &str = include_str!("../../../std/prelude.weir");
+
+fn with_prelude(source: &str) -> String {
+    format!("{}\n{}", PRELUDE_SOURCE, source)
+}
+
 fn read_file(file: &std::path::Path) -> String {
     match std::fs::read_to_string(file) {
         Ok(s) => s,
@@ -110,7 +116,7 @@ fn main() {
             }
         }
         Command::Check { file } => {
-            let source = read_file(&file);
+            let source = with_prelude(&read_file(&file));
             let expanded = expand_source(&source, &file);
 
             let (module, parse_errors) = weir_parser::parse(&expanded);
@@ -146,7 +152,7 @@ fn main() {
             }
         }
         Command::Run { file } => {
-            let source = read_file(&file);
+            let source = with_prelude(&read_file(&file));
             let expanded = expand_source(&source, &file);
 
             let (module, parse_errors) = weir_parser::parse(&expanded);
@@ -188,7 +194,7 @@ fn main() {
             }
         }
         Command::Build { file, output } => {
-            let source = read_file(&file);
+            let source = with_prelude(&read_file(&file));
             let expanded = expand_source(&source, &file);
 
             let (module, parse_errors) = weir_parser::parse(&expanded);
@@ -233,7 +239,7 @@ fn main() {
             }
         }
         Command::Dev { file } => {
-            let source = read_file(&file);
+            let source = with_prelude(&read_file(&file));
             let expanded = expand_source(&source, &file);
 
             let canonical = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
@@ -252,7 +258,7 @@ fn main() {
             }
         }
         Command::Interp { file } => {
-            let source = read_file(&file);
+            let source = with_prelude(&read_file(&file));
             let expanded = expand_source(&source, &file);
 
             let (module, errors) = weir_parser::parse(&expanded);

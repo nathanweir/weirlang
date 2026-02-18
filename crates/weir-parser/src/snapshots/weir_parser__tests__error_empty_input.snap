@@ -1,0 +1,6 @@
+---
+source: crates/weir-parser/src/lib.rs
+assertion_line: 1524
+expression: result
+---
+

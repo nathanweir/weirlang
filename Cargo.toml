@@ -34,6 +34,10 @@ thiserror = "2"
 
 # Testing
 insta = "1"
+proptest = "1"
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
 
 # CLI
 clap = { version = "4", features = ["derive"] }

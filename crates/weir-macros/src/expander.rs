@@ -567,4 +567,103 @@ mod tests {
         assert!(!result.contains("inc"), "result: {}", result);
         assert!(!result.contains("double-inc"), "result: {}", result);
     }
+
+    // ── Macro hygiene tests ─────────────────────────────────────
+
+    #[test]
+    fn test_hygiene_let_binding_does_not_capture() {
+        // A macro that introduces a `let` binding named `tmp`.
+        // The user code also has a variable named `tmp`.
+        // The macro's `tmp` should be renamed so it doesn't shadow the user's `tmp`.
+        let source = r#"
+            (defmacro with-tmp (val body)
+              (let ((tmp ,val)) ,body))
+            (defn main ()
+              (let ((tmp 10))
+                (with-tmp 99 tmp)))
+        "#;
+        let result = expand_to_source(source);
+        // The macro's `tmp` should be renamed to a gensym like `__tmp_0`
+        assert!(
+            result.contains("__tmp_"),
+            "macro-introduced 'tmp' should be renamed via gensym: {}",
+            result
+        );
+        // The user's `tmp` should remain as `tmp`
+        assert!(
+            result.contains("(let ((tmp 10))"),
+            "user's 'tmp' should be unchanged: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_hygiene_macro_var_does_not_leak() {
+        // A macro introduces `result` via let, but the user body
+        // should not see it — the macro's `result` is renamed.
+        let source = r#"
+            (defmacro compute (x body)
+              (let ((result (+ ,x 1))) ,body))
+            (defn main ()
+              (compute 5 42))
+        "#;
+        let result = expand_to_source(source);
+        // The macro's `result` should be gensym'd
+        assert!(
+            result.contains("__result_"),
+            "macro-introduced 'result' should be renamed: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_hygiene_nested_macros_independent_gensyms() {
+        // Two nested macro invocations should get distinct gensyms.
+        let source = r#"
+            (defmacro bind-tmp (val body)
+              (let ((tmp ,val)) ,body))
+            (defn main ()
+              (bind-tmp 1 (bind-tmp 2 tmp)))
+        "#;
+        let result = expand_to_source(source);
+        // Each macro invocation renames its `tmp` binding independently.
+        // The body `tmp` (from user context) stays as-is.
+        let gensyms: Vec<&str> = result.matches("__tmp_").collect();
+        assert!(
+            gensyms.len() >= 2,
+            "expected at least 2 gensym occurrences (one per macro invocation), got {}: {}",
+            gensyms.len(),
+            result
+        );
+        // The user's `tmp` (body argument) should remain un-renamed
+        assert!(
+            result.contains("tmp)))"),
+            "user body `tmp` should not be gensym'd: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_hygiene_macro_param_not_renamed() {
+        // Macro parameters (substituted values) should NOT be renamed —
+        // only bindings introduced by the macro itself.
+        let source = r#"
+            (defmacro swap-let (a b body)
+              (let ((x ,a) (y ,b)) ,body))
+            (defn main ()
+              (swap-let 1 2 (+ x y)))
+        "#;
+        let result = expand_to_source(source);
+        // `x` and `y` are introduced by the macro's let, so they should be renamed
+        assert!(
+            result.contains("__x_"),
+            "macro-introduced 'x' should be renamed: {}",
+            result
+        );
+        assert!(
+            result.contains("__y_"),
+            "macro-introduced 'y' should be renamed: {}",
+            result
+        );
+    }
 }

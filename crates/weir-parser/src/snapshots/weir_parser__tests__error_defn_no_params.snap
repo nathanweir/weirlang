@@ -1,0 +1,7 @@
+---
+source: crates/weir-parser/src/lib.rs
+assertion_line: 1554
+expression: result
+---
+ERRORS:
+  9:10: expected LParen, found Some(RParen)

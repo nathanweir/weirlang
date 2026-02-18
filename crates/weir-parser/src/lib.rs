@@ -1515,4 +1515,114 @@ mod tests {
             parse_and_print("(defn main () : Unit\n  (spawn-enemy :pos origin :health 50))");
         insta::assert_snapshot!(result);
     }
+
+    // ── Error recovery tests ─────────────────────────────────────
+
+    #[test]
+    fn test_error_empty_input() {
+        let result = parse_and_print("");
+        insta::assert_snapshot!(result);
+    }
+
+    #[test]
+    fn test_error_unclosed_paren() {
+        let result = parse_and_print("(defn foo (x) (+ x 1)");
+        insta::assert_snapshot!(result);
+    }
+
+    #[test]
+    fn test_error_unexpected_close_paren() {
+        let result = parse_and_print(")");
+        insta::assert_snapshot!(result);
+    }
+
+    #[test]
+    fn test_error_bare_token() {
+        let result = parse_and_print("hello");
+        insta::assert_snapshot!(result);
+    }
+
+    #[test]
+    fn test_error_incomplete_defn() {
+        let result = parse_and_print("(defn)");
+        insta::assert_snapshot!(result);
+    }
+
+    #[test]
+    fn test_error_defn_no_params() {
+        let result = parse_and_print("(defn foo)");
+        insta::assert_snapshot!(result);
+    }
+
+    #[test]
+    fn test_error_empty_parens_in_expr() {
+        let result = parse_and_print("(defn main () ())");
+        insta::assert_snapshot!(result);
+    }
+
+    #[test]
+    fn test_error_bad_param_list() {
+        let result = parse_and_print("(defn foo (42) x)");
+        insta::assert_snapshot!(result);
+    }
+
+    #[test]
+    fn test_error_bad_variant_in_deftype() {
+        let result = parse_and_print("(deftype Color 42)");
+        insta::assert_snapshot!(result);
+    }
+
+    #[test]
+    fn test_error_unclosed_nested() {
+        let result = parse_and_print("(if (= 1 (+ 2");
+        insta::assert_snapshot!(result);
+    }
+
+    #[test]
+    fn test_error_multiple_errors() {
+        let result = parse_and_print("(defn) (defn)");
+        insta::assert_snapshot!(result);
+    }
+
+    #[test]
+    fn test_error_unexpected_token_in_expr() {
+        let result = parse_and_print("(defn main () (+ 1 ] 2))");
+        insta::assert_snapshot!(result);
+    }
+
+    #[test]
+    fn test_error_invalid_character() {
+        let result = parse_and_print("(defn main () (+ 1 \\2))");
+        insta::assert_snapshot!(result);
+    }
+
+    // ── Property-based tests ────────────────────────────────────
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn parse_never_panics_on_ascii(s in "\\PC{0,200}") {
+                let _ = parse(&s);
+            }
+
+            #[test]
+            fn parse_never_panics_on_bytes(bytes in proptest::collection::vec(any::<u8>(), 0..200)) {
+                if let Ok(s) = std::str::from_utf8(&bytes) {
+                    let _ = parse(s);
+                }
+            }
+
+            #[test]
+            fn parse_never_panics_on_lispy_input(
+                s in proptest::string::string_regex(r"[\(\)\[\]\{\} a-z0-9\+\-\*/:;'\n ]{0,150}")
+                    .unwrap()
+            ) {
+                let _ = parse(&s);
+            }
+        }
+    }
+
 }

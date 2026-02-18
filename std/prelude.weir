@@ -1,0 +1,3 @@
+;; Weir prelude — implicitly available in all source files
+
+(deftype (Result 'ok 'err) (Ok 'ok) (Err 'err))

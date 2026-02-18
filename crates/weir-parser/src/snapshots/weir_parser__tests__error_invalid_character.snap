@@ -1,0 +1,13 @@
+---
+source: crates/weir-parser/src/lib.rs
+assertion_line: 1596
+expression: result
+---
+ERRORS:
+  19:20: unexpected character
+
+(defn main
+  params:
+  body:
+    (+ 1 2)
+)

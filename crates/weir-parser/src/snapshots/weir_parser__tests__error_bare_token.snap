@@ -1,0 +1,7 @@
+---
+source: crates/weir-parser/src/lib.rs
+assertion_line: 1542
+expression: result
+---
+ERRORS:
+  0:5: expected '(' to start a top-level form

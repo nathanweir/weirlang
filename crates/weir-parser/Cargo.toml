@@ -10,3 +10,4 @@ smol_str.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
+proptest.workspace = true

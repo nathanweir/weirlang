@@ -1,0 +1,14 @@
+---
+source: crates/weir-parser/src/lib.rs
+assertion_line: 1530
+expression: result
+---
+ERRORS:
+  21:21: expected ')' to close top-level form
+
+(defn foo
+  params:
+    x
+  body:
+    (+ x 1)
+)

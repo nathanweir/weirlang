@@ -1,0 +1,26 @@
+;; From typeclass — multi-parameter typeclass for conversions
+
+(deftype Color Red Green Blue)
+(deftype Primary Yes No)
+
+(defclass (From 'a 'b)
+  (from : (Fn ['a] 'b)))
+
+(instance (From Color Primary)
+  (defn from ((c : Color)) : Primary
+    (match c
+      (Red Yes)
+      (Blue Yes)
+      (_ No))))
+
+(defn primary-to-i32 ((p : Primary)) : i32
+  (match p
+    (Yes 1) (No 0)))
+
+(defn main ()
+  (let (((r : Primary) (from Red)))
+    (println (primary-to-i32 r)))
+  (let (((g : Primary) (from Green)))
+    (println (primary-to-i32 g)))
+  (let (((b : Primary) (from Blue)))
+    (println (primary-to-i32 b))))

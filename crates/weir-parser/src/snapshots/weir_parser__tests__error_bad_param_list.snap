@@ -1,0 +1,11 @@
+---
+source: crates/weir-parser/src/lib.rs
+assertion_line: 1566
+expression: result
+---
+ERRORS:
+  11:13: expected parameter, found Some(Int(42))
+  11:13: expected RParen, found Some(Int(42))
+  11:13: expected ')' to close top-level form
+  15:16: expected '(' to start a top-level form
+  16:17: expected '(' to start a top-level form

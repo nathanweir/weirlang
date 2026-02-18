@@ -11,6 +11,8 @@ use weir_ast::*;
 pub struct InterpError {
     pub message: String,
     pub span: Option<Span>,
+    /// If set, this error is an early return from a `?` operator.
+    pub early_return: Option<Box<Value>>,
 }
 
 impl InterpError {
@@ -18,6 +20,7 @@ impl InterpError {
         Self {
             message: message.into(),
             span: None,
+            early_return: None,
         }
     }
 
@@ -25,6 +28,15 @@ impl InterpError {
         Self {
             message: message.into(),
             span: Some(span),
+            early_return: None,
+        }
+    }
+
+    fn early_ret(value: Value) -> Self {
+        Self {
+            message: String::new(),
+            span: None,
+            early_return: Some(Box::new(value)),
         }
     }
 }
@@ -700,8 +712,29 @@ impl<'a> Interpreter<'a> {
             ExprKind::Unsafe { body } => self.eval_body(env, body),
 
             ExprKind::Try(inner) => {
-                // No error handling yet, just evaluate
-                self.eval_expr(env, *inner)
+                let value = self.eval_expr(env, *inner)?;
+                match &value {
+                    Value::Constructor {
+                        variant_name,
+                        args,
+                        arity,
+                        ..
+                    } if variant_name == "Ok" && *arity == 1 && args.len() == 1 => {
+                        Ok(args[0].clone())
+                    }
+                    Value::Constructor {
+                        variant_name,
+                        arity,
+                        args,
+                        ..
+                    } if variant_name == "Err" && *arity == 1 && args.len() == 1 => {
+                        Err(InterpError::early_ret(value))
+                    }
+                    _ => Err(InterpError::with_span(
+                        format!("? operator requires a Result value, got {}", value),
+                        span,
+                    )),
+                }
             }
         }
     }
@@ -745,7 +778,11 @@ impl<'a> Interpreter<'a> {
                 for (param, arg) in params.iter().zip(args.iter()) {
                     call_env.define(param.clone(), arg.clone(), false);
                 }
-                self.eval_body(&call_env, body)
+                match self.eval_body(&call_env, body) {
+                    Ok(val) => Ok(val),
+                    Err(e) if e.early_return.is_some() => Ok(*e.early_return.unwrap()),
+                    Err(e) => Err(e),
+                }
             }
 
             Value::Constructor {
@@ -1867,6 +1904,8 @@ mod tests {
 
     // ── Fixture-based end-to-end tests ───────────────────────────
 
+    const PRELUDE_SOURCE: &str = include_str!("../../../std/prelude.weir");
+
     fn run_fixture(name: &str) -> String {
         let path = format!(
             "{}/tests/fixtures/{}.weir",
@@ -1875,6 +1914,7 @@ mod tests {
         );
         let source = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("could not read fixture {}: {}", path, e));
+        let source = format!("{}\n{}", PRELUDE_SOURCE, source);
         let expanded = weir_macros::expand(&source);
         assert!(
             expanded.errors.is_empty(),
@@ -2038,5 +2078,178 @@ mod tests {
         (Some 6)
         None
         ");
+    }
+
+    #[test]
+    fn test_from_enum() {
+        let output = run_ok(
+            "(deftype Color Red Green Blue)
+             (deftype Primary Yes No)
+             (defclass (From 'a 'b)
+               (from : (Fn ['a] 'b)))
+             (instance (From Color Primary)
+               (defn from ((c : Color)) : Primary
+                 (match c
+                   (Red Yes)
+                   (Blue Yes)
+                   (_ No))))
+             (defn primary-to-i32 ((p : Primary)) : i32
+               (match p (Yes 1) (No 0)))
+             (defn main ()
+               (let (((r : Primary) (from Red)))
+                 (println (primary-to-i32 r)))
+               (let (((g : Primary) (from Green)))
+                 (println (primary-to-i32 g))))",
+        );
+        assert_eq!(output, "1\n0\n");
+    }
+
+    #[test]
+    fn fixture_typeclasses_from() {
+        insta::assert_snapshot!(run_fixture("typeclasses-from"), @r"
+        1
+        0
+        1
+        ");
+    }
+
+    // ── Result type + ? operator tests ──────────────────────────
+
+    #[test]
+    fn test_result_ok_err() {
+        let output = run_ok(
+            "(deftype (Result 'ok 'err) (Ok 'ok) (Err 'err))
+             (defn unwrap ((r : (Result i32 i32))) : i32
+               (match r
+                 ((Ok val) val)
+                 ((Err _) 0)))
+             (defn main ()
+               (println (unwrap (Ok 42)))
+               (println (unwrap (Err 99))))",
+        );
+        assert_eq!(output, "42\n0\n");
+    }
+
+    #[test]
+    fn test_try_operator_ok() {
+        let output = run_ok(
+            "(deftype (Result 'ok 'err) (Ok 'ok) (Err 'err))
+             (defn try-it () : (Result i32 i32)
+               (let ((x (Ok 42)?))
+                 (Ok (+ x 1))))
+             (defn unwrap ((r : (Result i32 i32))) : i32
+               (match r
+                 ((Ok val) val)
+                 ((Err _) 0)))
+             (defn main () (println (unwrap (try-it))))",
+        );
+        assert_eq!(output, "43\n");
+    }
+
+    #[test]
+    fn test_try_operator_err_propagates() {
+        let output = run_ok(
+            "(deftype (Result 'ok 'err) (Ok 'ok) (Err 'err))
+             (defn fail () : (Result i32 i32) (Err 99))
+             (defn try-it () : (Result i32 i32)
+               (let ((x (fail)?))
+                 (Ok (+ x 1))))
+             (defn unwrap-or ((r : (Result i32 i32)) (default : i32)) : i32
+               (match r
+                 ((Ok val) val)
+                 ((Err _) default)))
+             (defn main () (println (unwrap-or (try-it) 0)))",
+        );
+        assert_eq!(output, "0\n");
+    }
+
+    #[test]
+    fn fixture_result() {
+        insta::assert_snapshot!(run_fixture("result"), @r"
+        5
+        99
+        6
+        99
+        ");
+    }
+
+    // ── Error path tests ────────────────────────────────────────
+
+    #[test]
+    fn test_error_division_by_zero_int() {
+        let result = run("(defn main () (println (/ 10 0)))");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("division by zero"));
+    }
+
+    #[test]
+    fn test_error_division_by_zero_float() {
+        let result = run("(defn main () (println (/ 10.0 0.0)))");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("division by zero"));
+    }
+
+    #[test]
+    fn test_error_mod_by_zero() {
+        let result = run("(defn main () (println (mod 10 0)))");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("division by zero"));
+    }
+
+    #[test]
+    fn test_error_wrong_arg_count() {
+        // Bypass typeck by calling with wrong args at runtime via closure indirection
+        let result = run(
+            "(defn f ((x : i32) (y : i32)) : i32 (+ x y))
+             (defn main () (println (f 1)))",
+        );
+        // This may be caught by typeck or interp — either way it should error
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_error_non_exhaustive_match() {
+        let result = run(
+            "(deftype Color Red Green Blue)
+             (defn describe ((c : Color)) : i32
+               (match c
+                 ((Red) 1)
+                 ((Green) 2)))
+             (defn main () (println (describe Blue)))",
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err().message;
+        assert!(
+            msg.contains("no matching pattern"),
+            "expected 'no matching pattern' error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_error_set_undefined_variable() {
+        let result = run("(defn main () (set! x 42))");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().message;
+        assert!(
+            msg.contains("undefined") || msg.contains("not defined"),
+            "expected undefined variable error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_error_subtract_non_numeric() {
+        let result = run(
+            "(defn main () (println (- true false)))",
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_error_len_wrong_args() {
+        let result = run("(defn main () (println (len 1 2)))");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("len requires 1 argument"));
     }
 }

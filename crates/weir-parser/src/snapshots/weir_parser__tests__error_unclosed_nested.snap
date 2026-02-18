@@ -1,0 +1,7 @@
+---
+source: crates/weir-parser/src/lib.rs
+assertion_line: 1578
+expression: result
+---
+ERRORS:
+  1:3: expected top-level form (defn, deftype, ...), found Some(Symbol("if"))

@@ -477,6 +477,9 @@ struct TypeChecker<'a> {
     /// Known symbol names from other workspace files.
     /// Variables/constructors in this set produce fresh type variables instead of errors.
     external_names: HashSet<SmolStr>,
+
+    /// Return type of the function currently being checked (for `?` operator).
+    current_fn_return_type: Option<Ty>,
 }
 
 impl<'a> TypeChecker<'a> {
@@ -499,6 +502,7 @@ impl<'a> TypeChecker<'a> {
             expr_types: ArenaMap::default(),
             method_resolutions: HashMap::new(),
             external_names: externals.clone(),
+            current_fn_return_type: None,
         }
     }
 
@@ -905,7 +909,10 @@ impl<'a> TypeChecker<'a> {
             "String" => Ty::Str,
             "Unit" => Ty::Unit,
             _ => {
-                if self.type_defs.contains_key(name) || self.struct_defs.contains_key(name) {
+                if self.type_defs.contains_key(name)
+                    || self.struct_defs.contains_key(name)
+                    || self.external_names.contains(name)
+                {
                     Ty::Con(SmolStr::new(name), vec![])
                 } else {
                     self.error(format!("undefined type '{}'", name), span);
@@ -1328,6 +1335,23 @@ impl<'a> TypeChecker<'a> {
             }
         }
 
+        // Orphan check: in cross-file mode, either the class or at least one
+        // type argument must be defined in this file.
+        if !self.external_names.is_empty() && self.external_names.contains(&d.class_name) {
+            let has_local_type = instance_type_args.iter().any(|ty| self.is_type_local(ty));
+            if !has_local_type {
+                self.error(
+                    format!(
+                        "orphan instance: neither class '{}' nor its type arguments are defined in this file",
+                        d.class_name
+                    ),
+                    d.span,
+                );
+                self.type_param_scope = saved;
+                return;
+            }
+        }
+
         // Build the type param mapping from class params to instance types
         let class_param_mapping: HashMap<SmolStr, Ty> = class_def
             .type_params
@@ -1549,6 +1573,32 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// Check whether a type is "local" to the current file for orphan-rule purposes.
+    /// Primitives are always local, type constructors are local if defined in this file,
+    /// and type variables are considered local (polymorphic instances aren't rejected).
+    fn is_type_local(&self, ty: &Ty) -> bool {
+        match ty {
+            Ty::I8
+            | Ty::I16
+            | Ty::I32
+            | Ty::I64
+            | Ty::U8
+            | Ty::U16
+            | Ty::U32
+            | Ty::U64
+            | Ty::F32
+            | Ty::F64
+            | Ty::Bool
+            | Ty::Str
+            | Ty::Unit => true,
+            Ty::Con(name, _) => {
+                self.type_defs.contains_key(name) || self.struct_defs.contains_key(name)
+            }
+            Ty::Var(_) => true,
+            _ => false,
+        }
+    }
+
     fn register_builtin_schemes(&mut self) {
         // Builtins use fresh vars at each call site, handled in check_call
         // We just need to register names so they don't show as "undefined"
@@ -1641,6 +1691,10 @@ impl<'a> TypeChecker<'a> {
 
         self.push_scope();
 
+        // Set current function return type for ? operator checking
+        let prev_return_type = self.current_fn_return_type.take();
+        self.current_fn_return_type = Some(scheme.return_type.clone());
+
         // Bind parameters
         for (param, ty) in d.params.iter().zip(scheme.param_types.iter()) {
             self.define_var(param.name.clone(), ty.clone());
@@ -1653,6 +1707,9 @@ impl<'a> TypeChecker<'a> {
         if !d.body.is_empty() {
             self.unify(&body_ty, &scheme.return_type, d.span);
         }
+
+        // Restore previous return type
+        self.current_fn_return_type = prev_return_type;
 
         self.pop_scope();
 
@@ -2008,8 +2065,75 @@ impl<'a> TypeChecker<'a> {
             ExprKind::Unsafe { body } => self.check_body(body),
 
             ExprKind::Try(inner) => {
-                // For now, just check the inner expression
-                self.check_expr(*inner)
+                let inner_ty = self.check_expr(*inner);
+                let applied = self.apply(&inner_ty);
+
+                // Verify the inner expression is a Result type
+                match &applied {
+                    Ty::Con(name, args) if name == "Result" && args.len() == 2 => {
+                        let ok_ty = args[0].clone();
+                        let err_ty = args[1].clone();
+
+                        // Verify enclosing function returns a Result with matching error type
+                        if let Some(ret_ty) = &self.current_fn_return_type {
+                            let ret_applied = self.apply(ret_ty);
+                            match &ret_applied {
+                                Ty::Con(rname, rargs) if rname == "Result" && rargs.len() == 2 => {
+                                    self.unify(&err_ty, &rargs[1], span);
+                                }
+                                Ty::Var(_) => {
+                                    // Return type not yet resolved — unify with Result
+                                    let fresh_ok = self.fresh_var();
+                                    let result_ty = Ty::Con(
+                                        SmolStr::new("Result"),
+                                        vec![fresh_ok, err_ty.clone()],
+                                    );
+                                    self.unify(&ret_applied, &result_ty, span);
+                                }
+                                _ => {
+                                    self.error(
+                                        format!(
+                                            "? operator requires enclosing function to return Result, got {}",
+                                            ret_applied
+                                        ),
+                                        span,
+                                    );
+                                }
+                            }
+                        } else {
+                            self.error("? operator used outside of a function", span);
+                        }
+
+                        ok_ty
+                    }
+                    Ty::Var(_) => {
+                        // Type not yet resolved — constrain it to be Result
+                        let ok_ty = self.fresh_var();
+                        let err_ty = self.fresh_var();
+                        let result_ty =
+                            Ty::Con(SmolStr::new("Result"), vec![ok_ty.clone(), err_ty.clone()]);
+                        self.unify(&applied, &result_ty, span);
+
+                        // Also constrain enclosing function return type
+                        if let Some(ret_ty) = &self.current_fn_return_type {
+                            let ret_applied = self.apply(ret_ty);
+                            let fresh_ok2 = self.fresh_var();
+                            let ret_result =
+                                Ty::Con(SmolStr::new("Result"), vec![fresh_ok2, err_ty]);
+                            self.unify(&ret_applied, &ret_result, span);
+                        }
+
+                        ok_ty
+                    }
+                    Ty::Error => Ty::Error,
+                    _ => {
+                        self.error(
+                            format!("? operator requires a Result type, got {}", applied),
+                            span,
+                        );
+                        Ty::Error
+                    }
+                }
             }
         }
     }
@@ -3232,5 +3356,223 @@ mod tests {
             &["remote-fn"],
         );
         assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+    }
+
+    // ── Orphan instance coherence ─────────────────────────────────
+
+    #[test]
+    fn orphan_instance_class_local_ok() {
+        // Class defined locally, type is external → allowed (class owner)
+        let errors = check_with_ext(
+            "(defclass (MyClass 'a)
+               (my-method : (Fn ['a] i32)))
+             (instance (MyClass ExternalType)
+               (defn my-method ((x : ExternalType)) : i32 42))
+             (defn main () 0)",
+            &["ExternalType"],
+        );
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+    }
+
+    #[test]
+    fn orphan_instance_type_local_ok() {
+        // Class is external, type defined locally → allowed (type owner)
+        let errors = check_with_ext(
+            "(deftype Color Red Green Blue)
+             (defclass (Show 'a)
+               (show : (Fn ['a] i32)))
+             (instance (Show Color)
+               (defn show ((c : Color)) : i32 0))
+             (defn main () 0)",
+            &["Show"],
+        );
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+    }
+
+    #[test]
+    fn orphan_instance_primitive_ok() {
+        // Class is external, type is i32 (primitive) → allowed
+        let errors = check_with_ext(
+            "(defclass (Show 'a)
+               (show : (Fn ['a] i32)))
+             (instance (Show i32)
+               (defn show ((x : i32)) : i32 x))
+             (defn main () 0)",
+            &["Show"],
+        );
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+    }
+
+    #[test]
+    fn orphan_instance_rejected() {
+        // Class is external, type is external → orphan
+        let errors = check_with_ext(
+            "(defclass (Show 'a)
+               (show : (Fn ['a] i32)))
+             (instance (Show ExternalType)
+               (defn show ((x : ExternalType)) : i32 42))
+             (defn main () 0)",
+            &["Show", "ExternalType"],
+        );
+        assert!(!errors.is_empty());
+        assert!(
+            errors[0].message.contains("orphan instance"),
+            "expected 'orphan instance', got: {}",
+            errors[0].message
+        );
+    }
+
+    #[test]
+    fn orphan_rule_single_file_no_check() {
+        // No externals → single-file mode → always passes
+        let errors = check_with_ext(
+            "(defclass (Show 'a)
+               (show : (Fn ['a] i32)))
+             (instance (Show i32)
+               (defn show ((x : i32)) : i32 x))
+             (defn main () 0)",
+            &[],
+        );
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+    }
+
+    // ── From typeclass ────────────────────────────────────────────
+
+    #[test]
+    fn from_typeclass_resolves() {
+        check_ok(
+            "(deftype Color Red Green Blue)
+             (deftype Primary Yes No)
+             (defclass (From 'a 'b)
+               (from : (Fn ['a] 'b)))
+             (instance (From Color Primary)
+               (defn from ((c : Color)) : Primary
+                 (match c
+                   (Red Yes)
+                   (Blue Yes)
+                   (_ No))))
+             (defn main ()
+               (let (((r : Primary) (from Red)))
+                 (println r)))",
+        );
+    }
+
+    #[test]
+    fn from_typeclass_missing_instance_error() {
+        let msg = check_err(
+            "(deftype Color Red Green Blue)
+             (deftype Primary Yes No)
+             (defclass (From 'a 'b)
+               (from : (Fn ['a] 'b)))
+             (defn main ()
+               (let (((r : Primary) (from Red)))
+                 (println r)))",
+        );
+        assert!(
+            msg.contains("no instance"),
+            "expected 'no instance' error, got: {}",
+            msg
+        );
+    }
+
+    // ── Result type + ? operator tests ──────────────────────────
+
+    #[test]
+    fn result_type_basic() {
+        check_ok(
+            "(deftype (Result 'ok 'err) (Ok 'ok) (Err 'err))
+             (defn wrap ((x : i32)) : (Result i32 i32) (Ok x))
+             (defn unwrap ((r : (Result i32 i32))) : i32
+               (match r
+                 ((Ok val) val)
+                 ((Err _) 0)))
+             (defn main () (println (unwrap (wrap 42))))",
+        );
+    }
+
+    #[test]
+    fn try_operator_unwraps_ok() {
+        check_ok(
+            "(deftype (Result 'ok 'err) (Ok 'ok) (Err 'err))
+             (defn safe-div ((x : i32) (y : i32)) : (Result i32 i32)
+               (if (= y 0) (Err y) (Ok (/ x y))))
+             (defn use-try ((x : i32) (y : i32)) : (Result i32 i32)
+               (let ((result (safe-div x y)?))
+                 (Ok (+ result 1))))
+             (defn main () (println 0))",
+        );
+    }
+
+    #[test]
+    fn try_operator_error_on_non_result() {
+        let msg = check_err(
+            "(deftype (Result 'ok 'err) (Ok 'ok) (Err 'err))
+             (defn id ((x : i32)) : i32 x)
+             (defn bad ((x : i32)) : (Result i32 i32) (let ((y (id x)?)) (Ok y)))
+             (defn main () (println 0))",
+        );
+        assert!(
+            msg.contains("? operator requires a Result type"),
+            "expected '? operator requires a Result type' error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn try_operator_error_type_must_match() {
+        let msg = check_err(
+            "(deftype (Result 'ok 'err) (Ok 'ok) (Err 'err))
+             (defn f () : (Result i32 Bool) (Ok 42))
+             (defn g () : (Result i32 i32) (let ((x (f)?)) (Ok x)))
+             (defn main () (println 0))",
+        );
+        assert!(
+            msg.contains("type mismatch"),
+            "expected type mismatch error, got: {}",
+            msg
+        );
+    }
+
+    // ── Type-error fixture tests ────────────────────────────────
+
+    fn fixture_check_err(name: &str) -> String {
+        let path = format!(
+            "{}/tests/fixtures/type-errors/{}.weir",
+            env!("CARGO_MANIFEST_DIR").replace("/crates/weir-typeck", ""),
+            name
+        );
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("could not read fixture {}: {}", path, e));
+        check_err(&source)
+    }
+
+    #[test]
+    fn fixture_type_error_mismatched_return() {
+        let msg = fixture_check_err("mismatched-return");
+        assert!(
+            msg.contains("type mismatch"),
+            "expected type mismatch error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn fixture_type_error_non_exhaustive_match() {
+        let msg = fixture_check_err("non-exhaustive-match");
+        assert!(
+            msg.contains("non-exhaustive"),
+            "expected non-exhaustive match error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn fixture_type_error_unknown_variable() {
+        let msg = fixture_check_err("unknown-variable");
+        assert!(
+            msg.contains("undefined variable"),
+            "expected undefined variable error, got: {}",
+            msg
+        );
     }
 }

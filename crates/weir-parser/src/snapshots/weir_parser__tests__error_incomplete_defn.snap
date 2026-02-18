@@ -1,0 +1,7 @@
+---
+source: crates/weir-parser/src/lib.rs
+assertion_line: 1548
+expression: result
+---
+ERRORS:
+  5:6: expected symbol, found Some(RParen)

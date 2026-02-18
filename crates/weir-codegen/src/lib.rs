@@ -124,7 +124,7 @@ int main(void) { weir_main(); return 0; }
 
 // ── Type mapping ─────────────────────────────────────────────────
 
-fn ty_to_cl_with(ty: &Ty, simple_enums: Option<&HashMap<SmolStr, SimpleEnum>>) -> Option<Type> {
+fn ty_to_cl_with(ty: &Ty, tagged_adts: Option<&HashMap<SmolStr, TaggedAdt>>) -> Option<Type> {
     match ty {
         Ty::I8 | Ty::U8 | Ty::Bool => Some(types::I8),
         Ty::I16 | Ty::U16 => Some(types::I16),
@@ -133,10 +133,10 @@ fn ty_to_cl_with(ty: &Ty, simple_enums: Option<&HashMap<SmolStr, SimpleEnum>>) -
         Ty::F32 => Some(types::F32),
         Ty::F64 => Some(types::F64),
         Ty::Unit => None, // void — no value
-        Ty::Con(name, args) if args.is_empty() => {
-            if let Some(enums) = simple_enums {
-                if enums.contains_key(name) {
-                    return Some(types::I8); // tag-only representation
+        Ty::Con(name, _) => {
+            if let Some(adts) = tagged_adts {
+                if adts.contains_key(name) {
+                    return Some(types::I64); // packed tag+payload representation
                 }
             }
             None
@@ -280,12 +280,29 @@ pub fn build_executable(
     Ok(())
 }
 
-/// A simple enum type: all nullary constructors, represented as an i8 tag.
+/// Info about a constructor variant for codegen.
 #[derive(Clone, Debug)]
-struct SimpleEnum {
+struct ConstructorInfo {
+    #[allow(dead_code)]
+    type_name: SmolStr,
+    tag: i64,
+    /// Whether this constructor carries a payload (1 field).
+    has_payload: bool,
+    /// If has_payload, the index of the type parameter that the field references.
+    /// E.g., for `(Ok 'ok)` in `(deftype (Result 'ok 'err) ...)`, this is 0.
+    /// None if the field type is a concrete type (not a type parameter).
+    field_type_param_index: Option<usize>,
+}
+
+/// A tagged ADT type: all variants have 0 or 1 fields, represented as packed i64.
+#[derive(Clone, Debug)]
+struct TaggedAdt {
     /// Ordered list of variant names; tag = index in this list.
     #[allow(dead_code)]
     variants: Vec<SmolStr>,
+    /// For each variant, the number of fields (0 or 1).
+    #[allow(dead_code)]
+    field_counts: Vec<usize>,
 }
 
 struct Compiler<'a, M: Module> {
@@ -297,28 +314,56 @@ struct Compiler<'a, M: Module> {
     user_fns: HashMap<SmolStr, (FuncId, Vec<Ty>, Ty)>,
     /// Maps runtime helper name -> FuncId
     runtime_fns: HashMap<&'static str, FuncId>,
-    /// Simple enum types: type_name -> SimpleEnum
-    simple_enums: HashMap<SmolStr, SimpleEnum>,
-    /// Constructor name -> (type_name, tag index)
-    constructor_tags: HashMap<SmolStr, (SmolStr, i64)>,
+    /// Tagged ADT types (including simple enums): type_name -> TaggedAdt
+    tagged_adts: HashMap<SmolStr, TaggedAdt>,
+    /// Constructor name -> ConstructorInfo
+    constructor_tags: HashMap<SmolStr, ConstructorInfo>,
 }
 
 impl<'a, M: Module> Compiler<'a, M> {
     fn new(ast_module: &'a weir_ast::Module, type_info: &'a TypeCheckResult, module: M) -> Self {
-        let mut simple_enums = HashMap::new();
+        let mut tagged_adts = HashMap::new();
         let mut constructor_tags = HashMap::new();
 
-        // Collect simple enums from deftype definitions
+        // Collect tagged ADTs from deftype definitions (all variants with 0 or 1 fields)
         for (item, _span) in &ast_module.items {
             if let Item::Deftype(d) = item {
-                let all_nullary = d.variants.iter().all(|v| v.fields.is_empty());
-                if all_nullary && !d.variants.is_empty() {
+                let all_supported =
+                    !d.variants.is_empty() && d.variants.iter().all(|v| v.fields.len() <= 1);
+                if all_supported {
                     let variants: Vec<SmolStr> =
                         d.variants.iter().map(|v| v.name.clone()).collect();
-                    for (i, v) in variants.iter().enumerate() {
-                        constructor_tags.insert(v.clone(), (d.name.clone(), i as i64));
+                    let field_counts: Vec<usize> =
+                        d.variants.iter().map(|v| v.fields.len()).collect();
+                    for (i, v) in d.variants.iter().enumerate() {
+                        let field_type_param_index = if v.fields.len() == 1 {
+                            // Look up the field's type expression to find which type param it references
+                            let field_texpr = &ast_module.type_exprs[v.fields[0]];
+                            if let weir_ast::TypeExprKind::TypeVar(tvar_name) = &field_texpr.kind {
+                                d.type_params.iter().position(|p| p == tvar_name)
+                            } else {
+                                None // concrete type, not a type parameter
+                            }
+                        } else {
+                            None
+                        };
+                        constructor_tags.insert(
+                            v.name.clone(),
+                            ConstructorInfo {
+                                type_name: d.name.clone(),
+                                tag: i as i64,
+                                has_payload: !v.fields.is_empty(),
+                                field_type_param_index,
+                            },
+                        );
                     }
-                    simple_enums.insert(d.name.clone(), SimpleEnum { variants });
+                    tagged_adts.insert(
+                        d.name.clone(),
+                        TaggedAdt {
+                            variants,
+                            field_counts,
+                        },
+                    );
                 }
             }
         }
@@ -329,7 +374,7 @@ impl<'a, M: Module> Compiler<'a, M> {
             module,
             user_fns: HashMap::new(),
             runtime_fns: HashMap::new(),
-            simple_enums,
+            tagged_adts,
             constructor_tags,
         }
     }
@@ -401,7 +446,7 @@ impl<'a, M: Module> Compiler<'a, M> {
     // ── Pass 1: declare all user function signatures ────────────
 
     fn ty_cl(&self, ty: &Ty) -> Option<Type> {
-        ty_to_cl_with(ty, Some(&self.simple_enums))
+        ty_to_cl_with(ty, Some(&self.tagged_adts))
     }
 
     fn declare_user_functions(&mut self, linkage: Linkage) -> Result<(), CodegenError> {
@@ -575,9 +620,9 @@ impl<'a, M: Module> Compiler<'a, M> {
                 "Bool" | "bool" => Ok(Ty::Bool),
                 "Unit" => Ok(Ty::Unit),
                 other => {
-                    // Check if it's a simple enum type
+                    // Check if it's a tagged ADT type
                     let name_smol = SmolStr::new(other);
-                    if self.simple_enums.contains_key(&name_smol) {
+                    if self.tagged_adts.contains_key(&name_smol) {
                         Ok(Ty::Con(name_smol, vec![]))
                     } else {
                         Err(CodegenError::new(format!(
@@ -587,6 +632,30 @@ impl<'a, M: Module> Compiler<'a, M> {
                     }
                 }
             },
+            TypeExprKind::Applied { constructor, args } => {
+                let con_expr = &self.ast_module.type_exprs[*constructor];
+                match &con_expr.kind {
+                    TypeExprKind::Named(name) => {
+                        let name_smol = SmolStr::new(name.as_str());
+                        if self.tagged_adts.contains_key(&name_smol) {
+                            // Resolve args (for type checking), but the runtime rep is just i64
+                            let mut arg_tys = Vec::new();
+                            for &arg_id in args {
+                                arg_tys.push(self.resolve_type_expr_to_ty(arg_id)?);
+                            }
+                            Ok(Ty::Con(name_smol, arg_tys))
+                        } else {
+                            Err(CodegenError::new(format!(
+                                "unsupported parameterized type '{}' for codegen",
+                                name
+                            )))
+                        }
+                    }
+                    _ => Err(CodegenError::new(
+                        "complex type expressions not yet supported in codegen",
+                    )),
+                }
+            }
             _ => Err(CodegenError::new(
                 "complex type expressions not yet supported in codegen",
             )),
@@ -696,15 +765,15 @@ impl<'a, M: Module> Compiler<'a, M> {
             .ok_or_else(|| CodegenError::new(format!("unknown function '{}'", lookup_name)))?
             .clone();
 
-        let enums = &self.simple_enums;
+        let adts = &self.tagged_adts;
         let mut sig = self.module.make_signature();
         sig.call_conv = CallConv::SystemV;
         for pty in &param_tys {
-            if let Some(cl_ty) = ty_to_cl_with(pty, Some(enums)) {
+            if let Some(cl_ty) = ty_to_cl_with(pty, Some(adts)) {
                 sig.params.push(AbiParam::new(cl_ty));
             }
         }
-        if let Some(cl_ty) = ty_to_cl_with(&ret_ty, Some(enums)) {
+        if let Some(cl_ty) = ty_to_cl_with(&ret_ty, Some(adts)) {
             sig.returns.push(AbiParam::new(cl_ty));
         }
 
@@ -730,7 +799,7 @@ impl<'a, M: Module> Compiler<'a, M> {
                 vars: HashMap::new(),
                 fn_table_slots,
                 table_data_id,
-                simple_enums: &self.simple_enums,
+                tagged_adts: &self.tagged_adts,
                 constructor_tags: &self.constructor_tags,
             };
 
@@ -816,15 +885,15 @@ struct FnCompileCtx<'a, 'b, M: Module> {
     fn_table_slots: Option<&'a HashMap<SmolStr, usize>>,
     /// Data ID for the function table base pointer (used with indirect dispatch).
     table_data_id: Option<DataId>,
-    /// Simple enum types (from Compiler)
-    simple_enums: &'a HashMap<SmolStr, SimpleEnum>,
-    /// Constructor name -> (type_name, tag index)
-    constructor_tags: &'a HashMap<SmolStr, (SmolStr, i64)>,
+    /// Tagged ADT types (from Compiler)
+    tagged_adts: &'a HashMap<SmolStr, TaggedAdt>,
+    /// Constructor name -> ConstructorInfo
+    constructor_tags: &'a HashMap<SmolStr, ConstructorInfo>,
 }
 
 impl<M: Module> FnCompileCtx<'_, '_, M> {
     fn ty_cl(&self, ty: &Ty) -> Option<Type> {
-        ty_to_cl_with(ty, Some(self.simple_enums))
+        ty_to_cl_with(ty, Some(self.tagged_adts))
     }
 
     fn declare_variable(&mut self, cl_ty: Type) -> Variable {
@@ -876,9 +945,17 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
             ExprKind::Var(name) => {
                 if let Some((var, _ty)) = self.vars.get(name) {
                     Ok(Some(self.builder.use_var(*var)))
-                } else if let Some((_type_name, tag)) = self.constructor_tags.get(name) {
-                    // Nullary constructor — emit its tag as an i8 constant
-                    Ok(Some(self.builder.ins().iconst(types::I8, *tag)))
+                } else if let Some(info) = self.constructor_tags.get(name) {
+                    if info.has_payload {
+                        // Data-carrying constructor referenced without args — error
+                        Err(CodegenError::new(format!(
+                            "constructor '{}' requires an argument",
+                            name
+                        )))
+                    } else {
+                        // Nullary constructor — emit its tag as an i64 constant
+                        Ok(Some(self.builder.ins().iconst(types::I64, info.tag)))
+                    }
                 } else {
                     Err(CodegenError::new(format!(
                         "undefined variable '{}' in codegen",
@@ -956,6 +1033,8 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
 
             ExprKind::Ann { expr, .. } => self.compile_expr(*expr, &resolved_ty),
 
+            ExprKind::Try(inner) => self.compile_try(*inner, &resolved_ty),
+
             _ => Err(CodegenError::new(format!(
                 "unsupported expression kind in codegen: {:?}",
                 std::mem::discriminant(&expr.kind)
@@ -1028,6 +1107,43 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                     } else {
                         return Ok(None);
                     }
+                }
+            }
+
+            // Check if this is a constructor call
+            if let Some(info) = self.constructor_tags.get(name) {
+                if info.has_payload {
+                    if args.len() != 1 {
+                        return Err(CodegenError::new(format!(
+                            "constructor '{}' expects 1 argument, got {}",
+                            name,
+                            args.len()
+                        )));
+                    }
+                    let arg_ty = self.expr_ty(args[0].value);
+                    let payload = self.compile_expr(args[0].value, &arg_ty)?.unwrap();
+                    // Promote payload to i64
+                    let payload_i64 = match self.ty_cl(&arg_ty) {
+                        Some(t) if t == types::I8 || t == types::I16 || t == types::I32 => {
+                            self.builder.ins().sextend(types::I64, payload)
+                        }
+                        Some(t) if t == types::I64 => payload,
+                        _ => {
+                            // Payload is itself an ADT (packed i64) — use directly
+                            payload
+                        }
+                    };
+                    let tag = info.tag;
+                    let shifted = {
+                        let eight = self.builder.ins().iconst(types::I64, 8);
+                        self.builder.ins().ishl(payload_i64, eight)
+                    };
+                    let tag_val = self.builder.ins().iconst(types::I64, tag);
+                    let packed = self.builder.ins().bor(shifted, tag_val);
+                    return Ok(Some(packed));
+                } else {
+                    // Nullary constructor called as (None) — emit tag
+                    return Ok(Some(self.builder.ins().iconst(types::I64, info.tag)));
                 }
             }
 
@@ -1617,7 +1733,7 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
         Ok(())
     }
 
-    // ── Match (simple enums) ──────────────────────────────────
+    // ── Match (tagged ADTs) ────────────────────────────────────
 
     fn compile_match(
         &mut self,
@@ -1642,18 +1758,30 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
             let is_last = i == arms.len() - 1;
 
             match &pat.kind {
-                PatternKind::Constructor { name, args } if args.is_empty() => {
-                    let tag = self
+                PatternKind::Constructor { name, args } => {
+                    let info = self
                         .constructor_tags
                         .get(name)
-                        .map(|(_, t)| *t)
                         .ok_or_else(|| {
                             CodegenError::new(format!("unknown constructor '{}' in match", name))
-                        })?;
+                        })?
+                        .clone();
+
+                    // Extract tag from scrutinee: tag = scrutinee & 0xFF
+                    let mask = self.builder.ins().iconst(types::I64, 0xFF);
+                    let extracted_tag = self.builder.ins().band(scrut_val, mask);
+
+                    // Compute payload type for data-carrying constructors
+                    let payload_ty = Self::constructor_payload_ty(&info, &scrut_ty);
 
                     if is_last {
-                        // Last constructor arm — guaranteed to match by exhaustiveness.
-                        // Compile body directly in current block (no branch needed).
+                        // Last arm — compile body directly, binding payload if needed
+                        if info.has_payload && args.len() == 1 {
+                            let sub_pat = &self.ast_module.patterns[args[0]];
+                            let eight = self.builder.ins().iconst(types::I64, 8);
+                            let payload = self.builder.ins().sshr(scrut_val, eight);
+                            self.bind_pattern_var(&sub_pat.kind, payload, &payload_ty)?;
+                        }
                         let body_val = self.compile_body(&arm.body, result_ty)?;
                         if has_value {
                             let val = body_val.unwrap_or_else(|| self.zero_value(result_ty));
@@ -1666,8 +1794,11 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                     } else {
                         let arm_block = self.builder.create_block();
                         let next_block = self.builder.create_block();
-                        let tag_val = self.builder.ins().iconst(types::I8, tag);
-                        let cmp = self.builder.ins().icmp(IntCC::Equal, scrut_val, tag_val);
+                        let tag_val = self.builder.ins().iconst(types::I64, info.tag);
+                        let cmp = self
+                            .builder
+                            .ins()
+                            .icmp(IntCC::Equal, extracted_tag, tag_val);
                         self.builder
                             .ins()
                             .brif(cmp, arm_block, &[], next_block, &[]);
@@ -1675,6 +1806,15 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                         // Compile arm body
                         self.builder.switch_to_block(arm_block);
                         self.builder.seal_block(arm_block);
+
+                        // Extract payload and bind if data-carrying
+                        if info.has_payload && args.len() == 1 {
+                            let sub_pat = &self.ast_module.patterns[args[0]];
+                            let eight = self.builder.ins().iconst(types::I64, 8);
+                            let payload = self.builder.ins().sshr(scrut_val, eight);
+                            self.bind_pattern_var(&sub_pat.kind, payload, &payload_ty)?;
+                        }
+
                         let body_val = self.compile_body(&arm.body, result_ty)?;
                         if has_value {
                             let val = body_val.unwrap_or_else(|| self.zero_value(result_ty));
@@ -1742,6 +1882,100 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
             Ok(Some(result))
         } else {
             Ok(None)
+        }
+    }
+
+    // ── Try operator (?) ──────────────────────────────────────
+
+    fn compile_try(
+        &mut self,
+        inner: ExprId,
+        result_ok_ty: &Ty,
+    ) -> Result<Option<Value>, CodegenError> {
+        let inner_ty = self.expr_ty(inner);
+        let result_val = self.compile_expr(inner, &inner_ty)?.unwrap();
+
+        // Extract tag: tag = result & 0xFF
+        let mask = self.builder.ins().iconst(types::I64, 0xFF);
+        let tag = self.builder.ins().band(result_val, mask);
+
+        // Ok tag is 0 (first variant in (deftype (Result 'ok 'err) (Ok 'ok) (Err 'err)))
+        let zero = self.builder.ins().iconst(types::I64, 0);
+        let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, zero);
+
+        let ok_block = self.builder.create_block();
+        let err_block = self.builder.create_block();
+
+        self.builder
+            .ins()
+            .brif(is_ok, ok_block, &[], err_block, &[]);
+
+        // Err block: early return the packed Result (it's already an Err)
+        self.builder.switch_to_block(err_block);
+        self.builder.seal_block(err_block);
+        self.builder.ins().return_(&[result_val]);
+
+        // Ok block: extract payload
+        self.builder.switch_to_block(ok_block);
+        self.builder.seal_block(ok_block);
+
+        let eight = self.builder.ins().iconst(types::I64, 8);
+        let payload = self.builder.ins().sshr(result_val, eight);
+
+        // The payload type is the ok_ty; if it's smaller than i64, truncate
+        let final_val = match self.ty_cl(result_ok_ty) {
+            Some(t) if t == types::I8 || t == types::I16 || t == types::I32 => {
+                self.builder.ins().ireduce(t, payload)
+            }
+            _ => payload, // i64 or another packed ADT — use directly
+        };
+
+        Ok(Some(final_val))
+    }
+
+    // ── Pattern binding ────────────────────────────────────────
+
+    /// Determine the payload type for a constructor from the scrutinee type.
+    fn constructor_payload_ty(info: &ConstructorInfo, scrut_ty: &Ty) -> Ty {
+        if let Some(idx) = info.field_type_param_index {
+            if let Ty::Con(_, args) = scrut_ty {
+                if idx < args.len() {
+                    return args[idx].clone();
+                }
+            }
+        }
+        // Fallback: payload is i64 (e.g., concrete field type or unknown)
+        Ty::I64
+    }
+
+    /// Bind a pattern variable to a payload value extracted from a constructor match.
+    /// `payload` is the raw i64 extracted from the packed representation.
+    /// `payload_ty` is the logical type of the payload (e.g., i32 for Ok's value in Result i32 err).
+    fn bind_pattern_var(
+        &mut self,
+        pat_kind: &PatternKind,
+        payload: Value,
+        payload_ty: &Ty,
+    ) -> Result<(), CodegenError> {
+        match pat_kind {
+            PatternKind::Var(name) => {
+                let cl_ty = self.ty_cl(payload_ty).unwrap_or(types::I64);
+                // Truncate from i64 to the target type if needed
+                let final_val = if cl_ty != types::I64 && cl_ty != types::F32 && cl_ty != types::F64
+                {
+                    self.builder.ins().ireduce(cl_ty, payload)
+                } else {
+                    payload
+                };
+                let var = self.declare_variable(cl_ty);
+                self.builder.def_var(var, final_val);
+                self.vars.insert(name.clone(), (var, payload_ty.clone()));
+                Ok(())
+            }
+            PatternKind::Wildcard => Ok(()),
+            _ => Err(CodegenError::new(
+                "only variable or wildcard patterns supported in constructor payload",
+            )),
         }
     }
 
@@ -2094,6 +2328,24 @@ mod tests {
         compile_and_run(&module, &type_info).expect("codegen error")
     }
 
+    /// Parse + typecheck + compile, expecting codegen to return an Err.
+    /// Returns the error message string.
+    fn compile_err(source: &str) -> String {
+        let expanded = expand(source);
+        let (module, parse_errors) = weir_parser::parse(&expanded);
+        assert!(parse_errors.is_empty(), "parse errors: {:?}", parse_errors);
+        let type_info = weir_typeck::check(&module);
+        assert!(
+            type_info.errors.is_empty(),
+            "type errors: {:?}",
+            type_info.errors
+        );
+        match compile_and_run(&module, &type_info) {
+            Ok(output) => panic!("expected codegen error, got output: {}", output),
+            Err(e) => e.message,
+        }
+    }
+
     fn interp_run(source: &str) -> String {
         let expanded = expand(source);
         let (module, parse_errors) = weir_parser::parse(&expanded);
@@ -2432,6 +2684,8 @@ mod tests {
 
     // ── Fixture-based tests ─────────────────────────────────────
 
+    const PRELUDE_SOURCE: &str = include_str!("../../../std/prelude.weir");
+
     fn fixture_path(name: &str) -> String {
         format!(
             "{}/tests/fixtures/{}.weir",
@@ -2444,6 +2698,7 @@ mod tests {
         let path = fixture_path(name);
         let source = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("could not read fixture {}: {}", path, e));
+        let source = format!("{}\n{}", PRELUDE_SOURCE, source);
         compile_run(&source)
     }
 
@@ -2451,6 +2706,7 @@ mod tests {
         let path = fixture_path(name);
         let source = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("could not read fixture {}: {}", path, e));
+        let source = format!("{}\n{}", PRELUDE_SOURCE, source);
         interp_run(&source)
     }
 
@@ -2862,5 +3118,222 @@ mod tests {
             compiled, interpreted,
             "typeclasses-ord: compiler and interpreter disagree"
         );
+    }
+
+    #[test]
+    fn test_from_codegen() {
+        let out = compile_run(
+            "(deftype Color Red Green Blue)
+             (deftype Primary Yes No)
+             (defclass (From 'a 'b)
+               (from : (Fn ['a] 'b)))
+             (instance (From Color Primary)
+               (defn from ((c : Color)) : Primary
+                 (match c
+                   (Red Yes)
+                   (Blue Yes)
+                   (_ No))))
+             (defn primary-to-i32 ((p : Primary)) : i32
+               (match p (Yes 1) (No 0)))
+             (defn main () : Unit
+               (let (((r : Primary) (from Red)))
+                 (println (primary-to-i32 r)))
+               (let (((g : Primary) (from Green)))
+                 (println (primary-to-i32 g)))
+               (let (((b : Primary) (from Blue)))
+                 (println (primary-to-i32 b))))",
+        );
+        assert_eq!(out, "1\n0\n1\n");
+    }
+
+    #[test]
+    fn oracle_from() {
+        oracle_test(
+            "(deftype Color Red Green Blue)
+             (deftype Primary Yes No)
+             (defclass (From 'a 'b)
+               (from : (Fn ['a] 'b)))
+             (instance (From Color Primary)
+               (defn from ((c : Color)) : Primary
+                 (match c
+                   (Red Yes)
+                   (Blue Yes)
+                   (_ No))))
+             (defn primary-to-i32 ((p : Primary)) : i32
+               (match p (Yes 1) (No 0)))
+             (defn main () : Unit
+               (let (((r : Primary) (from Red)))
+                 (println (primary-to-i32 r)))
+               (let (((g : Primary) (from Green)))
+                 (println (primary-to-i32 g)))
+               (let (((b : Primary) (from Blue)))
+                 (println (primary-to-i32 b))))",
+        );
+    }
+
+    #[test]
+    fn fixture_typeclasses_from() {
+        let compiled = run_fixture_compiled("typeclasses-from");
+        let interpreted = run_fixture_interpreted("typeclasses-from");
+        assert_eq!(
+            compiled, interpreted,
+            "typeclasses-from: compiler and interpreter disagree"
+        );
+    }
+
+    // ── Data-carrying constructors + Result + ? operator tests ──
+
+    #[test]
+    fn test_option_some_none_codegen() {
+        let output = compile_run(
+            "(deftype (Option 'a) (Some 'a) (None))
+             (defn unwrap-or ((o : (Option i32)) (default : i32)) : i32
+               (match o
+                 ((Some val) val)
+                 ((None) default)))
+             (defn main ()
+               (println (unwrap-or (Some 42) 0))
+               (println (unwrap-or (None) 99)))",
+        );
+        assert_eq!(output, "42\n99\n");
+    }
+
+    #[test]
+    fn test_result_codegen() {
+        let output = compile_run(
+            "(deftype (Result 'ok 'err) (Ok 'ok) (Err 'err))
+             (defn unwrap-or ((r : (Result i32 i32)) (default : i32)) : i32
+               (match r
+                 ((Ok val) val)
+                 ((Err _) default)))
+             (defn main ()
+               (println (unwrap-or (Ok 42) 0))
+               (println (unwrap-or (Err 99) 0)))",
+        );
+        assert_eq!(output, "42\n0\n");
+    }
+
+    #[test]
+    fn test_try_operator_codegen() {
+        let output = compile_run(
+            "(deftype (Result 'ok 'err) (Ok 'ok) (Err 'err))
+             (defn safe-div ((x : i32) (y : i32)) : (Result i32 i32)
+               (if (= y 0) (Err y) (Ok (/ x y))))
+             (defn try-add ((x : i32) (y : i32)) : (Result i32 i32)
+               (let ((result (safe-div x y)?))
+                 (Ok (+ result 1))))
+             (defn unwrap-or ((r : (Result i32 i32)) (default : i32)) : i32
+               (match r
+                 ((Ok val) val)
+                 ((Err _) default)))
+             (defn main ()
+               (println (unwrap-or (try-add 10 2) 0))
+               (println (unwrap-or (try-add 10 0) 99)))",
+        );
+        assert_eq!(output, "6\n99\n");
+    }
+
+    #[test]
+    fn oracle_result() {
+        oracle_test(
+            "(deftype (Result 'ok 'err) (Ok 'ok) (Err 'err))
+             (defn safe-div ((x : i32) (y : i32)) : (Result i32 i32)
+               (if (= y 0) (Err y) (Ok (/ x y))))
+             (defn unwrap-or ((r : (Result i32 i32)) (default : i32)) : i32
+               (match r
+                 ((Ok val) val)
+                 ((Err _) default)))
+             (defn try-add ((x : i32) (y : i32)) : (Result i32 i32)
+               (let ((result (safe-div x y)?))
+                 (Ok (+ result 1))))
+             (defn main ()
+               (println (unwrap-or (safe-div 10 2) 0))
+               (println (unwrap-or (safe-div 10 0) 99))
+               (println (unwrap-or (try-add 10 2) 0))
+               (println (unwrap-or (try-add 10 0) 99)))",
+        );
+    }
+
+    #[test]
+    fn fixture_result() {
+        let compiled = run_fixture_compiled("result");
+        let interpreted = run_fixture_interpreted("result");
+        assert_eq!(
+            compiled, interpreted,
+            "result: compiler and interpreter disagree"
+        );
+    }
+
+    // ── Codegen error tests ────────────────────────────────────
+
+    #[test]
+    fn test_error_cannot_print_adt() {
+        let msg = compile_err(
+            "(deftype Color Red Green Blue)
+             (defn main () (println Red))",
+        );
+        assert!(
+            msg.contains("cannot print type"),
+            "expected 'cannot print type' error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_error_dev_session_parse_error() {
+        match DevSession::new("(defn main (") {
+            Err(e) => assert!(
+                e.message.contains("parse error"),
+                "expected parse error, got: {}",
+                e.message
+            ),
+            Ok(_) => panic!("expected DevSession::new to fail with parse error"),
+        }
+    }
+
+    #[test]
+    fn test_error_dev_session_type_error() {
+        match DevSession::new("(defn main () (+ 1 true))") {
+            Err(e) => assert!(
+                e.message.contains("type error"),
+                "expected type error, got: {}",
+                e.message
+            ),
+            Ok(_) => panic!("expected DevSession::new to fail with type error"),
+        }
+    }
+
+    #[test]
+    fn test_error_dev_session_reload_parse_error() {
+        let valid = "(defn main () (println 1))";
+        let mut session = DevSession::new(valid).expect("initial session should succeed");
+        match session.reload("(defn main (") {
+            Err(e) => assert!(
+                e.message.contains("parse error"),
+                "expected parse error on reload, got: {}",
+                e.message
+            ),
+            Ok(_) => panic!("expected reload to fail with parse error"),
+        }
+        // Session should still be functional with old code
+        let output = session.run_main().expect("old code should still run");
+        assert_eq!(output.trim(), "1");
+    }
+
+    #[test]
+    fn test_error_dev_session_reload_type_error() {
+        let valid = "(defn main () (println 1))";
+        let mut session = DevSession::new(valid).expect("initial session should succeed");
+        match session.reload("(defn main () (+ 1 true))") {
+            Err(e) => assert!(
+                e.message.contains("type error"),
+                "expected type error on reload, got: {}",
+                e.message
+            ),
+            Ok(_) => panic!("expected reload to fail with type error"),
+        }
+        // Session should still be functional with old code
+        let output = session.run_main().expect("old code should still run");
+        assert_eq!(output.trim(), "1");
     }
 }
