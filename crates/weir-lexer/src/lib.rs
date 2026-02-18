@@ -426,4 +426,136 @@ mod tests {
             other => panic!("expected Comment, got {:?}", other),
         }
     }
+
+    // ── Error / edge-case tests ─────────────────────────────────
+
+    /// Helper: lex and return (tokens, error_spans).
+    fn lex_with_errors(source: &str) -> (Vec<Token>, Vec<Span>) {
+        let (tokens, errors) = lex(source);
+        let tokens = tokens.into_iter().map(|(t, _)| t).collect();
+        (tokens, errors)
+    }
+
+    #[test]
+    fn test_error_unrecognized_character() {
+        let (tokens, errors) = lex_with_errors("@");
+        assert_eq!(errors.len(), 1, "expected 1 error, got {:?}", errors);
+        assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn test_error_multiple_unrecognized_characters() {
+        let (tokens, errors) = lex_with_errors("@ # $");
+        assert_eq!(errors.len(), 3, "expected 3 errors, got {:?}", errors);
+        assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn test_error_backslash() {
+        let (_tokens, errors) = lex_with_errors("\\");
+        assert!(!errors.is_empty(), "backslash should produce a lex error");
+    }
+
+    #[test]
+    fn test_error_unterminated_string() {
+        let (_tokens, errors) = lex_with_errors("\"hello");
+        assert!(
+            !errors.is_empty(),
+            "unterminated string should produce lex error"
+        );
+    }
+
+    #[test]
+    fn test_error_unterminated_string_with_escape() {
+        let (_tokens, errors) = lex_with_errors("\"hello\\n");
+        assert!(
+            !errors.is_empty(),
+            "unterminated string with escape should produce lex error"
+        );
+    }
+
+    #[test]
+    fn test_error_valid_tokens_alongside_errors() {
+        // Valid tokens should still be produced even when errors occur
+        let (tokens, errors) = lex_with_errors("( @ 42 )");
+        assert_eq!(errors.len(), 1, "expected 1 error for @");
+        assert_eq!(
+            tokens,
+            vec![Token::LParen, Token::Int(42), Token::RParen],
+            "valid tokens should still be returned"
+        );
+    }
+
+    #[test]
+    fn test_error_span_is_correct() {
+        let (_, errors) = lex("( @ )");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0], Span::new(2, 3), "error span should cover the '@'");
+    }
+
+    #[test]
+    fn test_error_bare_dot() {
+        // A bare `.` (not followed by an identifier) shouldn't lex as FieldAccess
+        let (_tokens, errors) = lex_with_errors(".");
+        assert!(
+            !errors.is_empty(),
+            "bare dot should produce lex error"
+        );
+    }
+
+    #[test]
+    fn test_error_bare_single_quote() {
+        // `'` alone (not followed by identifier) shouldn't lex as TypeVar
+        let (_tokens, errors) = lex_with_errors("'");
+        assert!(
+            !errors.is_empty(),
+            "bare single quote should produce lex error"
+        );
+    }
+
+    #[test]
+    fn test_error_hash() {
+        let (_tokens, errors) = lex_with_errors("#");
+        assert!(!errors.is_empty(), "# should produce lex error");
+    }
+
+    #[test]
+    fn test_edge_empty_input() {
+        let (tokens, errors) = lex_with_errors("");
+        assert!(tokens.is_empty());
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn test_edge_whitespace_only() {
+        let (tokens, errors) = lex_with_errors("   \t\n\r\n  ");
+        assert!(tokens.is_empty());
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn test_edge_string_with_all_escapes() {
+        let tokens = lex_tokens(r#""\n\t\r\\\"\0""#);
+        assert_eq!(tokens, vec![Token::String("\n\t\r\\\"\0".into())]);
+    }
+
+    #[test]
+    fn test_edge_string_with_unknown_escape() {
+        // Unknown escape sequences pass through as-is (backslash + char)
+        let tokens = lex_tokens(r#""\q""#);
+        assert_eq!(tokens, vec![Token::String("\\q".into())]);
+    }
+
+    #[test]
+    fn test_edge_negative_float() {
+        let tokens = lex_tokens("-3.14e-2");
+        assert_eq!(tokens, vec![Token::Float(-3.14e-2)]);
+    }
+
+    #[test]
+    fn test_edge_dotted_symbol() {
+        // module.name should lex as a single symbol
+        let tokens = lex_tokens("module.name");
+        assert_eq!(tokens, vec![Token::Symbol("module.name".into())]);
+    }
 }
