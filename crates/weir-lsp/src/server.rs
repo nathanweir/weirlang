@@ -150,6 +150,7 @@ impl LanguageServer for WeirLspBackend {
                         },
                     ),
                 ),
+                workspace_symbol_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -734,5 +735,51 @@ impl LanguageServer for WeirLspBackend {
             result_id: None,
             data: tokens,
         })))
+    }
+
+    async fn symbol(
+        &self,
+        params: WorkspaceSymbolParams,
+    ) -> Result<Option<Vec<SymbolInformation>>> {
+        let query = params.query.to_lowercase();
+        let ws = self.workspace.read().await;
+
+        #[allow(deprecated)] // SymbolInformation.deprecated is deprecated but required
+        let symbols: Vec<SymbolInformation> =
+            ws.all_top_level_symbols()
+                .into_iter()
+                .filter(|s| {
+                    if query.is_empty() {
+                        return true;
+                    }
+                    s.name.to_lowercase().contains(&query)
+                })
+                .filter_map(|s| {
+                    let line_index = ws.line_index_for(&s.uri)?;
+                    let range = line_index.span_to_range(s.name_span);
+                    let lsp_kind = match s.kind {
+                        crate::index::SymbolKind::Function => SymbolKind::FUNCTION,
+                        crate::index::SymbolKind::Type => SymbolKind::ENUM,
+                        crate::index::SymbolKind::Variant => SymbolKind::ENUM_MEMBER,
+                        crate::index::SymbolKind::Struct => SymbolKind::STRUCT,
+                        crate::index::SymbolKind::Class => SymbolKind::INTERFACE,
+                        crate::index::SymbolKind::Parameter
+                        | crate::index::SymbolKind::LetBinding => SymbolKind::VARIABLE,
+                    };
+                    Some(SymbolInformation {
+                        name: s.name.clone(),
+                        kind: lsp_kind,
+                        tags: None,
+                        deprecated: None,
+                        location: Location {
+                            uri: s.uri.clone(),
+                            range,
+                        },
+                        container_name: s.uri.path().rsplit('/').next().map(|f| f.to_string()),
+                    })
+                })
+                .collect();
+
+        Ok(Some(symbols))
     }
 }
