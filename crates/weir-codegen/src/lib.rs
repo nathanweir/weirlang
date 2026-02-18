@@ -124,7 +124,7 @@ int main(void) { weir_main(); return 0; }
 
 // ── Type mapping ─────────────────────────────────────────────────
 
-fn ty_to_cl(ty: &Ty) -> Option<Type> {
+fn ty_to_cl_with(ty: &Ty, simple_enums: Option<&HashMap<SmolStr, SimpleEnum>>) -> Option<Type> {
     match ty {
         Ty::I8 | Ty::U8 | Ty::Bool => Some(types::I8),
         Ty::I16 | Ty::U16 => Some(types::I16),
@@ -133,6 +133,14 @@ fn ty_to_cl(ty: &Ty) -> Option<Type> {
         Ty::F32 => Some(types::F32),
         Ty::F64 => Some(types::F64),
         Ty::Unit => None, // void — no value
+        Ty::Con(name, args) if args.is_empty() => {
+            if let Some(enums) = simple_enums {
+                if enums.contains_key(name) {
+                    return Some(types::I8); // tag-only representation
+                }
+            }
+            None
+        }
         _ => None,
     }
 }
@@ -272,6 +280,14 @@ pub fn build_executable(
     Ok(())
 }
 
+/// A simple enum type: all nullary constructors, represented as an i8 tag.
+#[derive(Clone, Debug)]
+struct SimpleEnum {
+    /// Ordered list of variant names; tag = index in this list.
+    #[allow(dead_code)]
+    variants: Vec<SmolStr>,
+}
+
 struct Compiler<'a, M: Module> {
     ast_module: &'a weir_ast::Module,
     type_info: &'a TypeCheckResult,
@@ -281,16 +297,40 @@ struct Compiler<'a, M: Module> {
     user_fns: HashMap<SmolStr, (FuncId, Vec<Ty>, Ty)>,
     /// Maps runtime helper name -> FuncId
     runtime_fns: HashMap<&'static str, FuncId>,
+    /// Simple enum types: type_name -> SimpleEnum
+    simple_enums: HashMap<SmolStr, SimpleEnum>,
+    /// Constructor name -> (type_name, tag index)
+    constructor_tags: HashMap<SmolStr, (SmolStr, i64)>,
 }
 
 impl<'a, M: Module> Compiler<'a, M> {
     fn new(ast_module: &'a weir_ast::Module, type_info: &'a TypeCheckResult, module: M) -> Self {
+        let mut simple_enums = HashMap::new();
+        let mut constructor_tags = HashMap::new();
+
+        // Collect simple enums from deftype definitions
+        for (item, _span) in &ast_module.items {
+            if let Item::Deftype(d) = item {
+                let all_nullary = d.variants.iter().all(|v| v.fields.is_empty());
+                if all_nullary && !d.variants.is_empty() {
+                    let variants: Vec<SmolStr> =
+                        d.variants.iter().map(|v| v.name.clone()).collect();
+                    for (i, v) in variants.iter().enumerate() {
+                        constructor_tags.insert(v.clone(), (d.name.clone(), i as i64));
+                    }
+                    simple_enums.insert(d.name.clone(), SimpleEnum { variants });
+                }
+            }
+        }
+
         Self {
             ast_module,
             type_info,
             module,
             user_fns: HashMap::new(),
             runtime_fns: HashMap::new(),
+            simple_enums,
+            constructor_tags,
         }
     }
 
@@ -360,6 +400,10 @@ impl<'a, M: Module> Compiler<'a, M> {
 
     // ── Pass 1: declare all user function signatures ────────────
 
+    fn ty_cl(&self, ty: &Ty) -> Option<Type> {
+        ty_to_cl_with(ty, Some(&self.simple_enums))
+    }
+
     fn declare_user_functions(&mut self, linkage: Linkage) -> Result<(), CodegenError> {
         for (item, _span) in &self.ast_module.items {
             if let Item::Defn(defn) = item {
@@ -373,11 +417,11 @@ impl<'a, M: Module> Compiler<'a, M> {
                 let mut sig = self.module.make_signature();
                 sig.call_conv = CallConv::SystemV;
                 for pty in &param_tys {
-                    if let Some(cl_ty) = ty_to_cl(pty) {
+                    if let Some(cl_ty) = self.ty_cl(pty) {
                         sig.params.push(AbiParam::new(cl_ty));
                     }
                 }
-                if let Some(cl_ty) = ty_to_cl(&ret_ty) {
+                if let Some(cl_ty) = self.ty_cl(&ret_ty) {
                     sig.returns.push(AbiParam::new(cl_ty));
                 }
 
@@ -404,8 +448,8 @@ impl<'a, M: Module> Compiler<'a, M> {
             let all_primitive = spec
                 .param_types
                 .iter()
-                .all(|t| ty_to_cl(t).is_some() || *t == Ty::Unit)
-                && (ty_to_cl(&spec.return_type).is_some() || spec.return_type == Ty::Unit);
+                .all(|t| self.ty_cl(t).is_some() || *t == Ty::Unit)
+                && (self.ty_cl(&spec.return_type).is_some() || spec.return_type == Ty::Unit);
 
             if !all_primitive {
                 continue;
@@ -414,11 +458,11 @@ impl<'a, M: Module> Compiler<'a, M> {
             let mut sig = self.module.make_signature();
             sig.call_conv = CallConv::SystemV;
             for pty in &spec.param_types {
-                if let Some(cl_ty) = ty_to_cl(pty) {
+                if let Some(cl_ty) = self.ty_cl(pty) {
                     sig.params.push(AbiParam::new(cl_ty));
                 }
             }
-            if let Some(cl_ty) = ty_to_cl(&spec.return_type) {
+            if let Some(cl_ty) = self.ty_cl(&spec.return_type) {
                 sig.returns.push(AbiParam::new(cl_ty));
             }
 
@@ -453,11 +497,11 @@ impl<'a, M: Module> Compiler<'a, M> {
                 let mut sig = self.module.make_signature();
                 sig.call_conv = CallConv::SystemV;
                 for pty in &param_tys {
-                    if let Some(cl_ty) = ty_to_cl(pty) {
+                    if let Some(cl_ty) = self.ty_cl(pty) {
                         sig.params.push(AbiParam::new(cl_ty));
                     }
                 }
-                if let Some(cl_ty) = ty_to_cl(&ret_ty) {
+                if let Some(cl_ty) = self.ty_cl(&ret_ty) {
                     sig.returns.push(AbiParam::new(cl_ty));
                 }
 
@@ -530,10 +574,18 @@ impl<'a, M: Module> Compiler<'a, M> {
                 "f64" => Ok(Ty::F64),
                 "Bool" | "bool" => Ok(Ty::Bool),
                 "Unit" => Ok(Ty::Unit),
-                other => Err(CodegenError::new(format!(
-                    "unsupported type '{}' for codegen",
-                    other
-                ))),
+                other => {
+                    // Check if it's a simple enum type
+                    let name_smol = SmolStr::new(other);
+                    if self.simple_enums.contains_key(&name_smol) {
+                        Ok(Ty::Con(name_smol, vec![]))
+                    } else {
+                        Err(CodegenError::new(format!(
+                            "unsupported type '{}' for codegen",
+                            other
+                        )))
+                    }
+                }
             },
             _ => Err(CodegenError::new(
                 "complex type expressions not yet supported in codegen",
@@ -644,14 +696,15 @@ impl<'a, M: Module> Compiler<'a, M> {
             .ok_or_else(|| CodegenError::new(format!("unknown function '{}'", lookup_name)))?
             .clone();
 
+        let enums = &self.simple_enums;
         let mut sig = self.module.make_signature();
         sig.call_conv = CallConv::SystemV;
         for pty in &param_tys {
-            if let Some(cl_ty) = ty_to_cl(pty) {
+            if let Some(cl_ty) = ty_to_cl_with(pty, Some(enums)) {
                 sig.params.push(AbiParam::new(cl_ty));
             }
         }
-        if let Some(cl_ty) = ty_to_cl(&ret_ty) {
+        if let Some(cl_ty) = ty_to_cl_with(&ret_ty, Some(enums)) {
             sig.returns.push(AbiParam::new(cl_ty));
         }
 
@@ -677,13 +730,15 @@ impl<'a, M: Module> Compiler<'a, M> {
                 vars: HashMap::new(),
                 fn_table_slots,
                 table_data_id,
+                simple_enums: &self.simple_enums,
+                constructor_tags: &self.constructor_tags,
             };
 
             // Bind parameters to variables
             let block_params: Vec<Value> = fn_ctx.builder.block_params(entry_block).to_vec();
             let mut param_idx = 0;
             for (i, param) in defn.params.iter().enumerate() {
-                if let Some(cl_ty) = ty_to_cl(&param_tys[i]) {
+                if let Some(cl_ty) = fn_ctx.ty_cl(&param_tys[i]) {
                     let var = fn_ctx.declare_variable(cl_ty);
                     fn_ctx.builder.def_var(var, block_params[param_idx]);
                     fn_ctx
@@ -697,11 +752,11 @@ impl<'a, M: Module> Compiler<'a, M> {
             let body_val = fn_ctx.compile_body(&defn.body, &ret_ty)?;
 
             // Return
-            if ty_to_cl(&ret_ty).is_some() {
+            if fn_ctx.ty_cl(&ret_ty).is_some() {
                 if let Some(val) = body_val {
                     fn_ctx.builder.ins().return_(&[val]);
                 } else {
-                    let cl_ty = ty_to_cl(&ret_ty).unwrap();
+                    let cl_ty = fn_ctx.ty_cl(&ret_ty).unwrap();
                     let zero = if cl_ty.is_float() {
                         fn_ctx.builder.ins().f64const(0.0)
                     } else {
@@ -761,9 +816,17 @@ struct FnCompileCtx<'a, 'b, M: Module> {
     fn_table_slots: Option<&'a HashMap<SmolStr, usize>>,
     /// Data ID for the function table base pointer (used with indirect dispatch).
     table_data_id: Option<DataId>,
+    /// Simple enum types (from Compiler)
+    simple_enums: &'a HashMap<SmolStr, SimpleEnum>,
+    /// Constructor name -> (type_name, tag index)
+    constructor_tags: &'a HashMap<SmolStr, (SmolStr, i64)>,
 }
 
 impl<M: Module> FnCompileCtx<'_, '_, M> {
+    fn ty_cl(&self, ty: &Ty) -> Option<Type> {
+        ty_to_cl_with(ty, Some(self.simple_enums))
+    }
+
     fn declare_variable(&mut self, cl_ty: Type) -> Variable {
         self.builder.declare_var(cl_ty)
     }
@@ -813,6 +876,9 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
             ExprKind::Var(name) => {
                 if let Some((var, _ty)) = self.vars.get(name) {
                     Ok(Some(self.builder.use_var(*var)))
+                } else if let Some((_type_name, tag)) = self.constructor_tags.get(name) {
+                    // Nullary constructor — emit its tag as an i8 constant
+                    Ok(Some(self.builder.ins().iconst(types::I8, *tag)))
                 } else {
                     Err(CodegenError::new(format!(
                         "undefined variable '{}' in codegen",
@@ -827,7 +893,7 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                 for b in bindings {
                     let val_ty = self.expr_ty(b.value);
                     let val = self.compile_expr(b.value, &val_ty)?;
-                    if let Some(cl_ty) = ty_to_cl(&val_ty) {
+                    if let Some(cl_ty) = self.ty_cl(&val_ty) {
                         let var = self.declare_variable(cl_ty);
                         if let Some(v) = val {
                             self.builder.def_var(var, v);
@@ -884,6 +950,10 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                 }
             }
 
+            ExprKind::Match { scrutinee, arms } => {
+                self.compile_match(*scrutinee, arms, &resolved_ty)
+            }
+
             ExprKind::Ann { expr, .. } => self.compile_expr(*expr, &resolved_ty),
 
             _ => Err(CodegenError::new(format!(
@@ -898,7 +968,7 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
     fn compile_lit(&mut self, lit: &Literal, ty: &Ty) -> Result<Option<Value>, CodegenError> {
         match lit {
             Literal::Int(n) => {
-                let cl_ty = ty_to_cl(ty).unwrap_or(types::I64);
+                let cl_ty = self.ty_cl(ty).unwrap_or(types::I64);
                 let val = self.builder.ins().iconst(cl_ty, *n);
                 Ok(Some(val))
             }
@@ -952,7 +1022,7 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                         .module
                         .declare_func_in_func(callee_id, self.builder.func);
                     let call_inst = self.builder.ins().call(func_ref, &arg_vals);
-                    if ty_to_cl(&ret_ty).is_some() {
+                    if self.ty_cl(&ret_ty).is_some() {
                         let results = self.builder.inst_results(call_inst);
                         return Ok(Some(results[0]));
                     } else {
@@ -1023,7 +1093,7 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                             .module
                             .declare_func_in_func(callee_id, self.builder.func);
                         let call_inst = self.builder.ins().call(func_ref, &arg_vals);
-                        if ty_to_cl(&spec_ret_ty).is_some() {
+                        if self.ty_cl(&spec_ret_ty).is_some() {
                             let results = self.builder.inst_results(call_inst);
                             return Ok(Some(results[0]));
                         } else {
@@ -1056,11 +1126,11 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                         // Build the callee signature
                         let mut sig = cranelift_codegen::ir::Signature::new(CallConv::SystemV);
                         for pty in &param_tys {
-                            if let Some(cl_ty) = ty_to_cl(pty) {
+                            if let Some(cl_ty) = self.ty_cl(pty) {
                                 sig.params.push(AbiParam::new(cl_ty));
                             }
                         }
-                        if let Some(cl_ty) = ty_to_cl(&ret_ty) {
+                        if let Some(cl_ty) = self.ty_cl(&ret_ty) {
                             sig.returns.push(AbiParam::new(cl_ty));
                         }
 
@@ -1081,7 +1151,7 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                         let call_inst =
                             self.builder.ins().call_indirect(sig_ref, fn_ptr, &arg_vals);
 
-                        if ty_to_cl(&ret_ty).is_some() {
+                        if self.ty_cl(&ret_ty).is_some() {
                             let results = self.builder.inst_results(call_inst);
                             return Ok(Some(results[0]));
                         } else {
@@ -1095,7 +1165,7 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                     .module
                     .declare_func_in_func(callee_id, self.builder.func);
                 let call_inst = self.builder.ins().call(func_ref, &arg_vals);
-                if ty_to_cl(&ret_ty).is_some() {
+                if self.ty_cl(&ret_ty).is_some() {
                     let results = self.builder.inst_results(call_inst);
                     Ok(Some(results[0]))
                 } else {
@@ -1125,11 +1195,11 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
         if args.is_empty() {
             return match op {
                 "+" => {
-                    let cl_ty = ty_to_cl(result_ty).unwrap_or(types::I64);
+                    let cl_ty = self.ty_cl(result_ty).unwrap_or(types::I64);
                     Ok(Some(self.builder.ins().iconst(cl_ty, 0)))
                 }
                 "*" => {
-                    let cl_ty = ty_to_cl(result_ty).unwrap_or(types::I64);
+                    let cl_ty = self.ty_cl(result_ty).unwrap_or(types::I64);
                     Ok(Some(self.builder.ins().iconst(cl_ty, 1)))
                 }
                 _ => Err(CodegenError::new(format!("{} requires arguments", op))),
@@ -1144,7 +1214,7 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                 return Ok(Some(self.builder.ins().fneg(val)));
             } else {
                 // ineg = 0 - val
-                let cl_ty = ty_to_cl(&arg_ty).unwrap();
+                let cl_ty = self.ty_cl(&arg_ty).unwrap();
                 let zero = self.builder.ins().iconst(cl_ty, 0);
                 return Ok(Some(self.builder.ins().isub(zero, val)));
             }
@@ -1384,9 +1454,9 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
         let merge_block = self.builder.create_block();
 
         // Add block param for the result value if the if-expr produces a value
-        let has_value = ty_to_cl(result_ty).is_some() && else_branch.is_some();
+        let has_value = self.ty_cl(result_ty).is_some() && else_branch.is_some();
         if has_value {
-            let cl_ty = ty_to_cl(result_ty).unwrap();
+            let cl_ty = self.ty_cl(result_ty).unwrap();
             self.builder.append_block_param(merge_block, cl_ty);
         }
 
@@ -1445,10 +1515,10 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
         else_clause: Option<ExprId>,
         result_ty: &Ty,
     ) -> Result<Option<Value>, CodegenError> {
-        let has_value = ty_to_cl(result_ty).is_some();
+        let has_value = self.ty_cl(result_ty).is_some();
         let merge_block = self.builder.create_block();
         if has_value {
-            let cl_ty = ty_to_cl(result_ty).unwrap();
+            let cl_ty = self.ty_cl(result_ty).unwrap();
             self.builder.append_block_param(merge_block, cl_ty);
         }
 
@@ -1547,6 +1617,134 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
         Ok(())
     }
 
+    // ── Match (simple enums) ──────────────────────────────────
+
+    fn compile_match(
+        &mut self,
+        scrutinee: ExprId,
+        arms: &[MatchArm],
+        result_ty: &Ty,
+    ) -> Result<Option<Value>, CodegenError> {
+        let scrut_ty = self.expr_ty(scrutinee);
+        let scrut_val = self
+            .compile_expr(scrutinee, &scrut_ty)?
+            .ok_or_else(|| CodegenError::new("match scrutinee produced no value"))?;
+
+        let has_value = self.ty_cl(result_ty).is_some();
+        let merge_block = self.builder.create_block();
+        if has_value {
+            let cl_ty = self.ty_cl(result_ty).unwrap();
+            self.builder.append_block_param(merge_block, cl_ty);
+        }
+
+        for (i, arm) in arms.iter().enumerate() {
+            let pat = &self.ast_module.patterns[arm.pattern];
+            let is_last = i == arms.len() - 1;
+
+            match &pat.kind {
+                PatternKind::Constructor { name, args } if args.is_empty() => {
+                    let tag = self
+                        .constructor_tags
+                        .get(name)
+                        .map(|(_, t)| *t)
+                        .ok_or_else(|| {
+                            CodegenError::new(format!("unknown constructor '{}' in match", name))
+                        })?;
+
+                    if is_last {
+                        // Last constructor arm — guaranteed to match by exhaustiveness.
+                        // Compile body directly in current block (no branch needed).
+                        let body_val = self.compile_body(&arm.body, result_ty)?;
+                        if has_value {
+                            let val = body_val.unwrap_or_else(|| self.zero_value(result_ty));
+                            self.builder
+                                .ins()
+                                .jump(merge_block, &[BlockArg::Value(val)]);
+                        } else {
+                            self.builder.ins().jump(merge_block, &[]);
+                        }
+                    } else {
+                        let arm_block = self.builder.create_block();
+                        let next_block = self.builder.create_block();
+                        let tag_val = self.builder.ins().iconst(types::I8, tag);
+                        let cmp = self.builder.ins().icmp(IntCC::Equal, scrut_val, tag_val);
+                        self.builder
+                            .ins()
+                            .brif(cmp, arm_block, &[], next_block, &[]);
+
+                        // Compile arm body
+                        self.builder.switch_to_block(arm_block);
+                        self.builder.seal_block(arm_block);
+                        let body_val = self.compile_body(&arm.body, result_ty)?;
+                        if has_value {
+                            let val = body_val.unwrap_or_else(|| self.zero_value(result_ty));
+                            self.builder
+                                .ins()
+                                .jump(merge_block, &[BlockArg::Value(val)]);
+                        } else {
+                            self.builder.ins().jump(merge_block, &[]);
+                        }
+
+                        // Continue to next arm
+                        self.builder.switch_to_block(next_block);
+                        self.builder.seal_block(next_block);
+                    }
+                }
+
+                PatternKind::Wildcard => {
+                    // Catch-all: compile body directly in current block
+                    let body_val = self.compile_body(&arm.body, result_ty)?;
+                    if has_value {
+                        let val = body_val.unwrap_or_else(|| self.zero_value(result_ty));
+                        self.builder
+                            .ins()
+                            .jump(merge_block, &[BlockArg::Value(val)]);
+                    } else {
+                        self.builder.ins().jump(merge_block, &[]);
+                    }
+                }
+
+                PatternKind::Var(name) => {
+                    // Bind scrutinee to variable, then compile body
+                    let cl_ty = self
+                        .ty_cl(&scrut_ty)
+                        .ok_or_else(|| CodegenError::new("match var pattern on non-value type"))?;
+                    let var = self.declare_variable(cl_ty);
+                    self.builder.def_var(var, scrut_val);
+                    self.vars.insert(name.clone(), (var, scrut_ty.clone()));
+
+                    let body_val = self.compile_body(&arm.body, result_ty)?;
+                    if has_value {
+                        let val = body_val.unwrap_or_else(|| self.zero_value(result_ty));
+                        self.builder
+                            .ins()
+                            .jump(merge_block, &[BlockArg::Value(val)]);
+                    } else {
+                        self.builder.ins().jump(merge_block, &[]);
+                    }
+                }
+
+                _ => {
+                    return Err(CodegenError::new(format!(
+                        "unsupported pattern kind in codegen match: {:?}",
+                        std::mem::discriminant(&pat.kind)
+                    )));
+                }
+            }
+        }
+
+        // Seal and switch to merge block
+        self.builder.seal_block(merge_block);
+        self.builder.switch_to_block(merge_block);
+
+        if has_value {
+            let result = self.builder.block_params(merge_block)[0];
+            Ok(Some(result))
+        } else {
+            Ok(None)
+        }
+    }
+
     // ── Helpers ─────────────────────────────────────────────────
 
     fn zero_value(&mut self, ty: &Ty) -> Value {
@@ -1554,7 +1752,7 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
             Ty::F32 => self.builder.ins().f32const(0.0),
             Ty::F64 => self.builder.ins().f64const(0.0),
             _ => {
-                let cl_ty = ty_to_cl(ty).unwrap_or(types::I64);
+                let cl_ty = self.ty_cl(ty).unwrap_or(types::I64);
                 self.builder.ins().iconst(cl_ty, 0)
             }
         }
@@ -2606,6 +2804,63 @@ mod tests {
              (defn main () : Unit
                (println (id 1))
                (println (id true)))",
+        );
+    }
+
+    // ── Ord typeclass + match + simple enums ─────────────────────
+
+    #[test]
+    fn test_ord_codegen() {
+        let out = compile_run(
+            "(deftype Ordering LT EQ GT)
+             (defclass (Ord 'a)
+               (compare : (Fn ['a 'a] Ordering)))
+             (instance (Ord i32)
+               (defn compare ((x : i32) (y : i32)) : Ordering
+                 (if (< x y) LT (if (> x y) GT EQ))))
+             (defn min-of ((x : i32) (y : i32)) : i32
+               (match (compare x y)
+                 (LT x) (EQ x) (GT y)))
+             (defn main () : Unit
+               (println (min-of 10 3))
+               (println (min-of 2 7))
+               (println (min-of 5 5)))",
+        );
+        assert_eq!(out, "3\n2\n5\n");
+    }
+
+    #[test]
+    fn oracle_ord() {
+        oracle_test(
+            "(deftype Ordering LT EQ GT)
+             (defclass (Ord 'a)
+               (compare : (Fn ['a 'a] Ordering)))
+             (instance (Ord i32)
+               (defn compare ((x : i32) (y : i32)) : Ordering
+                 (if (< x y) LT (if (> x y) GT EQ))))
+             (defn min-of ((x : i32) (y : i32)) : i32
+               (match (compare x y)
+                 (LT x) (EQ x) (GT y)))
+             (defn max-of ((x : i32) (y : i32)) : i32
+               (match (compare x y)
+                 (GT x) (_ y)))
+             (defn main () : Unit
+               (println (min-of 10 3))
+               (println (max-of 10 3))
+               (println (min-of 2 7))
+               (println (max-of 2 7))
+               (println (min-of 5 5))
+               (println (max-of 5 5)))",
+        );
+    }
+
+    #[test]
+    fn fixture_typeclasses_ord() {
+        let compiled = run_fixture_compiled("typeclasses-ord");
+        let interpreted = run_fixture_interpreted("typeclasses-ord");
+        assert_eq!(
+            compiled, interpreted,
+            "typeclasses-ord: compiler and interpreter disagree"
         );
     }
 }

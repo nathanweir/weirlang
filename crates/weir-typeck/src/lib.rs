@@ -3087,6 +3087,29 @@ mod tests {
         );
     }
 
+    // ── Ord typeclass ─────────────────────────────────────────────
+
+    #[test]
+    fn test_ord_typeclass_resolves() {
+        check_ok(
+            "(deftype Ordering LT EQ GT)
+             (defclass (Ord 'a)
+               (compare : (Fn ['a 'a] Ordering)))
+             (instance (Ord i32)
+               (defn compare ((x : i32) (y : i32)) : Ordering
+                 (if (< x y) LT (if (> x y) GT EQ))))
+             (defn min-of ((x : i32) (y : i32)) : i32
+               (match (compare x y)
+                 (LT x) (EQ x) (GT y)))
+             (defn max-of ((x : i32) (y : i32)) : i32
+               (match (compare x y)
+                 (GT x) (_ y)))
+             (defn main ()
+               (println (min-of 10 3))
+               (println (max-of 10 3)))",
+        );
+    }
+
     // ── Kind system + HKTs (Phase 8d) ────────────────────────────
 
     #[test]

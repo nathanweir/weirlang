@@ -199,18 +199,18 @@ Run `just test` on every commit. Tests must pass before merging.
   - Analysis pipeline: macro expansion → parse → typecheck → cache per document
   - [x] Diagnostic reporting (parse errors, type errors, macro expansion errors)
   - [x] Document symbols / outline (defn, deftype, defstruct, defclass, instances with nested children)
-  - [x] Go-to-definition (same file, scope-aware via SymbolIndex)
+  - [x] Go-to-definition (same file + cross-file via workspace index)
   - [x] Hover (expression types from typeck, function signatures, docstrings)
-  - [x] Completion (user-defined items + builtins + types + keywords; static, not scope-aware)
-  - [x] Find references (same file, scope-aware with shadowing)
-  - [x] Rename (same file, scope-aware with prepare_rename support)
+  - [x] Completion (user-defined items + builtins + types + keywords, scope-aware locals + cross-file workspace symbols)
+  - [x] Find references (same file + cross-file, scope-aware with shadowing)
+  - [x] Rename (same file + cross-file, scope-aware with prepare_rename support)
   - [x] Inlay hints (unannotated params, return types, let bindings, lambdas; range-aware)
   - [x] Document formatting (Wadler-Lindig pretty printer, 80-col, comment-preserving)
-  - [ ] Semantic token highlighting — *not implemented*
-  - [ ] Signature help — *not implemented*
+  - [x] Semantic token highlighting (15 token types, delta encoding)
+  - [x] Signature help (parameter hints, active parameter tracking, return types)
+  - [x] Cross-file support (workspace discovery, cross-file goto-def/references/rename/completion, external symbol awareness in type checker)
+  - [x] Workspace symbol search (case-insensitive substring matching)
   - [ ] Code actions — *not implemented*
-  - [ ] Cross-file support (multi-file definition, references, workspace) — *not implemented*
-  - [ ] Scope-aware completion (filter by visible bindings at cursor) — *not implemented*
 - [x] **Zed extension**: create `zed-weir` extension (adapt from `/home/nathan/dev/zed-common-lisp`)
   - `extension.toml` with language/grammar config
   - Point to tree-sitter-weir grammar
@@ -244,8 +244,8 @@ Run `just test` on every commit. Tests must pass before merging.
   - Interpreter: runtime dispatch via type tags
   - Codegen: monomorphization (specialization collection + mangled names)
   - Constraint resolution with deferred checking
-  - [ ] Core typeclasses beyond Eq/Show: `Ord`, `From` — *deferred*
-  - [ ] Coherence checking (Rust-style: only defining module can write instance) — *deferred*
+  - [ ] Core typeclasses beyond Eq/Show: `Ord`, `From` — *moved to Phase 8b*
+  - [ ] Coherence checking (Rust-style: only defining module can write instance) — *moved to Phase 8b*
   - [ ] `Shareable` typeclass (auto-derived based on type contents) — *deferred; needs concurrency (Phase 10)*
 - [x] **HKTs**:
   - Kind system (`TyKind::Star`, `TyKind::Arrow`)
@@ -254,6 +254,14 @@ Run `just test` on every commit. Tests must pass before merging.
   - Kind checking in instance declarations
   - Functor example working (interpreter)
 - [x] Verify: 322 tests pass, generic functions work in interpreter + codegen, typeclass dispatch works, HKTs work, oracle tests confirm interpreter/codegen agreement
+
+### Phase 8b: Independent deferred items
+Items deferred from earlier phases that don't depend on the runtime (Phase 9) or concurrency (Phase 10).
+
+- [ ] **Core typeclasses: `Ord`, `From`** — extend beyond Eq/Show. `Ord` enables `<`/`>`/`<=`/`>=` via typeclass dispatch instead of hardcoded builtins; `From` enables value conversions.
+- [ ] **Typeclass coherence checking** — enforce that only the module defining a type or class can write an instance (Rust-style orphan rule). Prevents conflicting instances.
+- [ ] **`Result` type + `?` operator** — error propagation. `(deftype (Result 'a 'e) (Ok 'a) (Err 'e))` with `?` desugaring to early return on `Err`. Needs support in parser, type checker, interpreter, and codegen.
+- [ ] **Property tests (`proptest`)** — fuzz the parser (never panics on arbitrary input), test type system invariants (inference idempotency), verify interpreter/codegen agreement on generated programs.
 
 ### Phase 9: GC + arenas
 - [ ] **Tracing GC** (in `weir-runtime`):
@@ -282,7 +290,7 @@ Run `just test` on every commit. Tests must pass before merging.
   - `channel` (typed channels)
   - `atom` (compare-and-swap)
   - `Shareable` enforcement at spawn/send boundaries
-- [ ] **Result + ? operator**: error propagation in codegen
+- [ ] **Result + ? operator**: error propagation in codegen — *moved to Phase 8b*
 - [ ] Verify: cascade works for all change types, concurrency primitives are thread-safe
 
 ## Milestone summary
@@ -292,7 +300,7 @@ Run `just test` on every commit. Tests must pass before merging.
 | **M0: "It runs"** | Phase 2 | Parse and interpret Weir programs with functions, let, if, arithmetic | **Done** |
 | **M1: "It compiles"** | Phase 4 | Programs compile to native code via Cranelift JIT and run | **Done** |
 | **M2: "Standalone binary + live reload"** | Phase 5 | `weir build` produces native binaries; `weir dev` enables live reload | **Done** |
-| **M3: "Editor support"** | Phase 6 | Syntax highlighting, inline errors, type hover in Zed | **Done** (LSP: diagnostics, hover, goto-def, references, rename, completion, inlay hints, formatting; Zed: tree-sitter highlighting; LSP launch wiring pending) |
+| **M3: "Editor support"** | Phase 6 | Syntax highlighting, inline errors, type hover in Zed | **Done** (LSP: diagnostics, hover, goto-def, references, rename, completion, inlay hints, formatting, semantic tokens, signature help, cross-file support, workspace symbol search; Zed: tree-sitter highlighting + LSP) |
 | **M4: "Real language"** | Phase 8 | Generics, typeclasses, macros — write non-trivial programs | **Done** (macros, generics, typeclasses, HKTs all working) |
 | **M5: "Production-ready runtime"** | Phase 10 | GC, arenas, concurrency, full cascade — the complete vision | Not started |
 

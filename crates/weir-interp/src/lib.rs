@@ -1976,6 +1976,51 @@ mod tests {
     }
 
     #[test]
+    fn test_ord_compare() {
+        let output = run_ok(
+            "(deftype Ordering LT EQ GT)
+             (defclass (Ord 'a)
+               (compare : (Fn ['a 'a] Ordering)))
+             (instance (Ord i32)
+               (defn compare ((x : i32) (y : i32)) : Ordering
+                 (if (< x y) LT (if (> x y) GT EQ))))
+             (defn main ()
+               (println (compare 1 2))
+               (println (compare 5 5))
+               (println (compare 9 3)))",
+        );
+        assert_eq!(output, "LT\nEQ\nGT\n");
+    }
+
+    #[test]
+    fn test_ord_match() {
+        let output = run_ok(
+            "(deftype Ordering LT EQ GT)
+             (defclass (Ord 'a)
+               (compare : (Fn ['a 'a] Ordering)))
+             (instance (Ord i32)
+               (defn compare ((x : i32) (y : i32)) : Ordering
+                 (if (< x y) LT (if (> x y) GT EQ))))
+             (defn min-of ((x : i32) (y : i32)) : i32
+               (match (compare x y)
+                 (LT x) (EQ x) (GT y)))
+             (defn main ()
+               (println (min-of 10 3))
+               (println (min-of 2 7))
+               (println (min-of 5 5)))",
+        );
+        assert_eq!(output, "3\n2\n5\n");
+    }
+
+    #[test]
+    fn fixture_typeclasses_ord() {
+        insta::assert_snapshot!(run_fixture("typeclasses-ord"), @r"
+        3
+        10
+        ");
+    }
+
+    #[test]
     fn test_functor_fmap() {
         insta::assert_snapshot!(run_ok(
             "(deftype (Option 'a) (Some 'a) None)
