@@ -1,0 +1,9 @@
+[package]
+name = "weir-runtime"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+doctest = false
+
+[dev-dependencies]

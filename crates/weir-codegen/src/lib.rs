@@ -157,47 +157,12 @@ extern "C" fn weir_str_cmp(a: i64, b: i64) -> i64 {
     }
 }
 
-extern "C" fn weir_alloc(size_bytes: i64) -> i64 {
-    let layout = std::alloc::Layout::from_size_align(size_bytes as usize, 8).unwrap();
-    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-    ptr as i64
-}
-
-extern "C" fn weir_vec_alloc(len: i64) -> i64 {
-    let total_bytes = (1 + len) * 8;
-    let ptr = weir_alloc(total_bytes);
-    // Store length at offset 0
-    unsafe {
-        *(ptr as *mut i64) = len;
-    }
-    ptr
-}
-
-extern "C" fn weir_vec_get(ptr: i64, idx: i64) -> i64 {
-    unsafe {
-        let base = ptr as *const i64;
-        *base.offset(1 + idx as isize)
-    }
-}
-
-extern "C" fn weir_vec_len(ptr: i64) -> i64 {
-    unsafe { *(ptr as *const i64) }
-}
-
-extern "C" fn weir_vec_append(ptr: i64, elem: i64) -> i64 {
-    let old_len = weir_vec_len(ptr);
-    let new_len = old_len + 1;
-    let new_ptr = weir_vec_alloc(new_len);
-    // Copy old elements
-    unsafe {
-        let src = (ptr as *const i64).offset(1);
-        let dst = (new_ptr as *mut i64).offset(1);
-        std::ptr::copy_nonoverlapping(src, dst, old_len as usize);
-        // Write new element
-        *dst.offset(old_len as isize) = elem;
-    }
-    new_ptr
-}
+// Allocation and vector operations are provided by weir-runtime (GC-managed).
+// The following re-exports make them available for JIT symbol registration.
+use weir_runtime::{
+    weir_gc_alloc, weir_gc_collect, weir_gc_vec_alloc, weir_shadow_pop, weir_shadow_push,
+    weir_vec_append, weir_vec_get, weir_vec_len, SHAPE_FIXED, SHAPE_VECTOR,
+};
 
 // ── C runtime for AOT binaries ──────────────────────────────────
 
@@ -247,28 +212,143 @@ int64_t weir_str_cmp(int64_t a, int64_t b) {
     return r < 0 ? -1 : (r > 0 ? 1 : 0);
 }
 
-int64_t weir_alloc(int64_t size_bytes) {
-    void *p = calloc(1, (size_t)size_bytes);
-    return (int64_t)p;
+/* ── GC runtime ── */
+
+#define SHAPE_FIXED  0
+#define SHAPE_VECTOR 1
+
+typedef struct ShapeDesc {
+    uint32_t num_slots;
+    uint32_t kind;
+    uint64_t pointer_mask;
+} ShapeDesc;
+
+typedef struct ObjHeader {
+    struct ObjHeader *next;
+    uint64_t mark;
+    const ShapeDesc *shape;
+    uint64_t user_size;
+} ObjHeader;
+
+#define HEADER_SIZE sizeof(ObjHeader)
+#define INITIAL_GC_THRESHOLD (256 * 1024)
+#define GC_GROWTH_FACTOR 2
+
+static ObjHeader *gc_all_objects = NULL;
+static size_t gc_bytes_since = 0;
+static size_t gc_total_bytes = 0;
+static size_t gc_threshold = INITIAL_GC_THRESHOLD;
+
+/* Shadow stack */
+static int64_t **shadow_stack = NULL;
+static size_t shadow_stack_len = 0;
+static size_t shadow_stack_cap = 0;
+
+void weir_shadow_push(int64_t *slot) {
+    if (shadow_stack_len >= shadow_stack_cap) {
+        shadow_stack_cap = shadow_stack_cap ? shadow_stack_cap * 2 : 256;
+        shadow_stack = realloc(shadow_stack, shadow_stack_cap * sizeof(int64_t*));
+    }
+    shadow_stack[shadow_stack_len++] = slot;
 }
-int64_t weir_vec_alloc(int64_t len) {
+
+void weir_shadow_pop(int64_t n) {
+    if ((size_t)n > shadow_stack_len) shadow_stack_len = 0;
+    else shadow_stack_len -= (size_t)n;
+}
+
+/* Forward declarations */
+static void mark_object(int64_t user_ptr);
+
+static void gc_collect(void) {
+    /* Mark phase: walk shadow stack roots */
+    for (size_t i = 0; i < shadow_stack_len; i++) {
+        int64_t val = *shadow_stack[i];
+        if (val != 0) mark_object(val);
+    }
+    /* Sweep phase */
+    ObjHeader **prev = &gc_all_objects;
+    ObjHeader *cur = gc_all_objects;
+    while (cur) {
+        ObjHeader *next = cur->next;
+        if (cur->mark & 1) {
+            cur->mark &= ~(uint64_t)1;
+            prev = &cur->next;
+            cur = next;
+        } else {
+            *prev = next;
+            size_t total = HEADER_SIZE + (size_t)cur->user_size;
+            if (gc_total_bytes >= total) gc_total_bytes -= total;
+            free(cur);
+            cur = next;
+        }
+    }
+    gc_bytes_since = 0;
+    if (gc_total_bytes > gc_threshold / 2)
+        gc_threshold = gc_total_bytes * GC_GROWTH_FACTOR;
+}
+
+static void mark_object(int64_t user_ptr) {
+    if (user_ptr == 0) return;
+    ObjHeader *h = (ObjHeader*)((char*)(intptr_t)user_ptr - HEADER_SIZE);
+    if (h->mark & 1) return;
+    h->mark |= 1;
+    const ShapeDesc *s = h->shape;
+    if (!s || s->pointer_mask == 0) return;
+    int64_t *data = (int64_t*)(intptr_t)user_ptr;
+    if (s->kind == SHAPE_FIXED) {
+        for (uint32_t i = 0; i < s->num_slots; i++) {
+            if (s->pointer_mask & (1ULL << i)) {
+                if (data[i] != 0) mark_object(data[i]);
+            }
+        }
+    } else if (s->kind == SHAPE_VECTOR) {
+        if (s->pointer_mask & 1) {
+            int64_t len = data[0];
+            for (int64_t i = 0; i < len; i++) {
+                if (data[1 + i] != 0) mark_object(data[1 + i]);
+            }
+        }
+    }
+}
+
+void weir_gc_collect(void) { gc_collect(); }
+
+int64_t weir_gc_alloc(int64_t size_bytes, int64_t shape_ptr) {
+    size_t user_size = (size_t)size_bytes;
+    if (gc_bytes_since + HEADER_SIZE + user_size > gc_threshold)
+        gc_collect();
+    size_t total = HEADER_SIZE + user_size;
+    ObjHeader *h = (ObjHeader*)calloc(1, total);
+    h->next = gc_all_objects;
+    h->mark = 0;
+    h->shape = (const ShapeDesc*)(intptr_t)shape_ptr;
+    h->user_size = (uint64_t)user_size;
+    gc_all_objects = h;
+    gc_bytes_since += total;
+    gc_total_bytes += total;
+    return (int64_t)(intptr_t)((char*)h + HEADER_SIZE);
+}
+
+int64_t weir_gc_vec_alloc(int64_t len, int64_t shape_ptr) {
     int64_t total = (1 + len) * 8;
-    int64_t ptr = weir_alloc(total);
-    *(int64_t*)ptr = len;
+    int64_t ptr = weir_gc_alloc(total, shape_ptr);
+    *(int64_t*)(intptr_t)ptr = len;
     return ptr;
 }
+
 int64_t weir_vec_get(int64_t ptr, int64_t idx) {
-    return ((int64_t*)ptr)[1 + idx];
+    return ((int64_t*)(intptr_t)ptr)[1 + idx];
 }
 int64_t weir_vec_len(int64_t ptr) {
-    return *(int64_t*)ptr;
+    return *(int64_t*)(intptr_t)ptr;
 }
-int64_t weir_vec_append(int64_t ptr, int64_t elem) {
+int64_t weir_vec_append(int64_t ptr, int64_t elem, int64_t shape_ptr) {
     int64_t old_len = weir_vec_len(ptr);
     int64_t new_len = old_len + 1;
-    int64_t new_ptr = weir_vec_alloc(new_len);
-    memcpy((int64_t*)new_ptr + 1, (int64_t*)ptr + 1, old_len * 8);
-    ((int64_t*)new_ptr)[1 + old_len] = elem;
+    int64_t new_ptr = weir_gc_vec_alloc(new_len, shape_ptr);
+    memcpy((int64_t*)(intptr_t)new_ptr + 1, (int64_t*)(intptr_t)ptr + 1, old_len * 8);
+    ((int64_t*)(intptr_t)new_ptr)[1 + old_len] = elem;
     return new_ptr;
 }
 
@@ -356,11 +436,14 @@ pub fn compile_and_run(
     builder.symbol("weir_str_concat", weir_str_concat as *const u8);
     builder.symbol("weir_str_eq", weir_str_eq as *const u8);
     builder.symbol("weir_str_cmp", weir_str_cmp as *const u8);
-    builder.symbol("weir_alloc", weir_alloc as *const u8);
-    builder.symbol("weir_vec_alloc", weir_vec_alloc as *const u8);
+    builder.symbol("weir_gc_alloc", weir_gc_alloc as *const u8);
+    builder.symbol("weir_gc_vec_alloc", weir_gc_vec_alloc as *const u8);
+    builder.symbol("weir_gc_collect", weir_gc_collect as *const u8);
     builder.symbol("weir_vec_get", weir_vec_get as *const u8);
     builder.symbol("weir_vec_len", weir_vec_len as *const u8);
     builder.symbol("weir_vec_append", weir_vec_append as *const u8);
+    builder.symbol("weir_shadow_push", weir_shadow_push as *const u8);
+    builder.symbol("weir_shadow_pop", weir_shadow_pop as *const u8);
 
     let jit_module = JITModule::new(builder);
 
@@ -731,27 +814,38 @@ impl<'a, M: Module> Compiler<'a, M> {
             .map_err(|e| CodegenError::new(format!("declare weir_str_cmp: {}", e)))?;
         self.runtime_fns.insert("str_cmp", id);
 
-        // weir_alloc(i64) -> i64
+        // weir_gc_alloc(i64, i64) -> i64  [size_bytes, shape_ptr]
         let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
         sig.params.push(AbiParam::new(types::I64));
         sig.returns.push(AbiParam::new(types::I64));
         sig.call_conv = CallConv::SystemV;
         let id = self
             .module
-            .declare_function("weir_alloc", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_alloc: {}", e)))?;
-        self.runtime_fns.insert("alloc", id);
+            .declare_function("weir_gc_alloc", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::new(format!("declare weir_gc_alloc: {}", e)))?;
+        self.runtime_fns.insert("gc_alloc", id);
 
-        // weir_vec_alloc(i64) -> i64
+        // weir_gc_vec_alloc(i64, i64) -> i64  [len, shape_ptr]
         let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
         sig.params.push(AbiParam::new(types::I64));
         sig.returns.push(AbiParam::new(types::I64));
         sig.call_conv = CallConv::SystemV;
         let id = self
             .module
-            .declare_function("weir_vec_alloc", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_vec_alloc: {}", e)))?;
-        self.runtime_fns.insert("vec_alloc", id);
+            .declare_function("weir_gc_vec_alloc", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::new(format!("declare weir_gc_vec_alloc: {}", e)))?;
+        self.runtime_fns.insert("gc_vec_alloc", id);
+
+        // weir_gc_collect() -> void
+        let mut sig = self.module.make_signature();
+        sig.call_conv = CallConv::SystemV;
+        let id = self
+            .module
+            .declare_function("weir_gc_collect", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::new(format!("declare weir_gc_collect: {}", e)))?;
+        self.runtime_fns.insert("gc_collect", id);
 
         // weir_vec_get(i64, i64) -> i64
         let mut sig = self.module.make_signature();
@@ -776,8 +870,9 @@ impl<'a, M: Module> Compiler<'a, M> {
             .map_err(|e| CodegenError::new(format!("declare weir_vec_len: {}", e)))?;
         self.runtime_fns.insert("vec_len", id);
 
-        // weir_vec_append(i64, i64) -> i64
+        // weir_vec_append(i64, i64, i64) -> i64  [vec_ptr, elem, shape_ptr]
         let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
         sig.params.push(AbiParam::new(types::I64));
         sig.params.push(AbiParam::new(types::I64));
         sig.returns.push(AbiParam::new(types::I64));
@@ -787,6 +882,26 @@ impl<'a, M: Module> Compiler<'a, M> {
             .declare_function("weir_vec_append", Linkage::Import, &sig)
             .map_err(|e| CodegenError::new(format!("declare weir_vec_append: {}", e)))?;
         self.runtime_fns.insert("vec_append", id);
+
+        // weir_shadow_push(i64) -> void  [slot_ptr]
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.call_conv = CallConv::SystemV;
+        let id = self
+            .module
+            .declare_function("weir_shadow_push", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::new(format!("declare weir_shadow_push: {}", e)))?;
+        self.runtime_fns.insert("shadow_push", id);
+
+        // weir_shadow_pop(i64) -> void  [count]
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.call_conv = CallConv::SystemV;
+        let id = self
+            .module
+            .declare_function("weir_shadow_pop", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::new(format!("declare weir_shadow_pop: {}", e)))?;
+        self.runtime_fns.insert("shadow_pop", id);
 
         Ok(())
     }
@@ -1185,6 +1300,7 @@ impl<'a, M: Module> Compiler<'a, M> {
                 pending_lambdas: Vec::new(),
                 lambda_counter: &mut self.lambda_counter,
                 type_subst: type_subst.clone(),
+                shadow_depth: 0,
             };
 
             // Bind parameters to variables
@@ -1197,12 +1313,20 @@ impl<'a, M: Module> Compiler<'a, M> {
                     fn_ctx
                         .vars
                         .insert(param.name.clone(), (var, param_tys[i].clone()));
+                    // Push heap-pointer-typed parameters onto the GC shadow stack
+                    if fn_ctx.is_heap_pointer(&param_tys[i]) {
+                        fn_ctx.push_gc_root(block_params[param_idx]);
+                    }
                     param_idx += 1;
                 }
             }
 
             // Compile body
             let body_val = fn_ctx.compile_body(&defn.body, &ret_ty)?;
+
+            // Pop shadow stack entries before returning
+            let depth = fn_ctx.shadow_depth;
+            fn_ctx.emit_shadow_pop(depth);
 
             // Return
             if fn_ctx.ty_cl(&ret_ty).is_some() {
@@ -1294,12 +1418,14 @@ impl<'a, M: Module> Compiler<'a, M> {
                 pending_lambdas: Vec::new(),
                 lambda_counter: &mut self.lambda_counter,
                 type_subst: info.type_subst.clone(),
+                shadow_depth: 0,
             };
 
             let block_params: Vec<Value> = fn_ctx.builder.block_params(entry_block).to_vec();
 
-            // block_params[0] is env_ptr
+            // block_params[0] is env_ptr — it's a heap pointer, push as GC root
             let env_ptr = block_params[0];
+            fn_ctx.push_gc_root(env_ptr);
 
             // Load captures from env_ptr at known offsets
             for (i, (cap_name, cap_ty)) in info.captures.iter().enumerate() {
@@ -1319,12 +1445,20 @@ impl<'a, M: Module> Compiler<'a, M> {
                     let var = fn_ctx.declare_variable(cl_ty);
                     fn_ctx.builder.def_var(var, block_params[param_idx]);
                     fn_ctx.vars.insert(param.name.clone(), (var, info.param_tys[i].clone()));
+                    // Push heap-pointer-typed lambda parameters onto the GC shadow stack
+                    if fn_ctx.is_heap_pointer(&info.param_tys[i]) {
+                        fn_ctx.push_gc_root(block_params[param_idx]);
+                    }
                     param_idx += 1;
                 }
             }
 
             // Compile body
             let body_val = fn_ctx.compile_body(&info.body, &info.ret_ty)?;
+
+            // Pop shadow stack entries before returning
+            let depth = fn_ctx.shadow_depth;
+            fn_ctx.emit_shadow_pop(depth);
 
             // Return
             if fn_ctx.ty_cl(&info.ret_ty).is_some() {
@@ -1528,11 +1662,88 @@ struct FnCompileCtx<'a, 'b, M: Module> {
     /// Type variable substitution for specialization contexts.
     /// Maps generic type var IDs to concrete types.
     type_subst: HashMap<TyVarId, Ty>,
+    /// Number of entries currently pushed onto the GC shadow stack by this function.
+    shadow_depth: usize,
 }
 
 impl<M: Module> FnCompileCtx<'_, '_, M> {
     fn ty_cl(&self, ty: &Ty) -> Option<Type> {
         ty_to_cl_with(ty, Some(self.tagged_adts))
+    }
+
+    /// Returns true if a value of this type is a GC heap pointer.
+    fn is_heap_pointer(&self, ty: &Ty) -> bool {
+        match ty {
+            Ty::Str | Ty::Vector(_) | Ty::Fn(_, _) => true,
+            Ty::Con(name, _) => {
+                // ADTs with any variant that has a payload field are heap-relevant
+                // (the payload might be a heap pointer when packed)
+                if let Some(adt) = self.tagged_adts.get(name) {
+                    adt.field_counts.iter().any(|&c| c > 0)
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Emit a static ShapeDesc in the Cranelift data section and return a Value
+    /// holding the pointer to it.
+    fn emit_shape_desc(
+        &mut self,
+        num_slots: u32,
+        kind: u32,
+        pointer_mask: u64,
+    ) -> Value {
+        // ShapeDesc layout: [num_slots: u32, kind: u32, pointer_mask: u64] = 16 bytes
+        let mut bytes = Vec::with_capacity(16);
+        bytes.extend_from_slice(&num_slots.to_le_bytes());
+        bytes.extend_from_slice(&kind.to_le_bytes());
+        bytes.extend_from_slice(&pointer_mask.to_le_bytes());
+
+        let mut data_desc = DataDescription::new();
+        data_desc.define(bytes.into_boxed_slice());
+        let data_id = self
+            .module
+            .declare_anonymous_data(false, false)
+            .expect("declare shape data");
+        self.module
+            .define_data(data_id, &data_desc)
+            .expect("define shape data");
+        let gv = self.module.declare_data_in_func(data_id, self.builder.func);
+        self.builder.ins().global_value(types::I64, gv)
+    }
+
+    /// Create a stack slot for a heap-pointer value, store it, and push
+    /// its address onto the GC shadow stack so the GC can find it as a root.
+    fn push_gc_root(&mut self, val: Value) {
+        use cranelift_codegen::ir::{StackSlotData, StackSlotKind};
+
+        let ss = self.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            8,
+            0,
+        ));
+        self.builder.ins().stack_store(val, ss, 0);
+        let addr = self.builder.ins().stack_addr(types::I64, ss, 0);
+
+        let push_id = self.runtime_fns["shadow_push"];
+        let push_ref = self.module.declare_func_in_func(push_id, self.builder.func);
+        self.builder.ins().call(push_ref, &[addr]);
+        self.shadow_depth += 1;
+    }
+
+    /// Emit a call to `weir_shadow_pop(count)` to pop entries from the shadow stack.
+    fn emit_shadow_pop(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let count_val = self.builder.ins().iconst(types::I64, count as i64);
+        let pop_id = self.runtime_fns["shadow_pop"];
+        let pop_ref = self.module.declare_func_in_func(pop_id, self.builder.func);
+        self.builder.ins().call(pop_ref, &[count_val]);
+        self.shadow_depth -= count;
     }
 
     fn declare_variable(&mut self, cl_ty: Type) -> Variable {
@@ -1632,6 +1843,7 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
             ExprKind::Call { func, args } => self.compile_call(*func, args, &resolved_ty),
 
             ExprKind::Let { bindings, body } => {
+                let mut let_push_count = 0usize;
                 for b in bindings {
                     let val_ty = self.expr_ty(b.value);
                     let val = self.compile_expr(b.value, &val_ty)?;
@@ -1639,11 +1851,19 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                         let var = self.declare_variable(cl_ty);
                         if let Some(v) = val {
                             self.builder.def_var(var, v);
+                            // Push heap-pointer-typed let bindings onto the GC shadow stack
+                            if self.is_heap_pointer(&val_ty) {
+                                self.push_gc_root(v);
+                                let_push_count += 1;
+                            }
                         }
                         self.vars.insert(b.name.clone(), (var, val_ty));
                     }
                 }
-                self.compile_body(body, &resolved_ty)
+                let result = self.compile_body(body, &resolved_ty);
+                // Pop let-scoped shadow stack entries
+                self.emit_shadow_pop(let_push_count);
+                result
             }
 
             ExprKind::If {
@@ -1769,11 +1989,22 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                 });
 
                 // Allocate closure: [fn_ptr, num_captures, cap_0, cap_1, ...]
+                // Build shape: slots 0,1 are fn_ptr and num_captures (not heap ptrs).
+                // Slots 2..2+n are captures; bit is set if capture type is a heap pointer.
+                let total_slots = (2 + num_captures) as u32;
+                let mut pointer_mask: u64 = 0;
+                for (i, (_, _, cap_ty)) in captures.iter().enumerate() {
+                    if self.is_heap_pointer(cap_ty) {
+                        pointer_mask |= 1u64 << (2 + i);
+                    }
+                }
+                let shape_val = self.emit_shape_desc(total_slots, SHAPE_FIXED, pointer_mask);
+
                 let alloc_size = ((2 + num_captures) * 8) as i64;
                 let alloc_size_val = self.builder.ins().iconst(types::I64, alloc_size);
-                let alloc_id = self.runtime_fns["alloc"];
+                let alloc_id = self.runtime_fns["gc_alloc"];
                 let alloc_ref = self.module.declare_func_in_func(alloc_id, self.builder.func);
-                let call = self.builder.ins().call(alloc_ref, &[alloc_size_val]);
+                let call = self.builder.ins().call(alloc_ref, &[alloc_size_val, shape_val]);
                 let closure_ptr = self.builder.inst_results(call)[0];
 
                 // Store fn_ptr at offset 0
@@ -1802,11 +2033,19 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                 } else {
                     Ty::I64
                 };
+                // Emit vector shape: SHAPE_VECTOR, pointer_mask bit 0 = elements are heap ptrs
+                let elems_are_ptrs = self.is_heap_pointer(&elem_ty);
+                let shape_val = self.emit_shape_desc(
+                    0,
+                    SHAPE_VECTOR,
+                    if elems_are_ptrs { 1 } else { 0 },
+                );
+
                 let len = elems.len() as i64;
                 let len_val = self.builder.ins().iconst(types::I64, len);
-                let alloc_id = self.runtime_fns["vec_alloc"];
+                let alloc_id = self.runtime_fns["gc_vec_alloc"];
                 let alloc_ref = self.module.declare_func_in_func(alloc_id, self.builder.func);
-                let call = self.builder.ins().call(alloc_ref, &[len_val]);
+                let call = self.builder.ins().call(alloc_ref, &[len_val, shape_val]);
                 let ptr = self.builder.inst_results(call)[0];
                 for (i, &elem_id) in elems.iter().enumerate() {
                     let val = self.compile_expr(elem_id, &elem_ty)?.unwrap();
@@ -2019,9 +2258,16 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                         let vec_ptr = self.compile_expr(args[0].value, &vec_ty)?.unwrap();
                         let elem_val = self.compile_expr(args[1].value, &elem_ty)?.unwrap();
                         let widened = self.widen_to_i64(elem_val, &elem_ty);
+                        // Build vector shape for the appended result
+                        let elems_are_ptrs = self.is_heap_pointer(&elem_ty);
+                        let shape_val = self.emit_shape_desc(
+                            0,
+                            SHAPE_VECTOR,
+                            if elems_are_ptrs { 1 } else { 0 },
+                        );
                         let func_id = self.runtime_fns["vec_append"];
                         let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
-                        let call = self.builder.ins().call(func_ref, &[vec_ptr, widened]);
+                        let call = self.builder.ins().call(func_ref, &[vec_ptr, widened, shape_val]);
                         let new_ptr = self.builder.inst_results(call)[0];
                         return Ok(Some(new_ptr));
                     }
@@ -3031,9 +3277,16 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
             .ins()
             .brif(is_ok, ok_block, &[], err_block, &[]);
 
-        // Err block: early return the packed Result (it's already an Err)
+        // Err block: pop shadow stack and early return the packed Result (it's already an Err)
         self.builder.switch_to_block(err_block);
         self.builder.seal_block(err_block);
+        // Pop ALL shadow stack entries for this function before early return
+        if self.shadow_depth > 0 {
+            let count_val = self.builder.ins().iconst(types::I64, self.shadow_depth as i64);
+            let pop_id = self.runtime_fns["shadow_pop"];
+            let pop_ref = self.module.declare_func_in_func(pop_id, self.builder.func);
+            self.builder.ins().call(pop_ref, &[count_val]);
+        }
         self.builder.ins().return_(&[result_val]);
 
         // Ok block: extract payload
@@ -3166,11 +3419,14 @@ fn register_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol("weir_str_concat", weir_str_concat as *const u8);
     builder.symbol("weir_str_eq", weir_str_eq as *const u8);
     builder.symbol("weir_str_cmp", weir_str_cmp as *const u8);
-    builder.symbol("weir_alloc", weir_alloc as *const u8);
-    builder.symbol("weir_vec_alloc", weir_vec_alloc as *const u8);
+    builder.symbol("weir_gc_alloc", weir_gc_alloc as *const u8);
+    builder.symbol("weir_gc_vec_alloc", weir_gc_vec_alloc as *const u8);
+    builder.symbol("weir_gc_collect", weir_gc_collect as *const u8);
     builder.symbol("weir_vec_get", weir_vec_get as *const u8);
     builder.symbol("weir_vec_len", weir_vec_len as *const u8);
     builder.symbol("weir_vec_append", weir_vec_append as *const u8);
+    builder.symbol("weir_shadow_push", weir_shadow_push as *const u8);
+    builder.symbol("weir_shadow_pop", weir_shadow_pop as *const u8);
 }
 
 pub struct DevSession {
@@ -4895,5 +5151,94 @@ mod tests {
                 prop_assert_eq!(compiled, interpreted);
             }
         }
+    }
+
+    // ── GC stress tests ──────────────────────────────────────────
+
+    #[test]
+    fn gc_stress_vector_allocation_loop() {
+        // Allocate many vectors in a loop — GC should collect unreachable ones
+        let source = r#"
+(defn make-vec ((n : i64)) : (Vector i64)
+  [n (+ n 1) (+ n 2)])
+
+(defn main () : Unit
+  (let ((result (make-vec 0)))
+    (let ((result (make-vec 1)))
+      (let ((result (make-vec 2)))
+        (let ((result (make-vec 997)))
+          (println (nth result 0))
+          (println (nth result 1))
+          (println (nth result 2)))))))
+"#;
+        let output = compile_run(source);
+        assert_eq!(output, "997\n998\n999\n");
+    }
+
+    #[test]
+    fn gc_stress_closure_allocation() {
+        // Allocate many closures — GC should handle them
+        let source = r#"
+(defn make-adder (x)
+  (fn (y) (+ x y)))
+
+(defn main ()
+  (let ((add10 (make-adder 10))
+        (add20 (make-adder 20)))
+    (println (add10 5))
+    (println (add20 5))))
+"#;
+        let output = compile_run(source);
+        assert_eq!(output, "15\n25\n");
+    }
+
+    #[test]
+    fn gc_stress_vector_append_chain() {
+        // Build a vector through repeated appends
+        let source = r#"
+(defn main () : Unit
+  (let ((v [1])
+        (v (append v 2))
+        (v (append v 3))
+        (v (append v 4))
+        (v (append v 5)))
+    (println (len v))
+    (println (nth v 0))
+    (println (nth v 4))))
+"#;
+        let output = compile_run(source);
+        assert_eq!(output, "5\n1\n5\n");
+    }
+
+    #[test]
+    fn gc_stress_mixed_heap_types() {
+        // Mix closures, vectors, and strings
+        let source = r#"
+(defn main () : Unit
+  (let ((v [10 20 30])
+        (s (str (nth v 1)))
+        (f (fn ((x : i64)) : i64 (+ x (nth v 0)))))
+    (println (f 5))
+    (println s)
+    (println (len v))))
+"#;
+        let output = compile_run(source);
+        assert_eq!(output, "15\n20\n3\n");
+    }
+
+    #[test]
+    fn gc_oracle_vector_operations() {
+        // Oracle test: GC shouldn't affect program semantics
+        let source = r#"
+(defn sum-vec ((v : (Vector i64)) (i : i64) (acc : i64)) : i64
+  (if (= i (len v))
+    acc
+    (sum-vec v (+ i 1) (+ acc (nth v i)))))
+
+(defn main () : Unit
+  (let ((v [1 2 3 4 5]))
+    (println (sum-vec v 0 0))))
+"#;
+        oracle_test(source);
     }
 }

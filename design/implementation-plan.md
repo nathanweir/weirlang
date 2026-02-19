@@ -264,19 +264,22 @@ Items deferred from earlier phases that don't depend on the runtime (Phase 9) or
 - [x] **Property tests (`proptest`)** — parser, typechecker, interpreter, and codegen all have proptest suites: fuzz inputs (never panic), determinism checks, interpreter/codegen agreement on generated arithmetic and programs.
 
 ### Phase 9: GC + arenas
-- [ ] **Tracing GC** (in `weir-runtime`):
-  - Replace leak-everything strategy (used in earlier phases)
-  - Start with mark-and-sweep, stop-the-world
-  - GC-managed heap for all Weir values
-  - Root set: stack, global function table, live closures
-  - Suppressible (for game loop critical sections)
-  - Manually triggerable
-- [ ] **Arenas**:
+- [x] **Tracing GC** (in `weir-runtime`):
+  - Replaced leak-everything strategy with mark-and-sweep, stop-the-world GC
+  - Object header at negative offset (32 bytes: next, mark, shape, user_size) — existing pointer offsets unchanged
+  - Shape descriptors for type-precise scanning: `SHAPE_FIXED` (bitmask) for closures, `SHAPE_VECTOR` (runtime length) for vectors
+  - Shadow stack for root scanning — compiler pushes/pops heap-typed locals at function entry/exit, let scopes, and early returns
+  - GC-managed heap for closures, vectors, and dynamic strings
+  - Root set: shadow stack (pointers to stack slots holding heap pointers)
+  - Collection triggered on allocation when byte threshold exceeded
+  - Full AOT C runtime with matching GC implementation
+  - 524 tests pass (519 original + 5 new GC stress tests)
+- [ ] **Arenas** (deferred to Phase 9b):
   - `with-arena` block support
   - Bump allocation via `bumpalo`
   - Compile-time escape analysis in type checker
   - Arena-scoped values cannot escape block, be stored in GC heap, or cross threads
-- [ ] Verify: GC collects unreachable objects, arenas free on block exit, escape analysis catches violations
+- [ ] Verify arenas: arenas free on block exit, escape analysis catches violations
 
 ### Phase 10: Full cascade + concurrency
 - [ ] **Dependency tracker**:

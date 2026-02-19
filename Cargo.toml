@@ -7,6 +7,7 @@ members = [
     "crates/weir-typeck",
     "crates/weir-interp",
     "crates/weir-codegen",
+    "crates/weir-runtime",
     "crates/weir-macros",
     "crates/weir-lsp",
     "crates/weir-cli",
@@ -65,4 +66,5 @@ weir-typeck = { path = "crates/weir-typeck" }
 weir-interp = { path = "crates/weir-interp" }
 weir-codegen = { path = "crates/weir-codegen" }
 weir-macros = { path = "crates/weir-macros" }
+weir-runtime = { path = "crates/weir-runtime" }
 weir-lsp = { path = "crates/weir-lsp" }

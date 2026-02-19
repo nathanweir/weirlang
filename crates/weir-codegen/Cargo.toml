@@ -10,6 +10,7 @@ doctest = false
 weir-ast.workspace = true
 weir-typeck.workspace = true
 weir-parser.workspace = true
+weir-runtime.workspace = true
 smol_str.workspace = true
 la-arena.workspace = true
 cranelift-codegen.workspace = true
