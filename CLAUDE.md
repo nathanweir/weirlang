@@ -51,3 +51,10 @@ Use the project-local `tmp/` directory (gitignored) for any scratch files, test 
   - `lsp-status.md` — LSP feature inventory: what's implemented, known limitations, and candidate next features. **Keep this up to date** when adding, changing, or removing LSP features.
 - `.transcripts/` — Raw voice memo transcripts (gitignored, not committed)
 - `README.md` — Project description and workflow explanation
+
+## Implementation Plan Maintenance
+
+When completing features or phases, always update `design/implementation-plan.md`:
+- Mark completed items with `[x]`
+- Update test counts if mentioned
+- Add notes about what was implemented if the description was aspirational

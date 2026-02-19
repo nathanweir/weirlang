@@ -1349,7 +1349,7 @@ impl<'a> Interpreter<'a> {
     }
 
     fn compare_op(
-        &self,
+        &mut self,
         args: &[Value],
         pred: fn(std::cmp::Ordering) -> bool,
         span: Span,
@@ -1360,26 +1360,54 @@ impl<'a> Interpreter<'a> {
                 span,
             ));
         }
+        // Fast path for primitive types
         let ord = match (&args[0], &args[1]) {
-            (Value::Int(a), Value::Int(b)) => a.cmp(b),
+            (Value::Int(a), Value::Int(b)) => Some(a.cmp(b)),
             (Value::Float(a), Value::Float(b)) => {
-                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                Some(a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             }
-            (Value::Int(a), Value::Float(b)) => (*a as f64)
-                .partial_cmp(b)
-                .unwrap_or(std::cmp::Ordering::Equal),
-            (Value::Float(a), Value::Int(b)) => a
-                .partial_cmp(&(*b as f64))
-                .unwrap_or(std::cmp::Ordering::Equal),
-            (Value::String(a), Value::String(b)) => a.cmp(b),
-            _ => {
-                return Err(InterpError::with_span(
-                    "comparison expects comparable arguments",
-                    span,
-                ))
+            (Value::Int(a), Value::Float(b)) => {
+                Some((*a as f64).partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             }
+            (Value::Float(a), Value::Int(b)) => {
+                Some(a.partial_cmp(&(*b as f64)).unwrap_or(std::cmp::Ordering::Equal))
+            }
+            (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
+            _ => None,
         };
-        Ok(Value::Bool(pred(ord)))
+        if let Some(ord) = ord {
+            return Ok(Value::Bool(pred(ord)));
+        }
+
+        // Fallback: dispatch through Ord typeclass
+        if let Some(result) = self.dispatch_method("compare", args, span)? {
+            // result should be an Ordering variant (LT/EQ/GT)
+            let ordering = match &result {
+                Value::Constructor { variant_name, .. } => match variant_name.as_str() {
+                    "LT" => std::cmp::Ordering::Less,
+                    "EQ" => std::cmp::Ordering::Equal,
+                    "GT" => std::cmp::Ordering::Greater,
+                    _ => {
+                        return Err(InterpError::with_span(
+                            format!("Ord compare returned unexpected variant: {}", variant_name),
+                            span,
+                        ))
+                    }
+                },
+                _ => {
+                    return Err(InterpError::with_span(
+                        "Ord compare did not return an Ordering value",
+                        span,
+                    ))
+                }
+            };
+            return Ok(Value::Bool(pred(ordering)));
+        }
+
+        Err(InterpError::with_span(
+            "comparison expects comparable arguments (no Ord instance found)",
+            span,
+        ))
     }
 }
 
@@ -2251,5 +2279,53 @@ mod tests {
         let result = run("(defn main () (println (len 1 2)))");
         assert!(result.is_err());
         assert!(result.unwrap_err().message.contains("len requires 1 argument"));
+    }
+
+    #[test]
+    fn test_ord_custom_type_dispatch() {
+        let output = run_ok(
+            "(deftype Ordering LT EQ GT)
+             (defclass (Ord 'a)
+               (compare : (Fn ['a 'a] Ordering)))
+             (deftype Priority Low Medium High)
+             (instance (Ord Priority)
+               (defn compare ((a : Priority) (b : Priority)) : Ordering
+                 (let ((ra (match a (Low 0) (Medium 1) (High 2)))
+                       (rb (match b (Low 0) (Medium 1) (High 2))))
+                   (if (< ra rb) LT (if (> ra rb) GT EQ)))))
+             (defn main ()
+               (println (< Low High))
+               (println (> High Medium))
+               (println (<= Medium Medium))
+               (println (>= Low High)))",
+        );
+        assert_eq!(output, "true\ntrue\ntrue\nfalse\n");
+    }
+
+    #[test]
+    fn fixture_typeclasses_ord_custom() {
+        insta::assert_snapshot!(run_fixture("typeclasses-ord-custom"), @r"
+        true
+        true
+        true
+        false
+        true
+        ");
+    }
+
+    // ── Property-based tests ────────────────────────────────────
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn interpreter_never_panics_on_parsed_input(s in "\\PC{0,200}") {
+                let expanded = weir_macros::expand(&s);
+                let (module, _errors) = weir_parser::parse(&expanded.source);
+                let _ = interpret(&module);
+            }
+        }
     }
 }

@@ -2176,6 +2176,30 @@ impl<'a> TypeChecker<'a> {
             return self.check_field_access(&obj_ty, &field, span);
         }
 
+        // Check for comparison operators (<, >, <=, >=) — these defer an Ord constraint
+        if let ExprKind::Var(name) = &func_expr.kind {
+            if self.is_comparison_op(name) {
+                let arg_tys: Vec<Ty> = args.iter().map(|a| self.check_expr(a.value)).collect();
+                if arg_tys.len() != 2 {
+                    self.error("comparison requires exactly 2 arguments", span);
+                    return Ty::Error;
+                }
+                self.unify(&arg_tys[0], &arg_tys[1], span);
+                let func_ty = Ty::Fn(arg_tys.clone(), Box::new(Ty::Bool));
+                self.expr_types.insert(func_id, func_ty);
+
+                // If Ord class is in scope, defer an Ord constraint on the arg type
+                if self.class_defs.contains_key("Ord") {
+                    let constraint = ClassConstraint {
+                        class_name: SmolStr::new("Ord"),
+                        type_args: vec![arg_tys[0].clone()],
+                    };
+                    self.deferred_constraints.push((constraint, func_id, span));
+                }
+                return Ty::Bool;
+            }
+        }
+
         // Check for builtin call
         if let ExprKind::Var(name) = &func_expr.kind {
             if self.is_builtin(name) {
@@ -2609,10 +2633,6 @@ impl<'a> TypeChecker<'a> {
                 | "*"
                 | "/"
                 | "mod"
-                | "<"
-                | ">"
-                | "<="
-                | ">="
                 | "="
                 | "!="
                 | "not"
@@ -2626,6 +2646,10 @@ impl<'a> TypeChecker<'a> {
                 | "append"
                 | "type-of"
         )
+    }
+
+    fn is_comparison_op(&self, name: &str) -> bool {
+        matches!(name, "<" | ">" | "<=" | ">=")
     }
 
     fn check_builtin_call(&mut self, name: &str, arg_tys: &[Ty], span: Span) -> Ty {
@@ -2664,14 +2688,6 @@ impl<'a> TypeChecker<'a> {
                     self.unify(&t, a, span);
                 }
                 t
-            }
-            "<" | ">" | "<=" | ">=" => {
-                if arg_tys.len() != 2 {
-                    self.error("comparison requires exactly 2 arguments", span);
-                    return Ty::Error;
-                }
-                self.unify(&arg_tys[0], &arg_tys[1], span);
-                Ty::Bool
             }
             "=" | "!=" => {
                 if arg_tys.len() != 2 {
@@ -3593,5 +3609,96 @@ mod tests {
             "expected undefined variable error, got: {}",
             msg
         );
+    }
+
+    #[test]
+    fn test_comparison_without_ord_still_works() {
+        // Without an Ord class in scope, < still works on primitives (no constraint deferred)
+        check_ok(
+            "(defn main () : Bool (< 1 2))",
+        );
+    }
+
+    #[test]
+    fn test_comparison_with_ord_defers_constraint() {
+        // With Ord in scope, < on i32 defers and resolves the constraint
+        check_ok(
+            "(deftype Ordering LT EQ GT)
+             (defclass (Ord 'a)
+               (compare : (Fn ['a 'a] Ordering)))
+             (instance (Ord i32)
+               (defn compare ((x : i32) (y : i32)) : Ordering
+                 (if (< x y) LT (if (> x y) GT EQ))))
+             (defn main () : Bool (< 1 2))",
+        );
+    }
+
+    #[test]
+    fn test_comparison_custom_type_without_ord_instance_errors() {
+        let msg = check_err(
+            "(deftype Ordering LT EQ GT)
+             (defclass (Ord 'a)
+               (compare : (Fn ['a 'a] Ordering)))
+             (deftype Color Red Green Blue)
+             (defn main () : Bool (< Red Green))",
+        );
+        assert!(
+            msg.contains("no instance of Ord for Color"),
+            "expected 'no instance of Ord' error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_comparison_custom_type_with_ord_instance_passes() {
+        check_ok(
+            "(deftype Ordering LT EQ GT)
+             (defclass (Ord 'a)
+               (compare : (Fn ['a 'a] Ordering)))
+             (deftype Priority Low High)
+             (instance (Ord Priority)
+               (defn compare ((a : Priority) (b : Priority)) : Ordering
+                 LT))
+             (defn main () : Bool (< Low High))",
+        );
+    }
+
+    // ── Property-based tests ────────────────────────────────────
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn typeck_never_panics_on_parsed_input(s in "\\PC{0,200}") {
+                let (module, _errors) = weir_parser::parse(&s);
+                let _ = check(&module);
+            }
+
+            #[test]
+            fn typeck_never_panics_on_lispy_input(
+                s in proptest::string::string_regex(
+                    r"[\(\)\[\] a-z0-9\+\-\*/:;'\n ]{0,150}"
+                ).unwrap()
+            ) {
+                let (module, _errors) = weir_parser::parse(&s);
+                let _ = check(&module);
+            }
+
+            #[test]
+            fn typeck_is_deterministic(
+                s in proptest::string::string_regex(
+                    r"\(defn main \(\) \([\+\-\*] [0-9]{1,3} [0-9]{1,3}\)\)"
+                ).unwrap()
+            ) {
+                let (module, errors) = weir_parser::parse(&s);
+                if errors.is_empty() {
+                    let r1 = check(&module);
+                    let r2 = check(&module);
+                    prop_assert_eq!(r1.errors.len(), r2.errors.len());
+                }
+            }
+        }
     }
 }

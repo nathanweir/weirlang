@@ -26,3 +26,4 @@ weir-parser.workspace = true
 weir-interp.workspace = true
 weir-macros.workspace = true
 insta.workspace = true
+proptest.workspace = true

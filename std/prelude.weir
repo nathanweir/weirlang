@@ -1,3 +1,54 @@
 ;; Weir prelude — implicitly available in all source files
 
 (deftype (Result 'ok 'err) (Ok 'ok) (Err 'err))
+
+;; ── Ordering & Ord ──────────────────────────────────────────────
+
+(deftype Ordering LT EQ GT)
+
+(defclass (Ord 'a)
+  (compare : (Fn ['a 'a] Ordering)))
+
+(instance (Ord i8)
+  (defn compare ((x : i8) (y : i8)) : Ordering
+    (if (< x y) LT (if (> x y) GT EQ))))
+
+(instance (Ord i16)
+  (defn compare ((x : i16) (y : i16)) : Ordering
+    (if (< x y) LT (if (> x y) GT EQ))))
+
+(instance (Ord i32)
+  (defn compare ((x : i32) (y : i32)) : Ordering
+    (if (< x y) LT (if (> x y) GT EQ))))
+
+(instance (Ord i64)
+  (defn compare ((x : i64) (y : i64)) : Ordering
+    (if (< x y) LT (if (> x y) GT EQ))))
+
+(instance (Ord u8)
+  (defn compare ((x : u8) (y : u8)) : Ordering
+    (if (< x y) LT (if (> x y) GT EQ))))
+
+(instance (Ord u16)
+  (defn compare ((x : u16) (y : u16)) : Ordering
+    (if (< x y) LT (if (> x y) GT EQ))))
+
+(instance (Ord u32)
+  (defn compare ((x : u32) (y : u32)) : Ordering
+    (if (< x y) LT (if (> x y) GT EQ))))
+
+(instance (Ord u64)
+  (defn compare ((x : u64) (y : u64)) : Ordering
+    (if (< x y) LT (if (> x y) GT EQ))))
+
+(instance (Ord f32)
+  (defn compare ((x : f32) (y : f32)) : Ordering
+    (if (< x y) LT (if (> x y) GT EQ))))
+
+(instance (Ord f64)
+  (defn compare ((x : f64) (y : f64)) : Ordering
+    (if (< x y) LT (if (> x y) GT EQ))))
+
+(instance (Ord String)
+  (defn compare ((x : String) (y : String)) : Ordering
+    (if (< x y) LT (if (> x y) GT EQ))))

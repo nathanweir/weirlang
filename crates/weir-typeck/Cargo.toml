@@ -14,3 +14,4 @@ la-arena.workspace = true
 [dev-dependencies]
 weir-parser.workspace = true
 insta.workspace = true
+proptest.workspace = true

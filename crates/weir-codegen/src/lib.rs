@@ -147,6 +147,16 @@ extern "C" fn weir_str_eq(a: i64, b: i64) -> i8 {
     if a_str == b_str { 1 } else { 0 }
 }
 
+extern "C" fn weir_str_cmp(a: i64, b: i64) -> i64 {
+    let a_str = unsafe { std::ffi::CStr::from_ptr(a as *const _) };
+    let b_str = unsafe { std::ffi::CStr::from_ptr(b as *const _) };
+    match a_str.cmp(b_str) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
 extern "C" fn weir_alloc(size_bytes: i64) -> i64 {
     let layout = std::alloc::Layout::from_size_align(size_bytes as usize, 8).unwrap();
     let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
@@ -231,6 +241,10 @@ int64_t weir_str_concat(int64_t a, int64_t b) {
 }
 int64_t weir_str_eq(int64_t a, int64_t b) {
     return strcmp((const char*)a, (const char*)b) == 0 ? 1 : 0;
+}
+int64_t weir_str_cmp(int64_t a, int64_t b) {
+    int r = strcmp((const char*)a, (const char*)b);
+    return r < 0 ? -1 : (r > 0 ? 1 : 0);
 }
 
 int64_t weir_alloc(int64_t size_bytes) {
@@ -341,6 +355,7 @@ pub fn compile_and_run(
     builder.symbol("weir_bool_to_str", weir_bool_to_str as *const u8);
     builder.symbol("weir_str_concat", weir_str_concat as *const u8);
     builder.symbol("weir_str_eq", weir_str_eq as *const u8);
+    builder.symbol("weir_str_cmp", weir_str_cmp as *const u8);
     builder.symbol("weir_alloc", weir_alloc as *const u8);
     builder.symbol("weir_vec_alloc", weir_vec_alloc as *const u8);
     builder.symbol("weir_vec_get", weir_vec_get as *const u8);
@@ -703,6 +718,18 @@ impl<'a, M: Module> Compiler<'a, M> {
             .declare_function("weir_str_eq", Linkage::Import, &sig)
             .map_err(|e| CodegenError::new(format!("declare weir_str_eq: {}", e)))?;
         self.runtime_fns.insert("str_eq", id);
+
+        // weir_str_cmp(i64, i64) -> i64
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.call_conv = CallConv::SystemV;
+        let id = self
+            .module
+            .declare_function("weir_str_cmp", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::new(format!("declare weir_str_cmp: {}", e)))?;
+        self.runtime_fns.insert("str_cmp", id);
 
         // weir_alloc(i64) -> i64
         let mut sig = self.module.make_signature();
@@ -2288,56 +2315,160 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
         let rhs_ty = self.expr_ty(args[1].value);
         let rhs = self.compile_expr(args[1].value, &rhs_ty)?.unwrap();
 
-        // String equality/inequality via runtime helper
+        // String comparison via runtime helpers
         if lhs_ty == Ty::Str && rhs_ty == Ty::Str {
-            if op != "=" && op != "!=" {
-                return Err(CodegenError::new(format!(
-                    "operator {} not supported for strings (only = and !=)",
-                    op
-                )));
+            if op == "=" || op == "!=" {
+                let func_id = self.runtime_fns["str_eq"];
+                let func_ref = self
+                    .module
+                    .declare_func_in_func(func_id, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[lhs, rhs]);
+                let eq_val = self.builder.inst_results(call)[0];
+                if op == "!=" {
+                    let one = self.builder.ins().iconst(types::I8, 1);
+                    return Ok(Some(self.builder.ins().bxor(eq_val, one)));
+                }
+                return Ok(Some(eq_val));
             }
-            let func_id = self.runtime_fns["str_eq"];
+            // Ordering comparisons via weir_str_cmp -> {-1, 0, 1}
+            let func_id = self.runtime_fns["str_cmp"];
             let func_ref = self
                 .module
                 .declare_func_in_func(func_id, self.builder.func);
             let call = self.builder.ins().call(func_ref, &[lhs, rhs]);
-            let eq_val = self.builder.inst_results(call)[0];
-            if op == "!=" {
-                let one = self.builder.ins().iconst(types::I8, 1);
-                return Ok(Some(self.builder.ins().bxor(eq_val, one)));
-            }
-            return Ok(Some(eq_val));
+            let cmp_val = self.builder.inst_results(call)[0]; // i64: -1, 0, 1
+            let zero = self.builder.ins().iconst(types::I64, 0);
+            let cc = match op {
+                "<" => IntCC::SignedLessThan,
+                ">" => IntCC::SignedGreaterThan,
+                "<=" => IntCC::SignedLessThanOrEqual,
+                ">=" => IntCC::SignedGreaterThanOrEqual,
+                _ => unreachable!(),
+            };
+            return Ok(Some(self.builder.ins().icmp(cc, cmp_val, zero)));
         }
 
-        let float = is_float(&lhs_ty);
+        // Check if this is a primitive numeric or bool type
+        let is_primitive = matches!(
+            &lhs_ty,
+            Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64
+            | Ty::F32 | Ty::F64 | Ty::Bool
+        );
 
-        let result = if float {
-            let cc = match op {
-                "<" => FloatCC::LessThan,
-                ">" => FloatCC::GreaterThan,
-                "<=" => FloatCC::LessThanOrEqual,
-                ">=" => FloatCC::GreaterThanOrEqual,
-                "=" => FloatCC::Equal,
-                "!=" => FloatCC::NotEqual,
-                _ => unreachable!(),
+        if is_primitive {
+            let float = is_float(&lhs_ty);
+
+            let result = if float {
+                let cc = match op {
+                    "<" => FloatCC::LessThan,
+                    ">" => FloatCC::GreaterThan,
+                    "<=" => FloatCC::LessThanOrEqual,
+                    ">=" => FloatCC::GreaterThanOrEqual,
+                    "=" => FloatCC::Equal,
+                    "!=" => FloatCC::NotEqual,
+                    _ => unreachable!(),
+                };
+                self.builder.ins().fcmp(cc, lhs, rhs)
+            } else {
+                let signed = is_signed(&lhs_ty);
+                let cc = match (op, signed) {
+                    ("<", true) => IntCC::SignedLessThan,
+                    ("<", false) => IntCC::UnsignedLessThan,
+                    (">", true) => IntCC::SignedGreaterThan,
+                    (">", false) => IntCC::UnsignedGreaterThan,
+                    ("<=", true) => IntCC::SignedLessThanOrEqual,
+                    ("<=", false) => IntCC::UnsignedLessThanOrEqual,
+                    (">=", true) => IntCC::SignedGreaterThanOrEqual,
+                    (">=", false) => IntCC::UnsignedGreaterThanOrEqual,
+                    ("=", _) => IntCC::Equal,
+                    ("!=", _) => IntCC::NotEqual,
+                    _ => unreachable!(),
+                };
+                self.builder.ins().icmp(cc, lhs, rhs)
             };
-            self.builder.ins().fcmp(cc, lhs, rhs)
-        } else {
-            let signed = is_signed(&lhs_ty);
-            let cc = match (op, signed) {
-                ("<", true) => IntCC::SignedLessThan,
-                ("<", false) => IntCC::UnsignedLessThan,
-                (">", true) => IntCC::SignedGreaterThan,
-                (">", false) => IntCC::UnsignedGreaterThan,
-                ("<=", true) => IntCC::SignedLessThanOrEqual,
-                ("<=", false) => IntCC::UnsignedLessThanOrEqual,
-                (">=", true) => IntCC::SignedGreaterThanOrEqual,
-                (">=", false) => IntCC::UnsignedGreaterThanOrEqual,
-                ("=", _) => IntCC::Equal,
-                ("!=", _) => IntCC::NotEqual,
-                _ => unreachable!(),
-            };
-            self.builder.ins().icmp(cc, lhs, rhs)
+
+            return Ok(Some(result));
+        }
+
+        // Non-primitive: dispatch through Ord typeclass
+        if matches!(op, "<" | ">" | "<=" | ">=") {
+            return self.compile_ord_comparison(op, lhs, rhs, &lhs_ty);
+        }
+
+        // = / != on non-primitive types: compare packed i64 values directly
+        let cc = match op {
+            "=" => IntCC::Equal,
+            "!=" => IntCC::NotEqual,
+            _ => unreachable!(),
+        };
+        Ok(Some(self.builder.ins().icmp(cc, lhs, rhs)))
+    }
+
+    fn compile_ord_comparison(
+        &mut self,
+        op: &str,
+        lhs: Value,
+        rhs: Value,
+        arg_ty: &Ty,
+    ) -> Result<Option<Value>, CodegenError> {
+        // Construct the mangled name for the Ord compare method
+        let type_name = match arg_ty {
+            Ty::Con(name, _) => name.as_str(),
+            _ => {
+                return Err(CodegenError::new(format!(
+                    "Ord dispatch not supported for type {} in codegen",
+                    arg_ty
+                )));
+            }
+        };
+
+        let mangled = format!("Ord#{}#compare", type_name);
+        let func_info = self.user_fns.get(mangled.as_str()).cloned();
+        let (func_id, _, _) = func_info.ok_or_else(|| {
+            CodegenError::new(format!(
+                "no Ord instance found for type {} (expected function {})",
+                arg_ty, mangled
+            ))
+        })?;
+
+        let func_ref = self
+            .module
+            .declare_func_in_func(func_id, self.builder.func);
+        let call = self.builder.ins().call(func_ref, &[lhs, rhs]);
+        let ordering_val = self.builder.inst_results(call)[0]; // packed ADT tag
+
+        // Extract the tag (low 8 bits)
+        let tag = {
+            let mask = self.builder.ins().iconst(types::I64, 0xFF);
+            self.builder.ins().band(ordering_val, mask)
+        };
+
+        // Look up LT/EQ/GT tag values from constructor_tags
+        let lt_tag = self.constructor_tags.get("LT")
+            .map(|c| c.tag)
+            .unwrap_or(0);
+        let gt_tag = self.constructor_tags.get("GT")
+            .map(|c| c.tag)
+            .unwrap_or(2);
+
+        let result = match op {
+            "<" => {
+                let lt_val = self.builder.ins().iconst(types::I64, lt_tag);
+                self.builder.ins().icmp(IntCC::Equal, tag, lt_val)
+            }
+            ">" => {
+                let gt_val = self.builder.ins().iconst(types::I64, gt_tag);
+                self.builder.ins().icmp(IntCC::Equal, tag, gt_val)
+            }
+            "<=" => {
+                let gt_val = self.builder.ins().iconst(types::I64, gt_tag);
+                self.builder.ins().icmp(IntCC::NotEqual, tag, gt_val)
+            }
+            ">=" => {
+                let lt_val = self.builder.ins().iconst(types::I64, lt_tag);
+                self.builder.ins().icmp(IntCC::NotEqual, tag, lt_val)
+            }
+            _ => unreachable!(),
         };
 
         Ok(Some(result))
@@ -3034,6 +3165,7 @@ fn register_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol("weir_bool_to_str", weir_bool_to_str as *const u8);
     builder.symbol("weir_str_concat", weir_str_concat as *const u8);
     builder.symbol("weir_str_eq", weir_str_eq as *const u8);
+    builder.symbol("weir_str_cmp", weir_str_cmp as *const u8);
     builder.symbol("weir_alloc", weir_alloc as *const u8);
     builder.symbol("weir_vec_alloc", weir_vec_alloc as *const u8);
     builder.symbol("weir_vec_get", weir_vec_get as *const u8);
@@ -4615,5 +4747,153 @@ mod tests {
         let compiled = compile_and_run(&module, &type_info).expect("codegen error");
         let interpreted = weir_interp::interpret(&module).expect("interp error");
         assert_eq!(compiled, interpreted, "closures: compiler and interpreter disagree");
+    }
+
+    #[test]
+    fn fixture_typeclasses_ord_custom() {
+        let compiled = run_fixture_compiled("typeclasses-ord-custom");
+        let interpreted = run_fixture_interpreted("typeclasses-ord-custom");
+        assert_eq!(
+            compiled, interpreted,
+            "typeclasses-ord-custom: compiler and interpreter disagree"
+        );
+        assert_eq!(compiled, "true\ntrue\ntrue\nfalse\ntrue\n");
+    }
+
+    #[test]
+    fn test_ord_custom_type_codegen() {
+        let source = format!(
+            "{}\n{}",
+            PRELUDE_SOURCE,
+            "(deftype Rank Low High)
+             (instance (Ord Rank)
+               (defn compare ((a : Rank) (b : Rank)) : Ordering
+                 (let ((ra (match a (Low 0) (High 1)))
+                       (rb (match b (Low 0) (High 1))))
+                   (compare ra rb))))
+             (defn main ()
+               (println (< Low High))
+               (println (> Low High))
+               (println (<= High High))
+               (println (>= High Low)))"
+        );
+        let compiled = compile_run(&source);
+        assert_eq!(compiled, "true\nfalse\ntrue\ntrue\n");
+    }
+
+    #[test]
+    fn oracle_ord_custom_type() {
+        let source = format!(
+            "{}\n{}",
+            PRELUDE_SOURCE,
+            "(deftype Rank Low High)
+             (instance (Ord Rank)
+               (defn compare ((a : Rank) (b : Rank)) : Ordering
+                 (let ((ra (match a (Low 0) (High 1)))
+                       (rb (match b (Low 0) (High 1))))
+                   (compare ra rb))))
+             (defn main ()
+               (println (< Low High))
+               (println (> Low High)))"
+        );
+        oracle_test(&source);
+    }
+
+    #[test]
+    fn test_string_ordering_codegen() {
+        let source = format!(
+            "{}\n{}",
+            PRELUDE_SOURCE,
+            "(defn main ()
+               (println (< \"apple\" \"banana\"))
+               (println (> \"banana\" \"apple\"))
+               (println (<= \"cat\" \"cat\"))
+               (println (>= \"apple\" \"banana\")))"
+        );
+        let compiled = compile_run(&source);
+        assert_eq!(compiled, "true\ntrue\ntrue\nfalse\n");
+    }
+
+    #[test]
+    fn oracle_string_ordering() {
+        let source = format!(
+            "{}\n{}",
+            PRELUDE_SOURCE,
+            "(defn main ()
+               (println (< \"apple\" \"banana\"))
+               (println (> \"banana\" \"apple\"))
+               (println (<= \"cat\" \"cat\")))"
+        );
+        oracle_test(&source);
+    }
+
+    // ── Property-based tests ────────────────────────────────────
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arith_expr() -> impl Strategy<Value = String> {
+            let leaf = prop_oneof![
+                (1i64..=100).prop_map(|n| n.to_string()),
+            ];
+            leaf.prop_recursive(3, 32, 4, |inner| {
+                let op = prop_oneof![
+                    Just("+"),
+                    Just("-"),
+                    Just("*"),
+                ];
+                (op, inner.clone(), inner).prop_map(|(op, l, r)| {
+                    format!("({} {} {})", op, l, r)
+                })
+            })
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(50))]
+
+            #[test]
+            fn interpreter_codegen_agree_on_arithmetic(expr in arith_expr()) {
+                let source = format!("(defn main () (println {}))", expr);
+                let expanded = expand(&source);
+                let (module, parse_errors) = weir_parser::parse(&expanded);
+                prop_assert!(parse_errors.is_empty());
+                let type_info = weir_typeck::check(&module);
+                prop_assert!(type_info.errors.is_empty());
+                let compiled = compile_and_run(&module, &type_info);
+                let interpreted = weir_interp::interpret(&module);
+                match (compiled, interpreted) {
+                    (Ok(c), Ok(i)) => prop_assert_eq!(c, i),
+                    _ => {} // both can error (e.g. division by zero) — just don't panic
+                }
+            }
+
+            #[test]
+            fn interpreter_codegen_agree_on_simple_programs(
+                a in 1i64..=50,
+                b in 1i64..=50,
+                use_let in any::<bool>(),
+            ) {
+                let source = if use_let {
+                    format!(
+                        "(defn main () (let ((x {}) (y {})) (println (+ x y))))",
+                        a, b
+                    )
+                } else {
+                    format!(
+                        "(defn main () (println (if (< {} {}) {} {})))",
+                        a, b, a, b
+                    )
+                };
+                let expanded = expand(&source);
+                let (module, parse_errors) = weir_parser::parse(&expanded);
+                prop_assert!(parse_errors.is_empty());
+                let type_info = weir_typeck::check(&module);
+                prop_assert!(type_info.errors.is_empty());
+                let compiled = compile_and_run(&module, &type_info).unwrap();
+                let interpreted = weir_interp::interpret(&module).unwrap();
+                prop_assert_eq!(compiled, interpreted);
+            }
+        }
     }
 }

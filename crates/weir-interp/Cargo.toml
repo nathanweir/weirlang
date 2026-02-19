@@ -14,3 +14,4 @@ smol_str.workspace = true
 weir-parser.workspace = true
 weir-macros.workspace = true
 insta.workspace = true
+proptest.workspace = true

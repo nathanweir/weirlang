@@ -2065,6 +2065,7 @@ dependencies = [
  "insta",
  "la-arena",
  "notify",
+ "proptest",
  "smol_str",
  "target-lexicon",
  "weir-ast",
@@ -2079,6 +2080,7 @@ name = "weir-interp"
 version = "0.1.0"
 dependencies = [
  "insta",
+ "proptest",
  "smol_str",
  "weir-ast",
  "weir-macros",
@@ -2139,6 +2141,7 @@ version = "0.1.0"
 dependencies = [
  "insta",
  "la-arena",
+ "proptest",
  "smol_str",
  "weir-ast",
  "weir-parser",

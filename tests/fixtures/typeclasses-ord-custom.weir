@@ -1,0 +1,16 @@
+;; Custom type with Ord instance — uses < and > directly
+
+(deftype Priority Low Medium High)
+
+(instance (Ord Priority)
+  (defn compare ((a : Priority) (b : Priority)) : Ordering
+    (let ((rank-a (match a (Low 0) (Medium 1) (High 2)))
+          (rank-b (match b (Low 0) (Medium 1) (High 2))))
+      (compare rank-a rank-b))))
+
+(defn main ()
+  (println (< Low High))
+  (println (> High Medium))
+  (println (<= Medium Medium))
+  (println (>= Low High))
+  (println (< (+ 1 2) (+ 3 4))))

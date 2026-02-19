@@ -244,8 +244,8 @@ Run `just test` on every commit. Tests must pass before merging.
   - Interpreter: runtime dispatch via type tags
   - Codegen: monomorphization (specialization collection + mangled names)
   - Constraint resolution with deferred checking
-  - [ ] Core typeclasses beyond Eq/Show: `Ord`, `From` — *moved to Phase 8b*
-  - [ ] Coherence checking (Rust-style: only defining module can write instance) — *moved to Phase 8b*
+  - [x] Core typeclasses beyond Eq/Show: `Ord`, `From` — *done in Phase 8b*
+  - [x] Coherence checking (Rust-style: only defining module can write instance) — *done in Phase 8b*
   - [ ] `Shareable` typeclass (auto-derived based on type contents) — *deferred; needs concurrency (Phase 10)*
 - [x] **HKTs**:
   - Kind system (`TyKind::Star`, `TyKind::Arrow`)
@@ -258,10 +258,10 @@ Run `just test` on every commit. Tests must pass before merging.
 ### Phase 8b: Independent deferred items
 Items deferred from earlier phases that don't depend on the runtime (Phase 9) or concurrency (Phase 10).
 
-- [ ] **Core typeclasses: `Ord`, `From`** — extend beyond Eq/Show. `Ord` enables `<`/`>`/`<=`/`>=` via typeclass dispatch instead of hardcoded builtins; `From` enables value conversions.
-- [ ] **Typeclass coherence checking** — enforce that only the module defining a type or class can write an instance (Rust-style orphan rule). Prevents conflicting instances.
-- [ ] **`Result` type + `?` operator** — error propagation. `(deftype (Result 'a 'e) (Ok 'a) (Err 'e))` with `?` desugaring to early return on `Err`. Needs support in parser, type checker, interpreter, and codegen.
-- [ ] **Property tests (`proptest`)** — fuzz the parser (never panics on arbitrary input), test type system invariants (inference idempotency), verify interpreter/codegen agreement on generated programs.
+- [x] **Core typeclasses: `Ord`, `From`** — `Ord` in prelude with instances for all numeric types + String; `<`/`>`/`<=`/`>=` defer Ord constraints and dispatch through typeclass for custom types. `From` implemented as multi-parameter typeclass.
+- [x] **Typeclass coherence checking** — orphan rule + duplicate instance detection implemented.
+- [x] **`Result` type + `?` operator** — `Result` in prelude; `?` desugars to early return on `Err` across parser, typechecker, interpreter, and codegen.
+- [x] **Property tests (`proptest`)** — parser, typechecker, interpreter, and codegen all have proptest suites: fuzz inputs (never panic), determinism checks, interpreter/codegen agreement on generated arithmetic and programs.
 
 ### Phase 9: GC + arenas
 - [ ] **Tracing GC** (in `weir-runtime`):
@@ -290,7 +290,7 @@ Items deferred from earlier phases that don't depend on the runtime (Phase 9) or
   - `channel` (typed channels)
   - `atom` (compare-and-swap)
   - `Shareable` enforcement at spawn/send boundaries
-- [ ] **Result + ? operator**: error propagation in codegen — *moved to Phase 8b*
+- [x] **Result + ? operator**: error propagation in codegen — *done in Phase 8b*
 - [ ] Verify: cascade works for all change types, concurrency primitives are thread-safe
 
 ## Milestone summary
