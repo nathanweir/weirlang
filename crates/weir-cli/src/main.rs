@@ -252,7 +252,21 @@ fn main() {
                 }
             };
 
-            if let Err(e) = session.run_dev_loop(&canonical) {
+            let transform = |raw: &str| -> Result<String, String> {
+                let with_prelude = format!("{}\n{}", PRELUDE_SOURCE, raw);
+                let result = weir_macros::expand(&with_prelude);
+                if !result.errors.is_empty() {
+                    return Err(result
+                        .errors
+                        .iter()
+                        .map(|e| e.message.clone())
+                        .collect::<Vec<_>>()
+                        .join("; "));
+                }
+                Ok(result.source)
+            };
+
+            if let Err(e) = session.run_dev_loop(&canonical, transform) {
                 eprintln!("{}: dev error: {}", file.display(), e);
                 std::process::exit(1);
             }

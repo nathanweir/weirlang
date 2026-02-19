@@ -1324,6 +1324,93 @@ impl<'a, M: Module> Compiler<'a, M> {
         Ok(())
     }
 
+    /// Like `compile_user_functions_with`, but when `dirty_set` is `Some`, only compile
+    /// functions whose name is in the dirty set. All functions must still be declared.
+    fn compile_user_functions_selective(
+        &mut self,
+        fn_table_slots: Option<&HashMap<SmolStr, usize>>,
+        table_data_id: Option<DataId>,
+        dirty_set: Option<&HashSet<SmolStr>>,
+    ) -> Result<(), CodegenError> {
+        let defns: Vec<Defn> = self
+            .ast_module
+            .items
+            .iter()
+            .filter_map(|(item, _)| {
+                if let Item::Defn(d) = item {
+                    Some(d.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for defn in &defns {
+            if !self.user_fns.contains_key(&defn.name) {
+                continue;
+            }
+            // Skip functions not in the dirty set (if provided)
+            if let Some(ds) = dirty_set {
+                if !ds.contains(&defn.name) {
+                    continue;
+                }
+            }
+            self.compile_function_with(defn, fn_table_slots, table_data_id)?;
+        }
+
+        // Compile specializations, also filtered by dirty set
+        self.compile_specializations_selective(fn_table_slots, table_data_id, dirty_set)?;
+
+        Ok(())
+    }
+
+    /// Compile specialization bodies, filtered by dirty set.
+    fn compile_specializations_selective(
+        &mut self,
+        fn_table_slots: Option<&HashMap<SmolStr, usize>>,
+        table_data_id: Option<DataId>,
+        dirty_set: Option<&HashSet<SmolStr>>,
+    ) -> Result<(), CodegenError> {
+        let items = &self.ast_module.items;
+        let mut to_compile: Vec<(SmolStr, Defn)> = Vec::new();
+
+        for spec in &self.type_info.specializations {
+            if !self.user_fns.contains_key(&spec.mangled_name) {
+                continue;
+            }
+            // Skip specializations not in the dirty set
+            if let Some(ds) = dirty_set {
+                if !ds.contains(&spec.mangled_name) {
+                    continue;
+                }
+            }
+
+            if let Some(item_idx) = spec.instance_item_index {
+                if let Some((Item::Instance(inst), _)) = items.get(item_idx) {
+                    for method_defn in &inst.methods {
+                        if method_defn.name == spec.original_name {
+                            to_compile.push((spec.mangled_name.clone(), method_defn.clone()));
+                        }
+                    }
+                }
+            } else {
+                for (item, _) in items {
+                    if let Item::Defn(defn) = item {
+                        if defn.name == spec.original_name {
+                            to_compile.push((spec.mangled_name.clone(), defn.clone()));
+                        }
+                    }
+                }
+            }
+        }
+
+        for (mangled_name, defn) in &to_compile {
+            self.compile_function_named(mangled_name, defn, fn_table_slots, table_data_id)?;
+        }
+
+        Ok(())
+    }
+
     /// Compile specialization bodies (instance methods + generic function instantiations).
     fn compile_specializations(
         &mut self,
@@ -3686,6 +3773,74 @@ fn register_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol("weir_gc_unsuppress", weir_gc_unsuppress as *const u8);
 }
 
+/// What changed between two versions of the source.
+struct ChangeSet {
+    body_changed: HashSet<SmolStr>,
+    sig_changed: HashSet<SmolStr>,
+    added: HashSet<SmolStr>,
+    removed: HashSet<SmolStr>,
+    types_changed: HashSet<SmolStr>,
+}
+
+/// Result of a selective reload.
+pub struct ReloadResult {
+    pub recompiled: Vec<SmolStr>,
+    pub skipped: usize,
+    pub type_warnings: Vec<SmolStr>,
+}
+
+/// Hash the body text of each function from source using its Defn span.
+fn compute_body_hashes(ast_module: &weir_ast::Module, source: &str) -> HashMap<SmolStr, u64> {
+    use std::hash::{Hash, Hasher};
+    let mut hashes = HashMap::new();
+    for (item, _) in &ast_module.items {
+        if let Item::Defn(defn) = item {
+            let start = defn.span.start as usize;
+            let end = defn.span.end as usize;
+            if end <= source.len() {
+                let body_text = &source[start..end];
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                body_text.hash(&mut hasher);
+                hashes.insert(defn.name.clone(), hasher.finish());
+            }
+        }
+    }
+    hashes
+}
+
+/// Extract type→constructor signatures for type change detection.
+fn compute_type_sigs(
+    ast_module: &weir_ast::Module,
+    type_info: &TypeCheckResult,
+) -> HashMap<SmolStr, Vec<(SmolStr, Vec<Ty>)>> {
+    let mut sigs: HashMap<SmolStr, Vec<(SmolStr, Vec<Ty>)>> = HashMap::new();
+    for (item, _) in &ast_module.items {
+        match item {
+            Item::Deftype(dt) => {
+                let mut con_sigs = Vec::new();
+                for variant in &dt.variants {
+                    if let Some(ft) = type_info.fn_types.get(&variant.name) {
+                        con_sigs.push((variant.name.clone(), ft.param_types.clone()));
+                    } else {
+                        con_sigs.push((variant.name.clone(), vec![]));
+                    }
+                }
+                sigs.insert(dt.name.clone(), con_sigs);
+            }
+            Item::Defstruct(ds) => {
+                if let Some(ft) = type_info.fn_types.get(&ds.name) {
+                    sigs.insert(
+                        ds.name.clone(),
+                        vec![(ds.name.clone(), ft.param_types.clone())],
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    sigs
+}
+
 pub struct DevSession {
     ast_module: weir_ast::Module,
     type_info: TypeCheckResult,
@@ -3700,18 +3855,26 @@ pub struct DevSession {
     current_module: JITModule,
     /// Old modules kept alive to prevent code page deallocation.
     _old_modules: Vec<JITModule>,
+    /// Body hashes from the previous source for change detection.
+    body_hashes: HashMap<SmolStr, u64>,
+    /// Type constructor signatures from previous source for type change detection.
+    type_sigs: HashMap<SmolStr, Vec<(SmolStr, Vec<Ty>)>>,
+    /// Previous expanded source for short-circuit.
+    prev_source: String,
 }
 
 type UserFnMap = HashMap<SmolStr, (FuncId, Vec<Ty>, Ty)>;
 type FnSigMap = HashMap<SmolStr, (Vec<Ty>, Ty)>;
 
-/// Helper: compile all functions with indirect dispatch into a JITModule.
+/// Helper: compile functions with indirect dispatch into a JITModule.
+/// When `dirty_set` is `Some`, only compile functions in the set (others are declared but not defined).
 /// Returns (jit_module, user_fns_map, fn_sigs_map).
 fn compile_dev_module(
     ast_module: &weir_ast::Module,
     type_info: &TypeCheckResult,
     fn_table_ptr: *const AtomicPtr<u8>,
     fn_slots: &HashMap<SmolStr, usize>,
+    dirty_set: Option<&HashSet<SmolStr>>,
 ) -> Result<(JITModule, UserFnMap, FnSigMap), CodegenError> {
     let isa = make_isa(false)?;
     let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
@@ -3733,7 +3896,11 @@ fn compile_dev_module(
         fn_sigs.insert(name.clone(), (param_tys.clone(), ret_ty.clone()));
     }
 
-    compiler.compile_user_functions_with(Some(fn_slots), Some(table_data_id))?;
+    compiler.compile_user_functions_selective(
+        Some(fn_slots),
+        Some(table_data_id),
+        dirty_set,
+    )?;
 
     compiler
         .module
@@ -3780,7 +3947,7 @@ impl DevSession {
             .into_boxed_slice();
 
         let (jit_module, user_fns, fn_sigs) =
-            compile_dev_module(&ast_module, &type_info, fn_table.as_ptr(), &fn_slots)?;
+            compile_dev_module(&ast_module, &type_info, fn_table.as_ptr(), &fn_slots, None)?;
 
         // Populate fn_table with finalized function pointers
         for (name, &slot_idx) in &fn_slots {
@@ -3788,6 +3955,9 @@ impl DevSession {
             let ptr = jit_module.get_finalized_function(*func_id);
             fn_table[slot_idx].store(ptr as *mut u8, Ordering::Release);
         }
+
+        let body_hashes = compute_body_hashes(&ast_module, source);
+        let type_sigs = compute_type_sigs(&ast_module, &type_info);
 
         Ok(DevSession {
             ast_module,
@@ -3797,13 +3967,25 @@ impl DevSession {
             fn_sigs,
             current_module: jit_module,
             _old_modules: Vec::new(),
+            body_hashes,
+            type_sigs,
+            prev_source: source.to_string(),
         })
     }
 
-    /// Recompile all functions from new source and swap pointers in the table.
-    /// Returns the list of function names on success.
+    /// Selectively recompile only dirty functions from new source and swap pointers.
+    /// Returns a `ReloadResult` with recompilation stats and type warnings.
     /// On parse/type error, returns Err but keeps old code running.
-    pub fn reload(&mut self, new_source: &str) -> Result<Vec<String>, CodegenError> {
+    pub fn reload(&mut self, new_source: &str) -> Result<ReloadResult, CodegenError> {
+        // Short-circuit: if expanded source is identical, skip everything
+        if new_source == self.prev_source {
+            return Ok(ReloadResult {
+                recompiled: vec![],
+                skipped: self.fn_slots.len(),
+                type_warnings: vec![],
+            });
+        }
+
         let (ast_module, parse_errors) = weir_parser::parse(new_source);
         if !parse_errors.is_empty() {
             return Err(CodegenError::new(format!(
@@ -3818,6 +4000,136 @@ impl DevSession {
                 "type error: {}",
                 type_info.errors[0].message
             )));
+        }
+
+        // Compute change set
+        let new_body_hashes = compute_body_hashes(&ast_module, new_source);
+        let new_type_sigs = compute_type_sigs(&ast_module, &type_info);
+
+        let old_fn_names: HashSet<SmolStr> = self.fn_slots.keys().cloned().collect();
+        let new_fn_names: HashSet<SmolStr> = ast_module
+            .items
+            .iter()
+            .filter_map(|(item, _)| {
+                if let Item::Defn(defn) = item {
+                    Some(defn.name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut change_set = ChangeSet {
+            body_changed: HashSet::new(),
+            sig_changed: HashSet::new(),
+            added: HashSet::new(),
+            removed: HashSet::new(),
+            types_changed: HashSet::new(),
+        };
+
+        // Detect added/removed functions
+        for name in &new_fn_names {
+            if !old_fn_names.contains(name) {
+                change_set.added.insert(name.clone());
+            }
+        }
+        for name in &old_fn_names {
+            if !new_fn_names.contains(name) {
+                change_set.removed.insert(name.clone());
+            }
+        }
+
+        // Detect body and signature changes for existing functions
+        for name in new_fn_names.intersection(&old_fn_names) {
+            // Signature change?
+            let old_sig = self.fn_sigs.get(name);
+            let new_sig = type_info.fn_types.get(name).map(|ft| {
+                (ft.param_types.clone(), ft.return_type.clone())
+            });
+            let sig_changed = match (old_sig, &new_sig) {
+                (Some(old), Some(new)) => old != new,
+                _ => true,
+            };
+            if sig_changed {
+                change_set.sig_changed.insert(name.clone());
+                continue; // sig change subsumes body change
+            }
+
+            // Body change?
+            let old_hash = self.body_hashes.get(name);
+            let new_hash = new_body_hashes.get(name);
+            if old_hash != new_hash {
+                change_set.body_changed.insert(name.clone());
+            }
+        }
+
+        // Detect type changes
+        for (type_name, new_cons) in &new_type_sigs {
+            match self.type_sigs.get(type_name) {
+                Some(old_cons) if old_cons == new_cons => {}
+                _ => {
+                    change_set.types_changed.insert(type_name.clone());
+                }
+            }
+        }
+        // Check for removed types
+        for type_name in self.type_sigs.keys() {
+            if !new_type_sigs.contains_key(type_name) {
+                change_set.types_changed.insert(type_name.clone());
+            }
+        }
+
+        // Compute dirty set using dependency graph + change set
+        let deps = &type_info.deps;
+        let mut dirty: HashSet<SmolStr> = HashSet::new();
+
+        // Body-only changes: just the function itself
+        for name in &change_set.body_changed {
+            dirty.insert(name.clone());
+        }
+
+        // Signature changes: function + transitive callers
+        for name in &change_set.sig_changed {
+            dirty.insert(name.clone());
+            self.add_transitive_callers(name, deps, &mut dirty);
+        }
+
+        // Type changes: all functions using the type + their transitive callers
+        for type_name in &change_set.types_changed {
+            if let Some(users) = deps.type_users.get(type_name) {
+                let users_snapshot: Vec<SmolStr> = users.iter().cloned().collect();
+                for user in &users_snapshot {
+                    dirty.insert(user.clone());
+                    self.add_transitive_callers(user, deps, &mut dirty);
+                }
+            }
+        }
+
+        // Added functions
+        for name in &change_set.added {
+            dirty.insert(name.clone());
+        }
+
+        // Expand dirty set to include specializations of dirty functions
+        let mut spec_dirty: Vec<SmolStr> = Vec::new();
+        for spec in &type_info.specializations {
+            if dirty.contains(&spec.original_name) {
+                spec_dirty.push(spec.mangled_name.clone());
+            }
+        }
+        dirty.extend(spec_dirty);
+
+        // Type warnings
+        let type_warnings: Vec<SmolStr> = change_set.types_changed.iter().cloned().collect();
+
+        // If nothing is dirty, skip compilation
+        if dirty.is_empty() {
+            self.prev_source = new_source.to_string();
+            return Ok(ReloadResult {
+                recompiled: vec![],
+                skipped: self.fn_slots.len(),
+                type_warnings,
+            });
         }
 
         // Reassign slots for the new source
@@ -3849,16 +4161,23 @@ impl DevSession {
             &type_info,
             self.fn_table.as_ptr(),
             &new_fn_slots,
+            Some(&dirty),
         )?;
 
-        // Swap function pointers in the table
-        let mut reloaded_names = Vec::new();
+        // Swap only dirty function pointers in the table
+        let mut recompiled = Vec::new();
         for (name, &slot_idx) in &new_fn_slots {
-            let (func_id, _, _) = &user_fns[name];
-            let ptr = jit_module.get_finalized_function(*func_id);
-            self.fn_table[slot_idx].store(ptr as *mut u8, Ordering::Release);
-            reloaded_names.push(name.to_string());
+            if !dirty.contains(name) {
+                continue;
+            }
+            if let Some((func_id, _, _)) = user_fns.get(name) {
+                let ptr = jit_module.get_finalized_function(*func_id);
+                self.fn_table[slot_idx].store(ptr as *mut u8, Ordering::Release);
+                recompiled.push(name.clone());
+            }
         }
+
+        let skipped = new_fn_slots.len() - recompiled.len();
 
         // Keep old module alive
         let old_module = std::mem::replace(&mut self.current_module, jit_module);
@@ -3869,8 +4188,35 @@ impl DevSession {
         self.type_info = type_info;
         self.fn_slots = new_fn_slots;
         self.fn_sigs = new_fn_sigs;
+        self.body_hashes = new_body_hashes;
+        self.type_sigs = new_type_sigs;
+        self.prev_source = new_source.to_string();
 
-        Ok(reloaded_names)
+        Ok(ReloadResult {
+            recompiled,
+            skipped,
+            type_warnings,
+        })
+    }
+
+    /// BFS to find all transitive callers of a function.
+    fn add_transitive_callers(
+        &self,
+        name: &SmolStr,
+        deps: &weir_typeck::DependencyGraph,
+        dirty: &mut HashSet<SmolStr>,
+    ) {
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(name.clone());
+        while let Some(current) = queue.pop_front() {
+            if let Some(callers) = deps.callers.get(&current) {
+                for caller in callers {
+                    if dirty.insert(caller.clone()) {
+                        queue.push_back(caller.clone());
+                    }
+                }
+            }
+        }
     }
 
     /// Get a callable function pointer for main() (reads through the fn_table).
@@ -3898,7 +4244,15 @@ impl DevSession {
     }
 
     /// Run the dev loop: spawn main() on a background thread, watch for file changes.
-    pub fn run_dev_loop(mut self, source_path: &Path) -> Result<(), CodegenError> {
+    /// `transform_source` is called on the raw file contents before reload (e.g. prepend prelude + expand macros).
+    pub fn run_dev_loop<F>(
+        mut self,
+        source_path: &Path,
+        transform_source: F,
+    ) -> Result<(), CodegenError>
+    where
+        F: Fn(&str) -> Result<String, String>,
+    {
         use notify::{RecursiveMode, Watcher};
         use std::sync::mpsc;
         use std::time::Duration;
@@ -3953,8 +4307,8 @@ impl DevSession {
                     std::thread::sleep(Duration::from_millis(50));
                     while rx.try_recv().is_ok() {}
 
-                    // Read new source
-                    let new_source = match std::fs::read_to_string(&source_path) {
+                    // Read new source and apply transform (prelude + macro expansion)
+                    let raw_source = match std::fs::read_to_string(&source_path) {
                         Ok(s) => s,
                         Err(e) => {
                             eprintln!("[weir dev] error reading file: {}", e);
@@ -3962,9 +4316,34 @@ impl DevSession {
                         }
                     };
 
+                    let new_source = match transform_source(&raw_source) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[weir dev] transform error: {}", e);
+                            continue;
+                        }
+                    };
+
                     match self.reload(&new_source) {
-                        Ok(names) => {
-                            eprintln!("[weir dev] reloaded: {}", names.join(", "));
+                        Ok(result) => {
+                            for tw in &result.type_warnings {
+                                eprintln!(
+                                    "[weir dev] type '{}' was redefined — live instances have stale layout",
+                                    tw
+                                );
+                            }
+                            if result.recompiled.is_empty() {
+                                eprintln!("[weir dev] no changes detected");
+                            } else {
+                                let names: Vec<&str> =
+                                    result.recompiled.iter().map(|s| s.as_str()).collect();
+                                eprintln!(
+                                    "[weir dev] reloaded {} fn(s): {} (skipped {})",
+                                    result.recompiled.len(),
+                                    names.join(", "),
+                                    result.skipped
+                                );
+                            }
                         }
                         Err(e) => {
                             eprintln!("[weir dev] reload error (old code still running): {}", e);
@@ -4599,8 +4978,8 @@ mod tests {
 
         let source_v2 = "(defn greet () : Unit (println 2))
              (defn main () : Unit (greet))";
-        let reloaded = session.reload(source_v2).expect("reload failed");
-        assert!(!reloaded.is_empty(), "should have reloaded functions");
+        let result = session.reload(source_v2).expect("reload failed");
+        assert!(!result.recompiled.is_empty(), "should have reloaded functions");
 
         let out2 = session.run_main().expect("run_main v2 failed");
         assert_eq!(out2, "2\n");
@@ -4649,6 +5028,142 @@ mod tests {
                 name
             );
         }
+    }
+
+    // ── Selective reload tests ────────────────────────────────────
+
+    #[test]
+    fn test_dev_no_change() {
+        let source = "(defn helper () : i32 42)
+             (defn main () : Unit (println (helper)))";
+        let mut session = DevSession::new(source).expect("DevSession::new failed");
+        let out1 = session.run_main().expect("run_main failed");
+        assert_eq!(out1, "42\n");
+
+        // Reload with identical source → 0 recompilations
+        let result = session.reload(source).expect("reload failed");
+        assert!(result.recompiled.is_empty(), "no changes should mean no recompilations");
+        assert_eq!(result.skipped, 2); // helper + main
+
+        let out2 = session.run_main().expect("run_main after no-change reload");
+        assert_eq!(out2, "42\n");
+    }
+
+    #[test]
+    fn test_dev_body_change() {
+        let source_v1 = "(defn helper () : i32 42)
+             (defn main () : Unit (println (helper)))";
+        let mut session = DevSession::new(source_v1).expect("DevSession::new failed");
+        assert_eq!(session.run_main().unwrap(), "42\n");
+
+        // Change only helper's body (same signature)
+        let source_v2 = "(defn helper () : i32 99)
+             (defn main () : Unit (println (helper)))";
+        let result = session.reload(source_v2).expect("reload failed");
+
+        // Only helper should be recompiled (body change), not main
+        assert!(
+            result.recompiled.iter().any(|n| n == "helper"),
+            "helper should be recompiled: {:?}",
+            result.recompiled
+        );
+        // main should NOT be in the recompiled list (body didn't change,
+        // and body-only changes don't cascade to callers)
+        assert!(
+            !result.recompiled.iter().any(|n| n == "main"),
+            "main should NOT be recompiled for body-only change: {:?}",
+            result.recompiled
+        );
+
+        assert_eq!(session.run_main().unwrap(), "99\n");
+    }
+
+    #[test]
+    fn test_dev_sig_change() {
+        let source_v1 = "(defn helper () : i32 42)
+             (defn main () : Unit (println (helper)))";
+        let mut session = DevSession::new(source_v1).expect("DevSession::new failed");
+        assert_eq!(session.run_main().unwrap(), "42\n");
+
+        // Change helper's return type (i32 → i64) — signature change
+        let source_v2 = "(defn helper () : i64 99)
+             (defn main () : Unit (println (helper)))";
+        let result = session.reload(source_v2).expect("reload failed");
+
+        // Both helper and main should be recompiled (sig change cascades)
+        assert!(
+            result.recompiled.iter().any(|n| n == "helper"),
+            "helper should be recompiled"
+        );
+        assert!(
+            result.recompiled.iter().any(|n| n == "main"),
+            "main should be recompiled (calls helper whose sig changed)"
+        );
+
+        assert_eq!(session.run_main().unwrap(), "99\n");
+    }
+
+    #[test]
+    fn test_dev_type_change() {
+        let source_v1 = "(deftype Color (Red) (Blue))
+             (defn pick () : Color Red)
+             (defn main () : Unit (println 1))";
+        let mut session = DevSession::new(source_v1).expect("DevSession::new failed");
+        assert_eq!(session.run_main().unwrap(), "1\n");
+
+        // Add a variant to Color — type change
+        let source_v2 = "(deftype Color (Red) (Blue) (Green))
+             (defn pick () : Color Red)
+             (defn main () : Unit (println 1))";
+        let result = session.reload(source_v2).expect("reload failed");
+
+        // pick uses Color, so it should be recompiled
+        assert!(
+            result.recompiled.iter().any(|n| n == "pick"),
+            "pick should be recompiled (uses changed type): {:?}",
+            result.recompiled
+        );
+        // Type warning should mention Color
+        assert!(
+            result.type_warnings.iter().any(|t| t == "Color"),
+            "should warn about Color type change: {:?}",
+            result.type_warnings
+        );
+    }
+
+    #[test]
+    fn test_dev_added_fn() {
+        let source_v1 = "(defn main () : Unit (println 1))";
+        let mut session = DevSession::new(source_v1).expect("DevSession::new failed");
+        assert_eq!(session.run_main().unwrap(), "1\n");
+
+        // Add a new function
+        let source_v2 = "(defn helper () : i32 99)
+             (defn main () : Unit (println (helper)))";
+        let result = session.reload(source_v2).expect("reload failed");
+
+        assert!(
+            result.recompiled.iter().any(|n| n == "helper"),
+            "new function should be compiled"
+        );
+
+        assert_eq!(session.run_main().unwrap(), "99\n");
+    }
+
+    #[test]
+    fn test_dev_macro_reload() {
+        // Verify that macro expansion works correctly through the transform
+        // (The integration is in CLI, but we can test that reload with different
+        // expanded source works)
+        let source_v1 = "(defn main () : Unit (println 1))";
+        let mut session = DevSession::new(source_v1).expect("DevSession::new failed");
+        assert_eq!(session.run_main().unwrap(), "1\n");
+
+        // Simulate what would happen after macro re-expansion changes the source
+        let source_v2 = "(defn main () : Unit (println 2))";
+        let result = session.reload(source_v2).expect("reload failed");
+        assert!(!result.recompiled.is_empty());
+        assert_eq!(session.run_main().unwrap(), "2\n");
     }
 
     // ── Typeclass codegen tests ──────────────────────────────────

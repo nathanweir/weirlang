@@ -289,11 +289,18 @@ Items deferred from earlier phases that don't depend on the runtime (Phase 9) or
   - Build and run the `ref`-based use-after-free example from `design/memory-management.md` to demonstrate the limitation
   - Evaluate mitigation: forbid arena values in `ref` params, add provenance annotations, or runtime tagging
   - See "Known escape vector: `ref` parameters" in `design/memory-management.md`
-- [ ] **Dependency tracker**:
-  - Track expansion, type, and call dependencies
-  - Full cascade: macro change → re-expand → re-typecheck → recompile
-  - Type change → recompile dependents + soft restart communication
-  - Short-circuit: skip cascade when expansion output unchanged
+- [x] **Dependency tracker** (Phase 10a):
+  - `DependencyGraph` in typechecker: call_deps, type_deps, callers, type_users — populated during typechecking
+  - `ChangeSet` in codegen: body_changed, sig_changed, added, removed, types_changed
+  - Body hashing (Defn span → u64) + signature comparison + type constructor signature comparison
+  - Dirty set computation: body-only → just that fn; sig change → fn + transitive callers; type change → users + transitive callers
+  - Specialization expansion: dirty generic fn → all its monomorphized specializations are also dirty
+  - `compile_user_functions_selective`: only compiles functions in the dirty set
+  - Macro integration: `run_dev_loop` accepts `transform_source` closure; CLI passes prelude+expand
+  - Expansion short-circuit: identical expanded source → skip entire reload
+  - Soft restart warnings: type redefinition prints stale-layout warning to stderr
+  - `ReloadResult`: recompiled names, skipped count, type warnings
+  - 570 tests pass (10 new: 4 dep graph + 6 selective reload)
 - [ ] **Concurrency primitives**:
   - `spawn` / `with-tasks` (structured concurrency)
   - `par-map` / `par-for-each` (parallel iteration)

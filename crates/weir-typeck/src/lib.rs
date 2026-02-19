@@ -161,6 +161,19 @@ pub struct Specialization {
     pub instance_item_index: Option<usize>,
 }
 
+/// Tracks inter-function and function→type dependencies for selective recompilation.
+#[derive(Debug, Clone, Default)]
+pub struct DependencyGraph {
+    /// Function A calls function B: A → {B, C, ...}
+    pub call_deps: HashMap<SmolStr, HashSet<SmolStr>>,
+    /// Function A uses type T (constructor, pattern match, field access)
+    pub type_deps: HashMap<SmolStr, HashSet<SmolStr>>,
+    /// Reverse: B is called by {A, C, ...}
+    pub callers: HashMap<SmolStr, HashSet<SmolStr>>,
+    /// Reverse: type T is used by {A, B, ...}
+    pub type_users: HashMap<SmolStr, HashSet<SmolStr>>,
+}
+
 pub struct TypeCheckResult {
     pub errors: Vec<TypeError>,
     /// Resolved type for every expression, after substitution + numeric defaulting.
@@ -171,6 +184,8 @@ pub struct TypeCheckResult {
     pub method_resolutions: HashMap<ExprId, SmolStr>,
     /// Monomorphized specializations needed for codegen.
     pub specializations: Vec<Specialization>,
+    /// Dependency graph for selective recompilation.
+    pub deps: DependencyGraph,
 }
 
 // ── Public API ───────────────────────────────────────────────────
@@ -186,6 +201,7 @@ pub fn check_with_externals(module: &Module, externals: &HashSet<SmolStr>) -> Ty
     let mut checker = TypeChecker::new(module, externals);
     checker.collect_definitions();
     checker.check_items();
+    checker.compute_reverse_deps();
 
     // Apply final substitution to all recorded expression types
     let mut expr_types = ArenaMap::default();
@@ -302,6 +318,7 @@ pub fn check_with_externals(module: &Module, externals: &HashSet<SmolStr>) -> Ty
         fn_types,
         method_resolutions: checker.method_resolutions,
         specializations,
+        deps: checker.dep_graph,
     }
 }
 
@@ -481,6 +498,11 @@ struct TypeChecker<'a> {
     /// Return type of the function currently being checked (for `?` operator).
     current_fn_return_type: Option<Ty>,
 
+    /// Name of the function currently being checked (for dependency tracking).
+    current_fn_name: Option<SmolStr>,
+    /// Dependency graph built during typechecking.
+    dep_graph: DependencyGraph,
+
     /// Current arena nesting depth (0 = not inside with-arena)
     arena_depth: u32,
     /// Per-variable arena provenance depth (0 = GC/stack, >0 = arena), scope-aware
@@ -510,9 +532,56 @@ impl<'a> TypeChecker<'a> {
             method_resolutions: HashMap::new(),
             external_names: externals.clone(),
             current_fn_return_type: None,
+            current_fn_name: None,
+            dep_graph: DependencyGraph::default(),
             arena_depth: 0,
             var_provenance: vec![HashMap::new()],
             expr_provenance: ArenaMap::default(),
+        }
+    }
+
+    // ── Dependency tracking ─────────────────────────────────────
+
+    fn record_call_dep(&mut self, callee: &SmolStr) {
+        if let Some(caller) = &self.current_fn_name {
+            self.dep_graph
+                .call_deps
+                .entry(caller.clone())
+                .or_default()
+                .insert(callee.clone());
+        }
+    }
+
+    fn record_type_dep(&mut self, type_name: &SmolStr) {
+        if let Some(fn_name) = &self.current_fn_name {
+            self.dep_graph
+                .type_deps
+                .entry(fn_name.clone())
+                .or_default()
+                .insert(type_name.clone());
+        }
+    }
+
+    fn compute_reverse_deps(&mut self) {
+        self.dep_graph.callers.clear();
+        for (caller, callees) in &self.dep_graph.call_deps {
+            for callee in callees {
+                self.dep_graph
+                    .callers
+                    .entry(callee.clone())
+                    .or_default()
+                    .insert(caller.clone());
+            }
+        }
+        self.dep_graph.type_users.clear();
+        for (fn_name, types) in &self.dep_graph.type_deps {
+            for type_name in types {
+                self.dep_graph
+                    .type_users
+                    .entry(type_name.clone())
+                    .or_default()
+                    .insert(fn_name.clone());
+            }
         }
     }
 
@@ -1731,6 +1800,10 @@ impl<'a> TypeChecker<'a> {
 
         self.push_scope();
 
+        // Set current function name for dependency tracking
+        let prev_fn_name = self.current_fn_name.take();
+        self.current_fn_name = Some(name.clone());
+
         // Set current function return type for ? operator checking
         let prev_return_type = self.current_fn_return_type.take();
         self.current_fn_return_type = Some(scheme.return_type.clone());
@@ -1748,8 +1821,9 @@ impl<'a> TypeChecker<'a> {
             self.unify(&body_ty, &scheme.return_type, d.span);
         }
 
-        // Restore previous return type
+        // Restore previous return type and function name
         self.current_fn_return_type = prev_return_type;
+        self.current_fn_name = prev_fn_name;
 
         self.pop_scope();
 
@@ -1966,6 +2040,7 @@ impl<'a> TypeChecker<'a> {
             ExprKind::Var(name) => {
                 // Check if it's a constructor
                 if let Some(info) = self.constructors.get(name).cloned() {
+                    self.record_type_dep(&info.0);
                     return self.instantiate_constructor(&info.0, &info.1, &info.2);
                 }
                 // Check if it's a known function (instantiate its scheme)
@@ -2340,6 +2415,8 @@ impl<'a> TypeChecker<'a> {
 
             // Check for ADT constructor call
             if let Some(info) = self.constructors.get(name).cloned() {
+                // Record type dependency: this function uses this type
+                self.record_type_dep(&info.0);
                 let con_ty = self.instantiate_constructor(&info.0, &info.1, &info.2);
                 let arg_tys: Vec<Ty> = args.iter().map(|a| self.check_expr(a.value)).collect();
 
@@ -2375,11 +2452,13 @@ impl<'a> TypeChecker<'a> {
 
             // Check for struct constructor call
             if let Some(sdef) = self.struct_defs.get(name).cloned() {
+                self.record_type_dep(&sdef.name);
                 return self.check_struct_construction(&sdef, args, span);
             }
 
             // Regular function call — instantiate the scheme
             if let Some(scheme) = self.fn_schemes.get(name).cloned() {
+                self.record_call_dep(name);
                 let (param_tys, ret_ty, constraints) = self.instantiate(&scheme);
                 let arg_tys: Vec<Ty> = args.iter().map(|a| self.check_expr(a.value)).collect();
 
@@ -2427,6 +2506,8 @@ impl<'a> TypeChecker<'a> {
 
         if let Ty::Con(name, type_args) = &obj_ty {
             if let Some(sdef) = self.struct_defs.get(name).cloned() {
+                // Record type dependency for field access
+                self.record_type_dep(name);
                 // Instantiate struct type params
                 let mapping: HashMap<SmolStr, Ty> = sdef
                     .params
@@ -2596,6 +2677,8 @@ impl<'a> TypeChecker<'a> {
                 let args = args.clone();
 
                 if let Some(info) = self.constructors.get(&name).cloned() {
+                    // Record type dependency for pattern matching
+                    self.record_type_dep(&info.0);
                     let con_ty = self.instantiate_constructor(&info.0, &info.1, &info.2);
 
                     match con_ty {
@@ -2658,6 +2741,8 @@ impl<'a> TypeChecker<'a> {
 
                 if let Ty::Con(name, type_args) = &expected {
                     if let Some(sdef) = self.struct_defs.get(name).cloned() {
+                        // Record type dependency for struct destructuring
+                        self.record_type_dep(name);
                         let mapping: HashMap<SmolStr, Ty> = sdef
                             .params
                             .iter()
@@ -3923,5 +4008,85 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── Dependency graph tests ────────────────────────────────────
+
+    #[test]
+    fn dep_graph_call_chain() {
+        // A calls B calls C → forward and reverse deps
+        let source = "(defn c () : i32 42)
+                      (defn b () : i32 (c))
+                      (defn a () : i32 (b))";
+        let (module, errors) = weir_parser::parse(source);
+        assert!(errors.is_empty());
+        let result = check(&module);
+        assert!(result.errors.is_empty());
+
+        let deps = &result.deps;
+        // Forward: a→{b}, b→{c}
+        assert!(deps.call_deps.get("a").unwrap().contains("b"));
+        assert!(deps.call_deps.get("b").unwrap().contains("c"));
+        // Reverse: c is called by {b}, b is called by {a}
+        assert!(deps.callers.get("c").unwrap().contains("b"));
+        assert!(deps.callers.get("b").unwrap().contains("a"));
+    }
+
+    #[test]
+    fn dep_graph_type_usage() {
+        // Function uses a deftype constructor
+        let source = "(deftype Color (Red) (Green) (Blue))
+                      (defn pick () : Color Red)";
+        let (module, errors) = weir_parser::parse(source);
+        assert!(errors.is_empty());
+        let result = check(&module);
+        assert!(result.errors.is_empty());
+
+        let deps = &result.deps;
+        // pick uses type Color
+        assert!(deps.type_deps.get("pick").unwrap().contains("Color"));
+        // Reverse: Color is used by pick
+        assert!(deps.type_users.get("Color").unwrap().contains("pick"));
+    }
+
+    #[test]
+    fn dep_graph_diamond() {
+        // A→B, A→C, B→D, C→D (diamond)
+        let source = "(defn d () : i32 1)
+                      (defn b () : i32 (d))
+                      (defn c () : i32 (d))
+                      (defn a () : i32 (+ (b) (c)))";
+        let (module, errors) = weir_parser::parse(source);
+        assert!(errors.is_empty());
+        let result = check(&module);
+        assert!(result.errors.is_empty());
+
+        let deps = &result.deps;
+        let a_deps = deps.call_deps.get("a").unwrap();
+        assert!(a_deps.contains("b"));
+        assert!(a_deps.contains("c"));
+        assert!(deps.call_deps.get("b").unwrap().contains("d"));
+        assert!(deps.call_deps.get("c").unwrap().contains("d"));
+        // Reverse: d is called by {b, c}
+        let d_callers = deps.callers.get("d").unwrap();
+        assert!(d_callers.contains("b"));
+        assert!(d_callers.contains("c"));
+    }
+
+    #[test]
+    fn dep_graph_pattern_match_type() {
+        let source = "(deftype Option (Some i32) (None))
+                      (defn unwrap ((x : Option)) : i32
+                        (match x
+                          ((Some v) v)
+                          (None 0)))";
+        let (module, errors) = weir_parser::parse(source);
+        assert!(errors.is_empty());
+        let result = check(&module);
+        assert!(result.errors.is_empty());
+
+        let deps = &result.deps;
+        assert!(deps.type_deps.get("unwrap").unwrap().contains("Option"));
+        assert!(deps.type_users.get("Option").unwrap().contains("unwrap"));
     }
 }
