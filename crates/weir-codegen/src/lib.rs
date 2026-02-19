@@ -22,6 +22,7 @@ use weir_ast::*;
 use weir_runtime::{SHAPE_FIXED, SHAPE_VECTOR};
 use weir_typeck::{StructInfo, Ty, TyVarId, TypeCheckResult};
 
+pub use jit_helpers::set_direct_output;
 use jit_helpers::{output_reset, output_take};
 
 // ── Error ────────────────────────────────────────────────────────
@@ -338,6 +339,7 @@ impl<'a, M: Module> Compiler<'a, M> {
             ("vec_get",      "weir_vec_get",      &[types::I64, types::I64],                  Some(types::I64)),
             ("vec_len",      "weir_vec_len",      &[types::I64],                              Some(types::I64)),
             ("vec_append",   "weir_vec_append",   &[types::I64, types::I64, types::I64],      Some(types::I64)),
+            ("vec_set",      "weir_vec_set",      &[types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
             // Shadow stack
             ("shadow_push",  "weir_shadow_push",  &[types::I64], None),
             ("shadow_pop",   "weir_shadow_pop",   &[types::I64], None),
@@ -390,6 +392,12 @@ impl<'a, M: Module> Compiler<'a, M> {
             // File I/O
             ("read_file",    "weir_read_file",    &[types::I64],               Some(types::I64)),
             ("write_file",   "weir_write_file",   &[types::I64, types::I64],   None),
+            // Time
+            ("time_ms",      "weir_time_ms",      &[],                         Some(types::I64)),
+            // Terminal I/O
+            ("term_init",    "weir_term_init",     &[],                        None),
+            ("term_restore", "weir_term_restore",  &[],                        None),
+            ("read_key",     "weir_read_key",      &[],                        Some(types::I64)),
         ];
 
         for &(key, symbol, params, ret) in helpers {
@@ -1437,7 +1445,9 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
     /// Returns true if a value of this type is a GC heap pointer.
     fn is_heap_pointer(&self, ty: &Ty) -> bool {
         match ty {
-            Ty::Str | Ty::Vector(_) | Ty::Fn(_, _) => true,
+            Ty::Vector(_) | Ty::Fn(_, _) => true,
+            // Note: Ty::Str is NOT a GC heap pointer. Strings are malloc'd
+            // C strings (CString::into_raw), not GC-managed objects with ObjHeader.
             Ty::Con(name, _) => {
                 // Structs are always GC heap pointers
                 if self.struct_names.contains(name) {
@@ -2240,6 +2250,62 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                             return Ok(Some(new_ptr));
                         }
                     }
+                }
+                "set-nth" => {
+                    if args.len() != 3 {
+                        return Err(CodegenError::new("set-nth expects exactly 3 arguments (vec, index, value)"));
+                    }
+                    let vec_ty = self.expr_ty(args[0].value);
+                    if let Ty::Vector(elem_ty) = &vec_ty {
+                        let elem_ty = elem_ty.as_ref().clone();
+                        let vec_ptr = self.compile_expr(args[0].value, &vec_ty)?.unwrap();
+                        let idx_ty = self.expr_ty(args[1].value);
+                        let idx = self.compile_expr(args[1].value, &idx_ty)?.unwrap();
+                        let idx_i64 = match &idx_ty {
+                            Ty::I8 | Ty::I16 | Ty::I32 => self.builder.ins().sextend(types::I64, idx),
+                            Ty::U8 | Ty::U16 | Ty::U32 => self.builder.ins().uextend(types::I64, idx),
+                            _ => idx,
+                        };
+                        let elem_val = self.compile_expr(args[2].value, &elem_ty)?.unwrap();
+                        let widened = self.widen_to_i64(elem_val, &elem_ty);
+                        let elems_are_ptrs = self.is_heap_pointer(&elem_ty);
+                        let shape_val = self.emit_shape_desc(
+                            0,
+                            SHAPE_VECTOR,
+                            if elems_are_ptrs { 1 } else { 0 },
+                        );
+                        let func_id = self.runtime_fns["vec_set"];
+                        let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                        let call = self.builder.ins().call(func_ref, &[vec_ptr, idx_i64, widened, shape_val]);
+                        let new_ptr = self.builder.inst_results(call)[0];
+                        return Ok(Some(new_ptr));
+                    }
+                }
+                "time-ms" => {
+                    let func_id = self.runtime_fns["time_ms"];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    let call = self.builder.ins().call(func_ref, &[]);
+                    let result = self.builder.inst_results(call)[0];
+                    return Ok(Some(result));
+                }
+                "term-init" => {
+                    let func_id = self.runtime_fns["term_init"];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    self.builder.ins().call(func_ref, &[]);
+                    return Ok(None);
+                }
+                "term-restore" => {
+                    let func_id = self.runtime_fns["term_restore"];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    self.builder.ins().call(func_ref, &[]);
+                    return Ok(None);
+                }
+                "read-key" => {
+                    let func_id = self.runtime_fns["read_key"];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    let call = self.builder.ins().call(func_ref, &[]);
+                    let result = self.builder.inst_results(call)[0];
+                    return Ok(Some(result));
                 }
                 "atom" => {
                     if args.len() != 1 {
@@ -3544,8 +3610,10 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
         // Then branch
         self.builder.switch_to_block(then_block);
         self.builder.seal_block(then_block);
+        let depth_before_then = self.shadow_depth;
         let then_val = self.compile_expr(then_branch, result_ty)?;
         let then_jumped = std::mem::replace(&mut self.tail_jump_emitted, false);
+        let depth_after_then = self.shadow_depth;
         if !then_jumped {
             if has_value {
                 let val = then_val.unwrap_or_else(|| self.zero_value(result_ty));
@@ -3560,6 +3628,8 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
         // Else branch
         self.builder.switch_to_block(else_block);
         self.builder.seal_block(else_block);
+        // Restore shadow_depth to the state before the then branch
+        self.shadow_depth = depth_before_then;
         let mut else_jumped = false;
         if let Some(else_id) = else_branch {
             let else_val = self.compile_expr(else_id, result_ty)?;
@@ -3577,6 +3647,17 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
         } else {
             // No else branch — Unit result
             self.builder.ins().jump(merge_block, &[]);
+        }
+        let depth_after_else = self.shadow_depth;
+
+        // Restore shadow_depth: use the depth from whichever branch continues (doesn't jump)
+        if then_jumped && !else_jumped {
+            self.shadow_depth = depth_after_else;
+        } else if !then_jumped && else_jumped {
+            self.shadow_depth = depth_after_then;
+        } else if !then_jumped && !else_jumped {
+            // Both continue — depths should match; use then's depth
+            self.shadow_depth = depth_after_then;
         }
 
         // If both branches emitted tail jumps, propagate the flag up

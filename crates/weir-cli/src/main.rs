@@ -188,6 +188,7 @@ fn main() {
                 std::process::exit(1);
             }
 
+            weir_codegen::set_direct_output(true);
             match weir_codegen::compile_and_run(&module, &type_info) {
                 Ok(output) => print!("{}", output),
                 Err(e) => {

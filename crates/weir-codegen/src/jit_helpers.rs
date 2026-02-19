@@ -11,10 +11,30 @@ use weir_runtime::{
     weir_channel_send, weir_gc_alloc, weir_gc_collect, weir_gc_suppress, weir_gc_unsuppress,
     weir_gc_vec_alloc, weir_par_for_each, weir_par_map, weir_shadow_pop, weir_shadow_push,
     weir_thread_join, weir_thread_spawn, weir_vec_append, weir_vec_get, weir_vec_len,
+    weir_vec_set,
 };
 
 std::thread_local! {
     static OUTPUT_BUF: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    static DIRECT_OUTPUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Enable or disable direct stdout output (bypasses buffer).
+/// When enabled, print functions write directly to stdout instead of buffering.
+pub fn set_direct_output(enabled: bool) {
+    DIRECT_OUTPUT.with(|d| d.set(enabled));
+}
+
+fn emit_str(s: &str) {
+    if DIRECT_OUTPUT.with(|d| d.get()) {
+        use std::io::Write;
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        out.write_all(s.as_bytes()).ok();
+        out.flush().ok();
+    } else {
+        OUTPUT_BUF.with(|buf| buf.borrow_mut().push_str(s));
+    }
 }
 
 pub(crate) fn output_reset() {
@@ -26,44 +46,27 @@ pub(crate) fn output_take() -> String {
 }
 
 extern "C" fn weir_print_i64(val: i64) {
-    OUTPUT_BUF.with(|buf| {
-        use std::fmt::Write;
-        write!(buf.borrow_mut(), "{}", val).unwrap();
-    });
+    emit_str(&format!("{}", val));
 }
 
 extern "C" fn weir_print_f64(val: f64) {
-    OUTPUT_BUF.with(|buf| {
-        use std::fmt::Write;
-        if val.fract() == 0.0 {
-            write!(buf.borrow_mut(), "{:.1}", val).unwrap();
-        } else {
-            write!(buf.borrow_mut(), "{}", val).unwrap();
-        }
-    });
+    if val.fract() == 0.0 {
+        emit_str(&format!("{:.1}", val));
+    } else {
+        emit_str(&format!("{}", val));
+    }
 }
 
 extern "C" fn weir_print_bool(val: i8) {
-    OUTPUT_BUF.with(|buf| {
-        use std::fmt::Write;
-        write!(
-            buf.borrow_mut(),
-            "{}",
-            if val != 0 { "true" } else { "false" }
-        )
-        .unwrap();
-    });
+    emit_str(if val != 0 { "true" } else { "false" });
 }
 
 extern "C" fn weir_print_unit() {
-    OUTPUT_BUF.with(|buf| {
-        use std::fmt::Write;
-        write!(buf.borrow_mut(), "()").unwrap();
-    });
+    emit_str("()");
 }
 
 extern "C" fn weir_print_newline() {
-    OUTPUT_BUF.with(|buf| buf.borrow_mut().push('\n'));
+    emit_str("\n");
 }
 
 extern "C" fn weir_sleep_ms(ms: i64) {
@@ -73,7 +76,7 @@ extern "C" fn weir_sleep_ms(ms: i64) {
 extern "C" fn weir_print_str(ptr: i64) {
     let c_str = unsafe { std::ffi::CStr::from_ptr(ptr as *const std::ffi::c_char) };
     let s = c_str.to_str().unwrap_or("<invalid utf8>");
-    OUTPUT_BUF.with(|buf| buf.borrow_mut().push_str(s));
+    emit_str(s);
 }
 
 extern "C" fn weir_i64_to_str(val: i64) -> i64 {
@@ -228,6 +231,59 @@ extern "C" fn weir_char_to_string(code: i64) -> i64 {
     std::ffi::CString::new(c.to_string()).unwrap().into_raw() as i64
 }
 
+// ── Time ─────────────────────────────────────────────────────────
+
+extern "C" fn weir_time_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+// ── Terminal I/O ─────────────────────────────────────────────────
+
+static ORIG_TERMIOS: std::sync::Mutex<Option<libc::termios>> = std::sync::Mutex::new(None);
+
+extern "C" fn weir_term_init() {
+    unsafe {
+        let mut orig: libc::termios = std::mem::zeroed();
+        libc::tcgetattr(0, &mut orig);
+        *ORIG_TERMIOS.lock().unwrap() = Some(orig);
+
+        let mut raw = orig;
+        raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+        raw.c_cc[libc::VMIN] = 0;
+        raw.c_cc[libc::VTIME] = 0;
+        libc::tcsetattr(0, libc::TCSANOW, &raw);
+
+        // Set stdin to non-blocking
+        let flags = libc::fcntl(0, libc::F_GETFL);
+        libc::fcntl(0, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+}
+
+extern "C" fn weir_term_restore() {
+    let guard = ORIG_TERMIOS.lock().unwrap();
+    if let Some(ref orig) = *guard {
+        unsafe {
+            libc::tcsetattr(0, libc::TCSANOW, orig);
+            // Restore blocking mode
+            let flags = libc::fcntl(0, libc::F_GETFL);
+            libc::fcntl(0, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+        }
+    }
+}
+
+extern "C" fn weir_read_key() -> i64 {
+    let mut buf = [0u8; 1];
+    let n = unsafe { libc::read(0, buf.as_mut_ptr() as *mut libc::c_void, 1) };
+    if n <= 0 {
+        -1
+    } else {
+        buf[0] as i64
+    }
+}
+
 // ── File I/O ─────────────────────────────────────────────────────
 
 extern "C" fn weir_read_file(path_ptr: i64) -> i64 {
@@ -273,6 +329,7 @@ pub(crate) fn register_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol("weir_vec_get", weir_vec_get as *const u8);
     builder.symbol("weir_vec_len", weir_vec_len as *const u8);
     builder.symbol("weir_vec_append", weir_vec_append as *const u8);
+    builder.symbol("weir_vec_set", weir_vec_set as *const u8);
     builder.symbol("weir_shadow_push", weir_shadow_push as *const u8);
     builder.symbol("weir_shadow_pop", weir_shadow_pop as *const u8);
     builder.symbol("weir_arena_create", weir_arena_create as *const u8);
@@ -319,4 +376,10 @@ pub(crate) fn register_jit_symbols(builder: &mut JITBuilder) {
     // File I/O
     builder.symbol("weir_read_file", weir_read_file as *const u8);
     builder.symbol("weir_write_file", weir_write_file as *const u8);
+    // Time
+    builder.symbol("weir_time_ms", weir_time_ms as *const u8);
+    // Terminal I/O
+    builder.symbol("weir_term_init", weir_term_init as *const u8);
+    builder.symbol("weir_term_restore", weir_term_restore as *const u8);
+    builder.symbol("weir_read_key", weir_read_key as *const u8);
 }

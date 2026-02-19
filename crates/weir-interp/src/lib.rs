@@ -383,6 +383,14 @@ impl<'a> Interpreter<'a> {
             "string-upcase", "string-downcase", "string-trim", "char-to-string",
             // File I/O
             "read-file", "write-file",
+            // Vector update
+            "set-nth",
+            // Sleep / time
+            "sleep",
+            // Time
+            "time-ms",
+            // Terminal I/O
+            "term-init", "term-restore", "read-key",
         ];
         for name in builtins {
             self.global_env.define(
@@ -2052,6 +2060,76 @@ impl<'a> Interpreter<'a> {
                     }
                     _ => Err(InterpError::with_span("write-file expects (string, string)", span)),
                 }
+            }
+
+            // ── Vector update ──
+            "set-nth" => {
+                if args.len() != 3 {
+                    return Err(InterpError::with_span("set-nth requires 3 arguments", span));
+                }
+                match (&args[0], &args[1]) {
+                    (Value::Vector(v), Value::Int(i)) => {
+                        let idx = *i as usize;
+                        if idx >= v.len() {
+                            return Err(InterpError::with_span(
+                                format!("set-nth index {} out of bounds (len {})", i, v.len()),
+                                span,
+                            ));
+                        }
+                        let mut new_vec = v.clone();
+                        new_vec[idx] = args[2].clone();
+                        Ok(Value::Vector(new_vec))
+                    }
+                    _ => Err(InterpError::with_span("set-nth expects (vector, int, value)", span)),
+                }
+            }
+
+            // ── Sleep ──
+            "sleep" => {
+                if args.len() != 1 {
+                    return Err(InterpError::with_span("sleep requires 1 argument", span));
+                }
+                match &args[0] {
+                    Value::Int(ms) => {
+                        std::thread::sleep(std::time::Duration::from_millis(*ms as u64));
+                        Ok(Value::Unit)
+                    }
+                    _ => Err(InterpError::with_span("sleep expects an integer (milliseconds)", span)),
+                }
+            }
+
+            // ── Time ──
+            "time-ms" => {
+                if !args.is_empty() {
+                    return Err(InterpError::with_span("time-ms takes no arguments", span));
+                }
+                let ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as i64;
+                Ok(Value::Int(ms))
+            }
+
+            // ── Terminal I/O ──
+            "term-init" => {
+                if !args.is_empty() {
+                    return Err(InterpError::with_span("term-init takes no arguments", span));
+                }
+                // In interpreter mode, terminal I/O is a no-op (used for testing)
+                Ok(Value::Unit)
+            }
+            "term-restore" => {
+                if !args.is_empty() {
+                    return Err(InterpError::with_span("term-restore takes no arguments", span));
+                }
+                Ok(Value::Unit)
+            }
+            "read-key" => {
+                if !args.is_empty() {
+                    return Err(InterpError::with_span("read-key takes no arguments", span));
+                }
+                // In interpreter mode, return -1 (no key)
+                Ok(Value::Int(-1))
             }
 
             _ => Err(InterpError::with_span(

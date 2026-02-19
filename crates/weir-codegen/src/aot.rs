@@ -186,6 +186,13 @@ int64_t weir_vec_get(int64_t ptr, int64_t idx) {
 int64_t weir_vec_len(int64_t ptr) {
     return *(int64_t*)(intptr_t)ptr;
 }
+int64_t weir_vec_set(int64_t ptr, int64_t idx, int64_t val, int64_t shape_ptr) {
+    int64_t len = weir_vec_len(ptr);
+    int64_t new_ptr = weir_gc_vec_alloc(len, shape_ptr);
+    memcpy((int64_t*)(intptr_t)new_ptr + 1, (int64_t*)(intptr_t)ptr + 1, len * 8);
+    ((int64_t*)(intptr_t)new_ptr)[1 + idx] = val;
+    return new_ptr;
+}
 int64_t weir_vec_append(int64_t ptr, int64_t elem, int64_t shape_ptr) {
     int64_t old_len = weir_vec_len(ptr);
     int64_t new_len = old_len + 1;
@@ -418,6 +425,56 @@ void weir_write_file(int64_t path_ptr, int64_t contents_ptr) {
     if (!f) { fprintf(stderr, "write-file failed: cannot open %s\n", path); return; }
     fwrite(contents, 1, strlen(contents), f);
     fclose(f);
+}
+
+/* ── Sleep ── */
+#include <time.h>
+void weir_sleep_ms(int64_t ms) {
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (ms % 1000) * 1000000;
+    nanosleep(&ts, NULL);
+}
+
+/* ── Time ── */
+int64_t weir_time_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + (int64_t)ts.tv_nsec / 1000000;
+}
+
+/* ── Terminal I/O ── */
+#include <termios.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+static struct termios orig_termios;
+static int term_saved = 0;
+
+void weir_term_init(void) {
+    tcgetattr(0, &orig_termios);
+    term_saved = 1;
+    struct termios raw = orig_termios;
+    raw.c_lflag &= ~(ICANON | ECHO);
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 0;
+    tcsetattr(0, TCSANOW, &raw);
+    int flags = fcntl(0, F_GETFL);
+    fcntl(0, F_SETFL, flags | O_NONBLOCK);
+}
+
+void weir_term_restore(void) {
+    if (term_saved) {
+        tcsetattr(0, TCSANOW, &orig_termios);
+        int flags = fcntl(0, F_GETFL);
+        fcntl(0, F_SETFL, flags & ~O_NONBLOCK);
+    }
+}
+
+int64_t weir_read_key(void) {
+    unsigned char c;
+    ssize_t n = read(0, &c, 1);
+    return n <= 0 ? -1 : (int64_t)c;
 }
 
 int main(void) { weir_main(); return 0; }

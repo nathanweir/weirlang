@@ -331,6 +331,20 @@ pub extern "C" fn weir_vec_len(ptr: i64) -> i64 {
     unsafe { *(ptr as *const i64) }
 }
 
+/// Set an element in a vector at the given index, returning a new vector.
+#[unsafe(no_mangle)]
+pub extern "C" fn weir_vec_set(ptr: i64, idx: i64, val: i64, shape: *const ShapeDesc) -> i64 {
+    let len = weir_vec_len(ptr);
+    let new_ptr = weir_gc_vec_alloc(len, shape);
+    unsafe {
+        let src = (ptr as *const i64).offset(1);
+        let dst = (new_ptr as *mut i64).offset(1);
+        ptr::copy_nonoverlapping(src, dst, len as usize);
+        *dst.offset(idx as isize) = val;
+    }
+    new_ptr
+}
+
 /// Append an element to a vector, returning a new vector.
 #[unsafe(no_mangle)]
 pub extern "C" fn weir_vec_append(ptr: i64, elem: i64, shape: *const ShapeDesc) -> i64 {

@@ -12,11 +12,17 @@ test:
 
 # Run a .weir file
 run file:
-    cargo run --bin weir -- run {{file}}
+    cargo run --bin weir -- run {{ file }}
 
 # Remove build artifacts
 clean:
     cargo clean
+
+# Clean the tmp/ scratch directory
+
+# NOTE: HARDCODED TO THIS SPECIFIC FULL PATH FOR SAFETY; DO NOT REMOVE
+clean-tmp:
+    rm -rf /home/nathan/dev/weirlang/tmp/*
 
 # Run clippy, check formatting, and run tests
 check:

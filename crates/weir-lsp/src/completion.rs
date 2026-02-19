@@ -301,6 +301,14 @@ const BUILTINS: &[(&str, &str)] = &[
     // File I/O
     ("read-file", "(Fn [String] String)"),
     ("write-file", "(Fn [String String] Unit)"),
+    // Vector update
+    ("set-nth", "(Fn [(Vector a) i64 a] (Vector a))"),
+    // Time
+    ("time-ms", "(Fn [] i64)"),
+    // Terminal I/O
+    ("term-init", "(Fn [] Unit)"),
+    ("term-restore", "(Fn [] Unit)"),
+    ("read-key", "(Fn [] i64)"),
 ];
 
 const PRIMITIVE_TYPES: &[&str] = &[

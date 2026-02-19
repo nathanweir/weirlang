@@ -1318,7 +1318,8 @@ impl<'a> TypeChecker<'a> {
         // We just need to register names so they don't show as "undefined"
         let builtins = [
             "+", "-", "*", "/", "mod", "<", ">", "<=", ">=", "=", "!=", "not", "and", "or",
-            "println", "print", "str", "len", "nth", "append", "type-of",
+            "println", "print", "str", "len", "nth", "append", "set-nth", "type-of",
+            "sleep", "time-ms", "term-init", "term-restore", "read-key",
         ];
         for name in builtins {
             self.scopes[0].insert(
@@ -2615,6 +2616,15 @@ impl<'a> TypeChecker<'a> {
                 // File I/O
                 | "read-file"
                 | "write-file"
+                // Vector update
+                | "set-nth"
+                // Sleep / time
+                | "sleep"
+                | "time-ms"
+                // Terminal I/O
+                | "term-init"
+                | "term-restore"
+                | "read-key"
         )
     }
 
@@ -2969,6 +2979,62 @@ impl<'a> TypeChecker<'a> {
                 self.unify(&arg_tys[0], &Ty::Str, span);
                 self.unify(&arg_tys[1], &Ty::Str, span);
                 Ty::Unit
+            }
+
+            // ── Vector update ──
+            "set-nth" => {
+                if arg_tys.len() != 3 {
+                    self.error("set-nth requires exactly 3 arguments (vec, index, value)", span);
+                    return Ty::Error;
+                }
+                let elem = self.fresh_var();
+                let vec_ty = Ty::Vector(Box::new(elem.clone()));
+                self.unify(&arg_tys[0], &vec_ty, span);
+                self.unify(&arg_tys[1], &Ty::I64, span);
+                self.unify(&arg_tys[2], &elem, span);
+                vec_ty
+            }
+
+            // ── Sleep ──
+            "sleep" => {
+                if arg_tys.len() != 1 {
+                    self.error("sleep requires exactly 1 argument (milliseconds)", span);
+                    return Ty::Error;
+                }
+                self.unify(&arg_tys[0], &Ty::I64, span);
+                Ty::Unit
+            }
+
+            // ── Time ──
+            "time-ms" => {
+                if !arg_tys.is_empty() {
+                    self.error("time-ms takes no arguments", span);
+                    return Ty::Error;
+                }
+                Ty::I64
+            }
+
+            // ── Terminal I/O ──
+            "term-init" => {
+                if !arg_tys.is_empty() {
+                    self.error("term-init takes no arguments", span);
+                    return Ty::Error;
+                }
+                Ty::Unit
+            }
+            "term-restore" => {
+                if !arg_tys.is_empty() {
+                    self.error("term-restore takes no arguments", span);
+                    return Ty::Error;
+                }
+                Ty::Unit
+            }
+            "read-key" => {
+                if !arg_tys.is_empty() {
+                    self.error("read-key takes no arguments", span);
+                    return Ty::Error;
+                }
+                Ty::I64
             }
 
             _ => {

@@ -1,0 +1,456 @@
+;; ── Tetris ─────────────────────────────────────────────────────────
+;;
+;; Terminal-based Tetris demo for the Weir programming language.
+;; Exercises: structs, vectors, pattern matching, TCO, closures, ANSI rendering.
+;;
+;; Controls:
+;;   Arrow keys  — move / rotate / soft-drop
+;;   Space       — hard drop
+;;   q           — quit
+
+;; ── Constants ──────────────────────────────────────────────────────
+
+(defn board-width  () : i64 10)
+(defn board-height () : i64 20)
+(defn board-size   () : i64 200)  ;; 10 * 20
+
+;; ── Game state ─────────────────────────────────────────────────────
+
+(defstruct GameState
+  (board     : (Vector i64))   ;; flat 200-element vector, 0=empty, 1-7=color
+  (piece     : i64)            ;; current piece kind (0-6)
+  (rotation  : i64)            ;; 0-3
+  (piece-x   : i64)            ;; column of piece origin
+  (piece-y   : i64)            ;; row of piece origin
+  (next-p    : i64)            ;; next piece kind
+  (score     : i64)
+  (level     : i64)
+  (lines     : i64)
+  (drop-time : i64)            ;; time-ms of last drop
+  (game-over : i64))           ;; 0 = playing, 1 = game over
+
+;; ── Piece definitions ──────────────────────────────────────────────
+;; Each piece has 4 rotations. Each rotation is a flat vector of 8 ints:
+;; [row0 col0 row1 col1 row2 col2 row3 col3]
+
+;; I-piece
+(defn i-piece () : (Vector (Vector i64))
+  [[0 0 0 1 0 2 0 3]
+   [0 0 1 0 2 0 3 0]
+   [0 0 0 1 0 2 0 3]
+   [0 0 1 0 2 0 3 0]])
+
+;; O-piece
+(defn o-piece () : (Vector (Vector i64))
+  [[0 0 0 1 1 0 1 1]
+   [0 0 0 1 1 0 1 1]
+   [0 0 0 1 1 0 1 1]
+   [0 0 0 1 1 0 1 1]])
+
+;; T-piece
+(defn t-piece () : (Vector (Vector i64))
+  [[0 0 0 1 0 2 1 1]
+   [0 0 1 0 2 0 1 1]
+   [1 0 1 1 1 2 0 1]
+   [0 0 1 0 2 0 1 (- 0 1)]])
+
+;; S-piece
+(defn s-piece () : (Vector (Vector i64))
+  [[0 1 0 2 1 0 1 1]
+   [0 0 1 0 1 1 2 1]
+   [0 1 0 2 1 0 1 1]
+   [0 0 1 0 1 1 2 1]])
+
+;; Z-piece
+(defn z-piece () : (Vector (Vector i64))
+  [[0 0 0 1 1 1 1 2]
+   [0 1 1 0 1 1 2 0]
+   [0 0 0 1 1 1 1 2]
+   [0 1 1 0 1 1 2 0]])
+
+;; J-piece
+(defn j-piece () : (Vector (Vector i64))
+  [[0 0 1 0 1 1 1 2]
+   [0 0 0 1 1 0 2 0]
+   [0 0 0 1 0 2 1 2]
+   [0 0 1 0 2 0 2 (- 0 1)]])
+
+;; L-piece
+(defn l-piece () : (Vector (Vector i64))
+  [[0 2 1 0 1 1 1 2]
+   [0 0 1 0 2 0 2 1]
+   [0 0 0 1 0 2 1 0]
+   [0 0 0 1 1 1 2 1]])
+
+;; Piece table: indexed by piece kind (0-6)
+(defn get-piece-rotations ((kind : i64)) : (Vector (Vector i64))
+  (cond
+    ((= kind 0) (i-piece))
+    ((= kind 1) (o-piece))
+    ((= kind 2) (t-piece))
+    ((= kind 3) (s-piece))
+    ((= kind 4) (z-piece))
+    ((= kind 5) (j-piece))
+    (else       (l-piece))))
+
+;; Get piece cells for a given kind and rotation
+(defn piece-cells ((kind : i64) (rot : i64)) : (Vector i64)
+  (nth (get-piece-rotations kind) (mod rot 4)))
+
+;; ── Board logic ────────────────────────────────────────────────────
+
+(defn board-get ((board : (Vector i64)) (row : i64) (col : i64)) : i64
+  (nth board (+ (* row 10) col)))
+
+(defn board-set ((board : (Vector i64)) (row : i64) (col : i64) (val : i64)) : (Vector i64)
+  (set-nth board (+ (* row 10) col) val))
+
+;; Make empty board (200 zeroes)
+(defn make-row ((v : (Vector i64)) (i : i64) (n : i64)) : (Vector i64)
+  (if (= i n) v
+    (make-row (append v 0) (+ i 1) n)))
+
+(defn make-empty-board () : (Vector i64)
+  (make-row [] 0 200))
+
+;; Check if a single cell is valid and empty
+(defn cell-ok ((board : (Vector i64)) (row : i64) (col : i64)) : i64
+  (if (< col 0) 0
+    (if (>= col 10) 0
+      (if (< row 0) 0
+        (if (>= row 20) 0
+          (if (= (board-get board row col) 0) 1 0))))))
+
+;; Check if piece at (px, py) collides with board or walls
+(defn collides ((board : (Vector i64)) (cells : (Vector i64)) (px : i64) (py : i64)) : i64
+  (let ((r0 (+ py (nth cells 0)))
+        (c0 (+ px (nth cells 1)))
+        (r1 (+ py (nth cells 2)))
+        (c1 (+ px (nth cells 3)))
+        (r2 (+ py (nth cells 4)))
+        (c2 (+ px (nth cells 5)))
+        (r3 (+ py (nth cells 6)))
+        (c3 (+ px (nth cells 7))))
+    (if (= (cell-ok board r0 c0) 0) 1
+      (if (= (cell-ok board r1 c1) 0) 1
+        (if (= (cell-ok board r2 c2) 0) 1
+          (if (= (cell-ok board r3 c3) 0) 1
+            0))))))
+
+;; Lock piece onto the board
+(defn lock-piece ((board : (Vector i64)) (cells : (Vector i64)) (px : i64) (py : i64) (color : i64)) : (Vector i64)
+  (let ((b1 (board-set board (+ py (nth cells 0)) (+ px (nth cells 1)) color))
+        (b2 (board-set b1    (+ py (nth cells 2)) (+ px (nth cells 3)) color))
+        (b3 (board-set b2    (+ py (nth cells 4)) (+ px (nth cells 5)) color))
+        (b4 (board-set b3    (+ py (nth cells 6)) (+ px (nth cells 7)) color)))
+    b4))
+
+;; ── Line clearing ──────────────────────────────────────────────────
+
+;; Check if a row is full
+(defn row-full ((board : (Vector i64)) (row : i64) (col : i64)) : i64
+  (if (= col 10) 1
+    (if (= (board-get board row col) 0) 0
+      (row-full board row (+ col 1)))))
+
+;; Copy one row to another
+(defn copy-row ((board : (Vector i64)) (src-row : i64) (dst-row : i64) (col : i64)) : (Vector i64)
+  (if (= col 10) board
+    (copy-row (board-set board dst-row col (board-get board src-row col))
+              src-row dst-row (+ col 1))))
+
+;; Clear one row (fill with 0)
+(defn clear-row ((board : (Vector i64)) (row : i64) (col : i64)) : (Vector i64)
+  (if (= col 10) board
+    (clear-row (board-set board row col 0) row (+ col 1))))
+
+;; Shift rows down starting from row, moving rows above down
+(defn shift-rows-down ((board : (Vector i64)) (row : i64)) : (Vector i64)
+  (if (<= row 0)
+    (clear-row board 0 0)
+    (shift-rows-down (copy-row board (- row 1) row 0) (- row 1))))
+
+;; Count and clear full lines, returns (board, lines-cleared) encoded as struct
+(defn clear-lines-helper ((board : (Vector i64)) (row : i64) (cleared : i64)) : (Vector i64)
+  ;; We encode cleared count in a side channel — return [board, cleared] trick:
+  ;; Actually, let's use the simpler approach: return board, count separately
+  (if (< row 0) board
+    (if (= (row-full board row 0) 1)
+      (clear-lines-helper (shift-rows-down board row) row (+ cleared 1))
+      (clear-lines-helper board (- row 1) cleared))))
+
+(defn count-full-rows ((board : (Vector i64)) (row : i64) (count : i64)) : i64
+  (if (< row 0) count
+    (if (= (row-full board row 0) 1)
+      (count-full-rows board (- row 1) (+ count 1))
+      (count-full-rows board (- row 1) count))))
+
+(defn clear-lines ((board : (Vector i64))) : (Vector i64)
+  (clear-lines-helper board 19 0))
+
+(defn count-cleared ((board : (Vector i64))) : i64
+  (count-full-rows board 19 0))
+
+;; ── Scoring ────────────────────────────────────────────────────────
+
+(defn line-score ((n : i64) (level : i64)) : i64
+  (let ((base (cond
+                ((= n 1) 100)
+                ((= n 2) 300)
+                ((= n 3) 500)
+                ((= n 4) 800)
+                (else 0))))
+    (* base level)))
+
+(defn drop-speed ((level : i64)) : i64
+  (let ((speed (- 500 (* (min level 10) 40))))
+    (max speed 100)))
+
+;; ── Piece spawning ─────────────────────────────────────────────────
+
+(defn spawn-piece ((state : GameState)) : GameState
+  (let ((kind (.next-p state))
+        (cells (piece-cells kind 0))
+        (new-next (random-int 7))
+        (px 3)
+        (py 0))
+    (if (= (collides (.board state) cells px py) 1)
+      ;; Game over
+      (GameState (.board state) kind 0 px py new-next
+                 (.score state) (.level state) (.lines state)
+                 (.drop-time state) 1)
+      (GameState (.board state) kind 0 px py new-next
+                 (.score state) (.level state) (.lines state)
+                 (.drop-time state) 0))))
+
+;; ── Movement ───────────────────────────────────────────────────────
+
+(defn try-move ((state : GameState) (dx : i64) (dy : i64)) : GameState
+  (let ((new-x (+ (.piece-x state) dx))
+        (new-y (+ (.piece-y state) dy))
+        (cells (piece-cells (.piece state) (.rotation state))))
+    (if (= (collides (.board state) cells new-x new-y) 0)
+      (GameState (.board state) (.piece state) (.rotation state)
+                 new-x new-y (.next-p state)
+                 (.score state) (.level state) (.lines state)
+                 (.drop-time state) (.game-over state))
+      state)))
+
+(defn try-rotate ((state : GameState)) : GameState
+  (let ((new-rot (mod (+ (.rotation state) 1) 4))
+        (cells (piece-cells (.piece state) new-rot)))
+    (if (= (collides (.board state) cells (.piece-x state) (.piece-y state)) 0)
+      (GameState (.board state) (.piece state) new-rot
+                 (.piece-x state) (.piece-y state) (.next-p state)
+                 (.score state) (.level state) (.lines state)
+                 (.drop-time state) (.game-over state))
+      state)))
+
+;; Lock piece and clear lines
+(defn lock-and-clear ((state : GameState)) : GameState
+  (let ((cells (piece-cells (.piece state) (.rotation state)))
+        (color (+ (.piece state) 1))
+        (board2 (lock-piece (.board state) cells (.piece-x state) (.piece-y state) color))
+        (n-cleared (count-cleared board2))
+        (board3 (clear-lines board2))
+        (new-lines (+ (.lines state) n-cleared))
+        (new-level (+ 1 (/ new-lines 10)))
+        (new-score (+ (.score state) (line-score n-cleared new-level))))
+    (spawn-piece (GameState board3 0 0 3 0 (.next-p state)
+                            new-score new-level new-lines
+                            (time-ms) (.game-over state)))))
+
+;; Hard drop: move down until collision, then lock
+(defn hard-drop-helper ((state : GameState)) : GameState
+  (let ((moved (try-move state 0 1)))
+    (if (= (.piece-y moved) (.piece-y state))
+      ;; Couldn't move down, lock here
+      (lock-and-clear state)
+      (hard-drop-helper moved))))
+
+(defn hard-drop ((state : GameState)) : GameState
+  (hard-drop-helper state))
+
+;; Tick: drop piece one row
+(defn tick-drop ((state : GameState) (now : i64)) : GameState
+  (let ((moved (try-move state 0 1)))
+    (if (= (.piece-y moved) (.piece-y state))
+      ;; Couldn't move down, lock
+      (lock-and-clear state)
+      ;; Update drop-time
+      (GameState (.board moved) (.piece moved) (.rotation moved)
+                 (.piece-x moved) (.piece-y moved) (.next-p moved)
+                 (.score moved) (.level moved) (.lines moved)
+                 now (.game-over moved)))))
+
+;; ── Rendering ──────────────────────────────────────────────────────
+
+(defn esc () : String (char-to-string 27))
+
+;; Color for a cell value (1-7 are piece colors)
+(defn cell-color ((val : i64)) : String
+  (cond
+    ((= val 0) (str (esc) "[48;5;236m"))   ;; dark gray (empty)
+    ((= val 1) (str (esc) "[48;5;14m"))    ;; cyan (I)
+    ((= val 2) (str (esc) "[48;5;11m"))    ;; yellow (O)
+    ((= val 3) (str (esc) "[48;5;13m"))    ;; magenta (T)
+    ((= val 4) (str (esc) "[48;5;10m"))    ;; green (S)
+    ((= val 5) (str (esc) "[48;5;9m"))     ;; red (Z)
+    ((= val 6) (str (esc) "[48;5;12m"))    ;; blue (J)
+    (else      (str (esc) "[48;5;208m"))))  ;; orange (L)
+
+(defn reset-color () : String
+  (str (esc) "[0m"))
+
+;; Check if a position is occupied by the current piece
+(defn is-piece-cell ((cells : (Vector i64)) (px : i64) (py : i64) (row : i64) (col : i64)) : i64
+  (let ((r0 (+ py (nth cells 0)))
+        (c0 (+ px (nth cells 1)))
+        (r1 (+ py (nth cells 2)))
+        (c1 (+ px (nth cells 3)))
+        (r2 (+ py (nth cells 4)))
+        (c2 (+ px (nth cells 5)))
+        (r3 (+ py (nth cells 6)))
+        (c3 (+ px (nth cells 7))))
+    (if (and (= row r0) (= col c0)) 1
+      (if (and (= row r1) (= col c1)) 1
+        (if (and (= row r2) (= col c2)) 1
+          (if (and (= row r3) (= col c3)) 1
+            0))))))
+
+;; Render a single cell (two spaces with background color)
+(defn render-cell ((board : (Vector i64)) (cells : (Vector i64)) (px : i64) (py : i64) (piece-color : i64) (row : i64) (col : i64)) : String
+  (let ((pc (is-piece-cell cells px py row col)))
+    (if (= pc 1)
+      (str (cell-color piece-color) "  " (reset-color))
+      (let ((val (board-get board row col)))
+        (str (cell-color val) "  " (reset-color))))))
+
+;; Render a single row
+(defn render-row-cells ((board : (Vector i64)) (cells : (Vector i64)) (px : i64) (py : i64) (color : i64) (row : i64) (col : i64) (acc : String)) : String
+  (if (= col 10) acc
+    (render-row-cells board cells px py color row (+ col 1)
+                      (str acc (render-cell board cells px py color row col)))))
+
+;; Render piece preview (4x4 box)
+(defn render-preview-cell ((cells : (Vector i64)) (row : i64) (col : i64) (color : i64)) : String
+  (if (= (is-piece-cell cells 0 0 row col) 1)
+    (str (cell-color color) "  " (reset-color))
+    (str (esc) "[48;5;236m  " (reset-color))))
+
+(defn render-preview-row ((cells : (Vector i64)) (color : i64) (row : i64) (col : i64) (acc : String)) : String
+  (if (= col 4) acc
+    (render-preview-row cells color row (+ col 1)
+                        (str acc (render-preview-cell cells row col color)))))
+
+;; Sidebar info for a given row
+(defn render-sidebar ((state : GameState) (next-cells : (Vector i64)) (next-color : i64) (row : i64)) : String
+  (cond
+    ((= row 1)  (str "  SCORE: " (.score state)))
+    ((= row 2)  (str "  LEVEL: " (.level state)))
+    ((= row 3)  (str "  LINES: " (.lines state)))
+    ((= row 5)  "  NEXT:")
+    ((= row 6)  (str "  " (render-preview-row next-cells next-color 0 0 "")))
+    ((= row 7)  (str "  " (render-preview-row next-cells next-color 1 0 "")))
+    ((= row 8)  (str "  " (render-preview-row next-cells next-color 2 0 "")))
+    ((= row 9)  (str "  " (render-preview-row next-cells next-color 3 0 "")))
+    (else "")))
+
+;; Full render
+(defn render ((state : GameState)) : Unit
+  (let ((cells (piece-cells (.piece state) (.rotation state)))
+        (color (+ (.piece state) 1))
+        (next-cells (piece-cells (.next-p state) 0))
+        (next-color (+ (.next-p state) 1)))
+    ;; Cursor home
+    (print (str (esc) "[H"))
+    ;; Title
+    (print (str "  " (esc) "[1mTETRIS" (reset-color) "                " (esc) "[2mq=quit" (reset-color) "\n\n"))
+    ;; Board rows with sidebar
+    (render-rows state cells color next-cells next-color 0)))
+
+(defn render-rows ((state : GameState) (cells : (Vector i64)) (color : i64) (next-cells : (Vector i64)) (next-color : i64) (row : i64)) : Unit
+  (if (= row 20)
+    (do
+      ;; Bottom border
+      (print (str "  " (esc) "[48;5;240m                    " (reset-color) "\n"))
+      (print (str "\n  " (esc) "[2mArrows=move  Space=drop" (reset-color) "\n")))
+    (do
+      ;; Row content
+      (print (str "  "
+                  (render-row-cells (.board state) cells (.piece-x state) (.piece-y state) color row 0 "")))
+      ;; Sidebar info
+      (print (render-sidebar state next-cells next-color row))
+      ;; Clear to end of line and newline
+      (print (str (esc) "[K\n"))
+      (render-rows state cells color next-cells next-color (+ row 1)))))
+
+;; ── Input handling ─────────────────────────────────────────────────
+
+;; Read an escape sequence (arrow keys = ESC [ X)
+(defn handle-input ((state : GameState) (key : i64)) : GameState
+  (cond
+    ((= key (- 0 1)) state)        ;; no key pressed
+    ((= key 113) state)            ;; 'q' — handled in game-loop
+    ((= key 32) (hard-drop state)) ;; space — hard drop
+    ((= key 27)                    ;; ESC — start of arrow key sequence
+      (let ((k2 (read-key)))
+        (if (= k2 91)   ;; '['
+          (let ((k3 (read-key)))
+            (cond
+              ((= k3 65) (try-rotate state))       ;; Up
+              ((= k3 66) (try-move state 0 1))     ;; Down
+              ((= k3 67) (try-move state 1 0))     ;; Right
+              ((= k3 68) (try-move state (- 0 1) 0)) ;; Left
+              (else state)))
+          state)))
+    (else state)))
+
+;; ── Game loop helpers ───────────────────────────────────────────────
+
+(defn quit-game () : Unit
+  (do (term-restore)
+      (print (str (esc) "[?25h"))
+      (println "\nGoodbye!")))
+
+(defn game-over-screen ((state : GameState)) : Unit
+  (do (render state)
+      (term-restore)
+      (print (str (esc) "[?25h"))
+      (print (str "\n  " (esc) "[1;31mGAME OVER!" (reset-color) "  Score: " (.score state) "\n\n"))))
+
+(defn maybe-drop ((state : GameState)) : GameState
+  (let ((now (time-ms))
+        (interval (drop-speed (.level state))))
+    (if (> (- now (.drop-time state)) interval)
+      (tick-drop state now)
+      state)))
+
+;; ── Game loop (tail-recursive) ─────────────────────────────────────
+
+(defn game-loop ((state : GameState)) : Unit
+  (let ((frame-start (time-ms))
+        (key (read-key)))
+    (if (= key 113)
+      (quit-game)
+      (let ((state2 (maybe-drop (handle-input state key))))
+        (if (= (.game-over state2) 1)
+          (game-over-screen state2)
+          (do
+            (render state2)
+            (sleep (max 0 (- 33 (- (time-ms) frame-start))))
+            (game-loop state2)))))))
+
+;; ── Main ───────────────────────────────────────────────────────────
+
+(defn main ()
+  (term-init)
+  (random-seed (time-ms))
+  ;; Clear screen and hide cursor
+  (print (str (esc) "[2J" (esc) "[?25l"))
+  (let ((board (make-empty-board))
+        (first-piece (random-int 7))
+        (next-piece (random-int 7))
+        (now (time-ms))
+        (state (GameState board first-piece 0 3 0 next-piece 0 1 0 now 0)))
+    (game-loop (spawn-piece state))))
