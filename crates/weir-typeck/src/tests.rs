@@ -134,6 +134,56 @@ use super::*;
     }
 
     #[test]
+    fn defstruct_destructure() {
+        check_ok(
+            "(defstruct Point
+               (x : f64)
+               (y : f64))
+             (defn get-x ((p : Point)) : f64
+               (match p
+                 ({:x} x)))",
+        );
+    }
+
+    #[test]
+    fn defstruct_destructure_multi_field() {
+        check_ok(
+            "(defstruct Point
+               (x : f64)
+               (y : f64))
+             (defn sum ((p : Point)) : f64
+               (match p
+                 ({:x :y} (+ x y))))",
+        );
+    }
+
+    #[test]
+    fn defstruct_destructure_renamed() {
+        check_ok(
+            "(defstruct Point
+               (x : f64)
+               (y : f64))
+             (defn sum ((p : Point)) : f64
+               (match p
+                 ({:x px :y py} (+ px py))))",
+        );
+    }
+
+    #[test]
+    fn defstruct_operations() {
+        check_ok(
+            "(defstruct Vec2
+               (x : f64)
+               (y : f64))
+             (defn v-add ((a : Vec2) (b : Vec2)) : Vec2
+               (Vec2 (+ (.x a) (.x b)) (+ (.y a) (.y b))))
+             (defn main ()
+               (let ((c (v-add (Vec2 1.0 0.0) (Vec2 0.0 1.0))))
+                 (.x c)))",
+        );
+    }
+
+    #[test]
     fn vector_literal() {
         check_ok("(defn main () [1 2 3])");
     }

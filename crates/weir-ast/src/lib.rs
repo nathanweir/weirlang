@@ -1,3 +1,5 @@
+pub mod tco;
+
 use la_arena::{Arena, Idx};
 use smol_str::SmolStr;
 pub use weir_lexer::Span;

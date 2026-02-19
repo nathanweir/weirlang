@@ -13,6 +13,12 @@ pub struct FnType {
     pub return_type: Ty,
 }
 
+/// Struct definition with resolved field types, for codegen.
+#[derive(Clone, Debug)]
+pub struct StructInfo {
+    pub fields: Vec<(SmolStr, Ty)>,
+}
+
 /// A monomorphized specialization of a generic function for codegen.
 #[derive(Clone, Debug)]
 pub struct Specialization {
@@ -54,6 +60,8 @@ pub struct TypeCheckResult {
     pub specializations: Vec<Specialization>,
     /// Dependency graph for selective recompilation.
     pub deps: DependencyGraph,
+    /// Struct definitions with resolved field types, for codegen.
+    pub struct_defs: HashMap<SmolStr, StructInfo>,
 }
 
 /// Check if a type contains any unresolved type variables.

@@ -1,0 +1,30 @@
+;; Deep self-recursion (would overflow without TCO)
+(defn count-down ((n : i64)) : i64
+  (if (= n 0) 0 (count-down (- n 1))))
+
+;; Accumulator pattern
+(defn fact-iter ((n : i64) (acc : i64)) : i64
+  (if (= n 0) acc (fact-iter (- n 1) (* n acc))))
+
+;; Tail call in cond
+(defn sum-to ((n : i64) (acc : i64)) : i64
+  (cond
+    ((= n 0) acc)
+    (else (sum-to (- n 1) (+ acc n)))))
+
+;; Tail call in let body
+(defn fib-iter ((n : i64) (a : i64) (b : i64)) : i64
+  (if (= n 0) a
+    (let ((next (+ a b)))
+      (fib-iter (- n 1) b next))))
+
+;; Non-tail recursion (should NOT be optimized, must still work)
+(defn fact ((n : i64)) : i64
+  (if (= n 0) 1 (* n (fact (- n 1)))))
+
+(defn main ()
+  (println (count-down 1000000))
+  (println (fact-iter 20 1))
+  (println (sum-to 1000000 0))
+  (println (fib-iter 50 0 1))
+  (println (fact 20)))

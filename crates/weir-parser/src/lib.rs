@@ -1194,19 +1194,33 @@ impl Parser {
                 Some(self.alloc_pattern(PatternKind::Constructor { name, args }, start.merge(end)))
             }
             Token::LBrace => {
-                // Struct destructure: {field1 field2} or {field1 name1 field2 name2}
+                // Struct destructure: {:field1 :field2} or {:field1 bind1 :field2 bind2}
+                // Keywords (:name) denote field names; a bare symbol after a keyword
+                // is an explicit binding name. Without one, binding = field name.
                 self.advance();
                 let mut fields = Vec::new();
                 while !self.at_end() && !self.check(&Token::RBrace) {
-                    let (field_name, fspan) = self.expect_symbol()?;
-                    // Check if there's a binding name (another symbol before next field/close)
+                    // Expect a keyword for the field name
+                    let fspan = self.peek_span();
+                    let field_name = if let Some(Token::Keyword(_)) = self.peek() {
+                        let (tok, _) = self.advance();
+                        if let Token::Keyword(name) = tok {
+                            name
+                        } else {
+                            unreachable!()
+                        }
+                    } else {
+                        self.error(
+                            "expected keyword (:field-name) in struct destructure".into(),
+                            fspan,
+                        );
+                        return None;
+                    };
+                    // Check for an explicit binding name (bare symbol)
                     let binding = if !self.check(&Token::RBrace)
                         && matches!(self.peek(), Some(Token::Symbol(_)))
                     {
                         let (b, _) = self.expect_symbol()?;
-                        // Heuristic: if it starts lowercase, it's a binding
-                        // If it starts uppercase, it's probably the next field
-                        // This is ambiguous; for now treat pairs as field+binding
                         Some(b)
                     } else {
                         None

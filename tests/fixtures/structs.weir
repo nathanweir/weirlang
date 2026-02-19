@@ -1,0 +1,58 @@
+;; Test: struct construction, field access, operations, heap-pointer fields
+
+(defstruct Vec3
+  (x : f64)
+  (y : f64)
+  (z : f64))
+
+(defn v-add ((a : Vec3) (b : Vec3)) : Vec3
+  (Vec3 (+ (.x a) (.x b))
+        (+ (.y a) (.y b))
+        (+ (.z a) (.z b))))
+
+(defn v-dot ((a : Vec3) (b : Vec3)) : f64
+  (+ (+ (* (.x a) (.x b)) (* (.y a) (.y b))) (* (.z a) (.z b))))
+
+(defn v-scale ((v : Vec3) (s : f64)) : Vec3
+  (Vec3 (* (.x v) s) (* (.y v) s) (* (.z v) s)))
+
+(defn v-len ((v : Vec3)) : f64
+  (sqrt (v-dot v v)))
+
+;; Struct with heap-pointer field (String)
+(defstruct Named
+  (name : String)
+  (val : f64))
+
+;; Struct destructure in match
+(defn get-x ((v : Vec3)) : f64
+  (match v
+    ({:x} x)))
+
+(defn sum-xyz ((v : Vec3)) : f64
+  (match v
+    ({:x :y :z} (+ (+ x y) z))))
+
+(defn main ()
+  ;; Basic construction and field access
+  (let ((v (Vec3 1.0 2.0 3.0)))
+    (println (str (.x v) " " (.y v) " " (.z v))))
+
+  ;; Vector operations
+  (let ((a (Vec3 1.0 0.0 0.0))
+        (b (Vec3 0.0 1.0 0.0))
+        (c (v-add a b)))
+    (println (str (.x c) " " (.y c) " " (.z c)))
+    (println (v-dot a b))
+    (println (v-len (Vec3 3.0 4.0 0.0))))
+
+  ;; String field
+  (let ((n (Named "hello" 42.0)))
+    (println (str (.name n) " " (.val n))))
+
+  ;; Nested operation
+  (let ((scaled (v-scale (Vec3 1.0 2.0 3.0) 2.0)))
+    (println (str (.x scaled) " " (.y scaled) " " (.z scaled))))
+
+  ;; Destructure
+  (println (get-x (Vec3 99.0 0.0 0.0))))

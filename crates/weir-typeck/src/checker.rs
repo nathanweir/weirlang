@@ -5,7 +5,7 @@ use weir_ast::*;
 
 use crate::defs::*;
 use crate::error::TypeError;
-use crate::result::DependencyGraph;
+use crate::result::{DependencyGraph, StructInfo};
 use crate::types::{Ty, TyVarId};
 
 // ── Type checker ─────────────────────────────────────────────────
@@ -142,6 +142,31 @@ impl<'a> TypeChecker<'a> {
                     .insert(fn_name.clone());
             }
         }
+    }
+
+    /// Export struct definitions with resolved field types for codegen.
+    pub(crate) fn export_struct_defs(&mut self) -> HashMap<SmolStr, StructInfo> {
+        let mut result = HashMap::new();
+        let sdefs: Vec<_> = self.struct_defs.values().cloned().collect();
+        for sdef in &sdefs {
+            let saved = self.type_param_scope.clone();
+            self.type_param_scope.clear();
+            for p in &sdef.params {
+                self.type_param_scope
+                    .insert(p.clone(), Ty::Con(p.clone(), vec![]));
+            }
+            let fields: Vec<(SmolStr, Ty)> = sdef
+                .fields
+                .iter()
+                .map(|(name, type_id)| {
+                    let ty = self.resolve_type_expr(*type_id);
+                    (name.clone(), self.apply(&ty))
+                })
+                .collect();
+            self.type_param_scope = saved;
+            result.insert(sdef.name.clone(), StructInfo { fields });
+        }
+        result
     }
 
     // ── Fresh type variables ─────────────────────────────────────

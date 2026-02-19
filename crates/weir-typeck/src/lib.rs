@@ -8,7 +8,7 @@ mod types;
 mod tests;
 
 pub use error::TypeError;
-pub use result::{DependencyGraph, FnType, Specialization, TypeCheckResult};
+pub use result::{DependencyGraph, FnType, Specialization, StructInfo, TypeCheckResult};
 pub use types::{Ty, TyVarId};
 
 use la_arena::ArenaMap;
@@ -144,6 +144,8 @@ pub fn check_with_externals(module: &Module, externals: &HashSet<SmolStr>) -> Ty
         }
     }
 
+    let struct_defs = checker.export_struct_defs();
+
     TypeCheckResult {
         errors: checker.errors,
         expr_types,
@@ -151,5 +153,6 @@ pub fn check_with_externals(module: &Module, externals: &HashSet<SmolStr>) -> Ty
         method_resolutions: checker.method_resolutions,
         specializations,
         deps: checker.dep_graph,
+        struct_defs,
     }
 }

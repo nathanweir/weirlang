@@ -1,6 +1,6 @@
 use smol_str::SmolStr;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
 use weir_ast::*;
@@ -13,6 +13,8 @@ pub struct InterpError {
     pub span: Option<Span>,
     /// If set, this error is an early return from a `?` operator.
     pub early_return: Option<Box<Value>>,
+    /// If set, this is a self-tail-call with new argument values (TCO trampoline).
+    pub tail_call_args: Option<Vec<Value>>,
 }
 
 impl InterpError {
@@ -21,6 +23,7 @@ impl InterpError {
             message: message.into(),
             span: None,
             early_return: None,
+            tail_call_args: None,
         }
     }
 
@@ -29,6 +32,7 @@ impl InterpError {
             message: message.into(),
             span: Some(span),
             early_return: None,
+            tail_call_args: None,
         }
     }
 
@@ -37,6 +41,16 @@ impl InterpError {
             message: String::new(),
             span: None,
             early_return: Some(Box::new(value)),
+            tail_call_args: None,
+        }
+    }
+
+    fn tail_call(args: Vec<Value>) -> Self {
+        Self {
+            message: String::new(),
+            span: None,
+            early_return: None,
+            tail_call_args: Some(args),
         }
     }
 }
@@ -294,6 +308,8 @@ pub fn interpret(module: &Module) -> Result<String, InterpError> {
         output: String::new(),
         method_to_class: HashMap::new(),
         class_instances: HashMap::new(),
+        current_fn_name: None,
+        tail_positions: HashSet::new(),
     };
     interp.run()?;
     Ok(interp.output)
@@ -312,6 +328,9 @@ struct Interpreter<'a> {
     method_to_class: HashMap<SmolStr, SmolStr>,
     /// class_name -> Vec<RuntimeInstance>
     class_instances: HashMap<SmolStr, Vec<RuntimeInstance>>,
+    // ── TCO fields ──
+    current_fn_name: Option<SmolStr>,
+    tail_positions: HashSet<ExprId>,
 }
 
 impl<'a> Interpreter<'a> {
@@ -579,6 +598,23 @@ impl<'a> Interpreter<'a> {
                     }
                 }
 
+                // TCO: intercept self-tail-calls (after typeclass dispatch, so method
+                // names that shadow the current function name are handled correctly)
+                if let ExprKind::Var(callee) = &func_expr.kind {
+                    if let Some(ref fn_name) = self.current_fn_name {
+                        if callee == fn_name
+                            && self.tail_positions.contains(&expr_id)
+                            && !self.method_to_class.contains_key(callee.as_str())
+                        {
+                            let arg_vals: Vec<Value> = args
+                                .iter()
+                                .map(|a| self.eval_expr(env, a.value))
+                                .collect::<Result<_, _>>()?;
+                            return Err(InterpError::tail_call(arg_vals));
+                        }
+                    }
+                }
+
                 let func_val = self.eval_expr(env, *func)?;
 
                 // Struct constructor with named args
@@ -818,7 +854,7 @@ impl<'a> Interpreter<'a> {
     ) -> Result<Value, InterpError> {
         match func {
             Value::Closure {
-                params, body, env, ..
+                name, params, body, env,
             } => {
                 if args.len() != params.len() {
                     return Err(InterpError::with_span(
@@ -826,14 +862,58 @@ impl<'a> Interpreter<'a> {
                         span,
                     ));
                 }
-                let call_env = env.child();
-                for (param, arg) in params.iter().zip(args.iter()) {
-                    call_env.define(param.clone(), arg.clone(), false);
-                }
-                match self.eval_body(&call_env, body) {
-                    Ok(val) => Ok(val),
-                    Err(e) if e.early_return.is_some() => Ok(*e.early_return.unwrap()),
-                    Err(e) => Err(e),
+
+                // Check if this closure has self-tail-calls (TCO candidate)
+                let needs_tco = name.as_ref().map_or(false, |n| {
+                    tco::has_self_tail_calls(body, n, &self.module.exprs)
+                });
+
+                if needs_tco {
+                    let fn_name = name.as_ref().unwrap().clone();
+                    let tail_pos = tco::mark_tail_positions(body, &self.module.exprs);
+
+                    // Save old TCO state
+                    let old_fn_name = self.current_fn_name.take();
+                    let old_tail_pos = std::mem::take(&mut self.tail_positions);
+
+                    // Set new TCO state
+                    self.current_fn_name = Some(fn_name);
+                    self.tail_positions = tail_pos;
+
+                    let mut current_args: Vec<Value> = args.to_vec();
+
+                    let result = loop {
+                        let call_env = env.child();
+                        for (param, arg) in params.iter().zip(current_args.iter()) {
+                            call_env.define(param.clone(), arg.clone(), false);
+                        }
+                        match self.eval_body(&call_env, body) {
+                            Ok(val) => break Ok(val),
+                            Err(e) if e.tail_call_args.is_some() => {
+                                current_args = e.tail_call_args.unwrap();
+                            }
+                            Err(e) if e.early_return.is_some() => {
+                                break Ok(*e.early_return.unwrap());
+                            }
+                            Err(e) => break Err(e),
+                        }
+                    };
+
+                    // Restore old TCO state
+                    self.current_fn_name = old_fn_name;
+                    self.tail_positions = old_tail_pos;
+
+                    result
+                } else {
+                    let call_env = env.child();
+                    for (param, arg) in params.iter().zip(args.iter()) {
+                        call_env.define(param.clone(), arg.clone(), false);
+                    }
+                    match self.eval_body(&call_env, body) {
+                        Ok(val) => Ok(val),
+                        Err(e) if e.early_return.is_some() => Ok(*e.early_return.unwrap()),
+                        Err(e) => Err(e),
+                    }
                 }
             }
 

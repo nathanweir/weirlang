@@ -151,3 +151,107 @@ fn syntax_error_exits_nonzero() {
         .failure()
         .stderr(predicate::str::contains("error"));
 }
+
+// ── struct codegen ─────────────────────────────────────────
+
+#[test]
+fn interp_structs() {
+    weir()
+        .args(["interp", &fixture_path("structs")])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1.0 2.0 3.0"))
+        .stdout(predicate::str::contains("hello 42.0"))
+        .stdout(predicate::str::contains("99.0"));
+}
+
+#[test]
+fn run_structs() {
+    weir()
+        .args(["run", &fixture_path("structs")])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1.0 2.0 3.0"))
+        .stdout(predicate::str::contains("hello 42.0"))
+        .stdout(predicate::str::contains("99.0"));
+}
+
+#[test]
+fn build_structs() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("structs_bin");
+
+    weir()
+        .args([
+            "build",
+            &fixture_path("structs"),
+            "-o",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert!(output.exists(), "binary should be created");
+
+    // Run the compiled binary
+    let out = std::process::Command::new(output)
+        .output()
+        .expect("failed to run compiled binary");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("1.0 2.0 3.0"), "field access works");
+    assert!(stdout.contains("hello 42.0"), "string field works");
+    assert!(stdout.contains("99.0"), "destructure works");
+}
+
+// ── TCO (tail-call optimization) ─────────────────────────
+
+#[test]
+fn interp_tco() {
+    weir()
+        .args(["interp", &fixture_path("tco")])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("0\n"))
+        .stdout(predicate::str::contains("2432902008176640000\n"))
+        .stdout(predicate::str::contains("500000500000\n"))
+        .stdout(predicate::str::contains("12586269025\n"));
+}
+
+#[test]
+fn run_tco() {
+    weir()
+        .args(["run", &fixture_path("tco")])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("0\n"))
+        .stdout(predicate::str::contains("2432902008176640000\n"))
+        .stdout(predicate::str::contains("500000500000\n"))
+        .stdout(predicate::str::contains("12586269025\n"));
+}
+
+#[test]
+fn build_tco() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("tco_bin");
+
+    weir()
+        .args([
+            "build",
+            &fixture_path("tco"),
+            "-o",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert!(output.exists(), "binary should be created");
+
+    let out = std::process::Command::new(output)
+        .output()
+        .expect("failed to run compiled binary");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("0\n"), "count-down 1000000 = 0");
+    assert!(stdout.contains("2432902008176640000"), "factorial 20");
+    assert!(stdout.contains("500000500000"), "sum-to 1000000");
+    assert!(stdout.contains("12586269025"), "fib-iter 50");
+}

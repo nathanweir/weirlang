@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use weir_ast::*;
 use weir_runtime::{SHAPE_FIXED, SHAPE_VECTOR};
-use weir_typeck::{Ty, TyVarId, TypeCheckResult};
+use weir_typeck::{StructInfo, Ty, TyVarId, TypeCheckResult};
 
 use jit_helpers::{output_reset, output_take};
 
@@ -47,7 +47,11 @@ impl fmt::Display for CodegenError {
 
 impl std::error::Error for CodegenError {}
 
-pub(crate) fn ty_to_cl_with(ty: &Ty, tagged_adts: Option<&HashMap<SmolStr, TaggedAdt>>) -> Option<Type> {
+pub(crate) fn ty_to_cl_with(
+    ty: &Ty,
+    tagged_adts: Option<&HashMap<SmolStr, TaggedAdt>>,
+    struct_names: Option<&HashSet<SmolStr>>,
+) -> Option<Type> {
     match ty {
         Ty::I8 | Ty::U8 | Ty::Bool => Some(types::I8),
         Ty::I16 | Ty::U16 => Some(types::I16),
@@ -67,6 +71,11 @@ pub(crate) fn ty_to_cl_with(ty: &Ty, tagged_adts: Option<&HashMap<SmolStr, Tagge
             if let Some(adts) = tagged_adts {
                 if adts.contains_key(name) {
                     return Some(types::I64); // packed tag+payload representation
+                }
+            }
+            if let Some(structs) = struct_names {
+                if structs.contains(name) {
+                    return Some(types::I64); // pointer to GC-managed struct
                 }
             }
             None
@@ -211,6 +220,8 @@ pub(crate) struct Compiler<'a, M: Module> {
     tagged_adts: HashMap<SmolStr, TaggedAdt>,
     /// Constructor name -> ConstructorInfo
     constructor_tags: HashMap<SmolStr, ConstructorInfo>,
+    /// Struct type names (for ty_to_cl recognition)
+    struct_names: HashSet<SmolStr>,
     /// Counter for generating unique lambda names
     lambda_counter: usize,
 }
@@ -263,6 +274,8 @@ impl<'a, M: Module> Compiler<'a, M> {
             }
         }
 
+        let struct_names: HashSet<SmolStr> = type_info.struct_defs.keys().cloned().collect();
+
         Self {
             ast_module,
             type_info,
@@ -271,6 +284,7 @@ impl<'a, M: Module> Compiler<'a, M> {
             runtime_fns: HashMap::new(),
             tagged_adts,
             constructor_tags,
+            struct_names,
             lambda_counter: 0,
         }
     }
@@ -382,7 +396,7 @@ impl<'a, M: Module> Compiler<'a, M> {
     // ── Pass 1: declare all user function signatures ────────────
 
     fn ty_cl(&self, ty: &Ty) -> Option<Type> {
-        ty_to_cl_with(ty, Some(&self.tagged_adts))
+        ty_to_cl_with(ty, Some(&self.tagged_adts), Some(&self.struct_names))
     }
 
     pub(crate) fn declare_user_functions(&mut self, linkage: Linkage) -> Result<(), CodegenError> {
@@ -557,9 +571,11 @@ impl<'a, M: Module> Compiler<'a, M> {
                 "String" => Ok(Ty::Str),
                 "Unit" => Ok(Ty::Unit),
                 other => {
-                    // Check if it's a tagged ADT type
+                    // Check if it's a tagged ADT type or struct
                     let name_smol = SmolStr::new(other);
-                    if self.tagged_adts.contains_key(&name_smol) {
+                    if self.tagged_adts.contains_key(&name_smol)
+                        || self.struct_names.contains(&name_smol)
+                    {
                         Ok(Ty::Con(name_smol, vec![]))
                     } else {
                         Err(CodegenError::new(format!(
@@ -578,7 +594,9 @@ impl<'a, M: Module> Compiler<'a, M> {
                             return Ok(Ty::Vector(Box::new(elem_ty)));
                         }
                         let name_smol = SmolStr::new(name.as_str());
-                        if self.tagged_adts.contains_key(&name_smol) {
+                        if self.tagged_adts.contains_key(&name_smol)
+                            || self.struct_names.contains(&name_smol)
+                        {
                             // Resolve args (for type checking), but the runtime rep is just i64
                             let mut arg_tys = Vec::new();
                             for &arg_id in args {
@@ -822,14 +840,15 @@ impl<'a, M: Module> Compiler<'a, M> {
         };
 
         let adts = &self.tagged_adts;
+        let snames = &self.struct_names;
         let mut sig = self.module.make_signature();
         sig.call_conv = CallConv::SystemV;
         for pty in &param_tys {
-            if let Some(cl_ty) = ty_to_cl_with(pty, Some(adts)) {
+            if let Some(cl_ty) = ty_to_cl_with(pty, Some(adts), Some(snames)) {
                 sig.params.push(AbiParam::new(cl_ty));
             }
         }
-        if let Some(cl_ty) = ty_to_cl_with(&ret_ty, Some(adts)) {
+        if let Some(cl_ty) = ty_to_cl_with(&ret_ty, Some(adts), Some(snames)) {
             sig.returns.push(AbiParam::new(cl_ty));
         }
 
@@ -844,6 +863,10 @@ impl<'a, M: Module> Compiler<'a, M> {
         builder.switch_to_block(entry_block);
         builder.seal_block(entry_block);
 
+        // Check if this function has self-tail-calls (for TCO)
+        let tail_positions = weir_ast::tco::mark_tail_positions(&defn.body, &self.ast_module.exprs);
+        let needs_tco = weir_ast::tco::has_self_tail_calls(&defn.body, &defn.name, &self.ast_module.exprs);
+
         let pending_lambdas = {
             let mut fn_ctx = FnCompileCtx {
                 builder: &mut builder,
@@ -857,11 +880,17 @@ impl<'a, M: Module> Compiler<'a, M> {
                 table_data_id,
                 tagged_adts: &self.tagged_adts,
                 constructor_tags: &self.constructor_tags,
+                struct_names: &self.struct_names,
                 pending_lambdas: Vec::new(),
                 lambda_counter: &mut self.lambda_counter,
                 type_subst: type_subst.clone(),
                 shadow_depth: 0,
                 arena_stack: Vec::new(),
+                current_fn_name: if needs_tco { Some(defn.name.clone()) } else { None },
+                loop_header: None,
+                tail_positions: if needs_tco { tail_positions } else { HashSet::new() },
+                tail_jump_emitted: false,
+                param_vars: Vec::new(),
             };
 
             // Bind parameters to variables
@@ -874,36 +903,89 @@ impl<'a, M: Module> Compiler<'a, M> {
                     fn_ctx
                         .vars
                         .insert(param.name.clone(), (var, param_tys[i].clone()));
-                    // Push heap-pointer-typed parameters onto the GC shadow stack
-                    if fn_ctx.is_heap_pointer(&param_tys[i]) {
-                        fn_ctx.push_gc_root(block_params[param_idx]);
+                    fn_ctx.param_vars.push((param.name.clone(), var, param_tys[i].clone()));
+                    if !needs_tco {
+                        // Push heap-pointer-typed parameters onto the GC shadow stack
+                        if fn_ctx.is_heap_pointer(&param_tys[i]) {
+                            fn_ctx.push_gc_root(block_params[param_idx]);
+                        }
                     }
                     param_idx += 1;
                 }
             }
 
-            // Compile body
-            let body_val = fn_ctx.compile_body(&defn.body, &ret_ty)?;
+            if needs_tco {
+                // Create loop header block (unsealed — back-edge will be added later)
+                let loop_header = fn_ctx.builder.create_block();
+                fn_ctx.builder.ins().jump(loop_header, &[]);
+                fn_ctx.builder.switch_to_block(loop_header);
+                // Do NOT seal yet — tail-call jumps will add predecessors
 
-            // Pop shadow stack entries before returning
-            let depth = fn_ctx.shadow_depth;
-            fn_ctx.emit_shadow_pop(depth);
+                // Push GC roots for heap-pointer params (after switching to loop_header
+                // so they are re-evaluated on each iteration)
+                let gc_params: Vec<(Variable, Ty)> = fn_ctx.param_vars.iter()
+                    .filter(|(_, _, ty)| fn_ctx.is_heap_pointer(ty))
+                    .map(|(_, var, ty)| (*var, ty.clone()))
+                    .collect();
+                for (var, _ty) in gc_params {
+                    let val = fn_ctx.builder.use_var(var);
+                    fn_ctx.push_gc_root(val);
+                }
 
-            // Return
-            if fn_ctx.ty_cl(&ret_ty).is_some() {
-                if let Some(val) = body_val {
-                    fn_ctx.builder.ins().return_(&[val]);
-                } else {
-                    let cl_ty = fn_ctx.ty_cl(&ret_ty).unwrap();
-                    let zero = if cl_ty.is_float() {
-                        fn_ctx.builder.ins().f64const(0.0)
+                fn_ctx.loop_header = Some(loop_header);
+
+                // Compile body
+                let body_val = fn_ctx.compile_body(&defn.body, &ret_ty)?;
+
+                // Seal loop_header now that all predecessors are known
+                fn_ctx.builder.seal_block(loop_header);
+
+                if !fn_ctx.tail_jump_emitted {
+                    // Normal return path (body didn't end with a tail-call jump)
+                    let depth = fn_ctx.shadow_depth;
+                    fn_ctx.emit_shadow_pop(depth);
+
+                    if fn_ctx.ty_cl(&ret_ty).is_some() {
+                        if let Some(val) = body_val {
+                            fn_ctx.builder.ins().return_(&[val]);
+                        } else {
+                            let cl_ty = fn_ctx.ty_cl(&ret_ty).unwrap();
+                            let zero = if cl_ty.is_float() {
+                                fn_ctx.builder.ins().f64const(0.0)
+                            } else {
+                                fn_ctx.builder.ins().iconst(cl_ty, 0)
+                            };
+                            fn_ctx.builder.ins().return_(&[zero]);
+                        }
                     } else {
-                        fn_ctx.builder.ins().iconst(cl_ty, 0)
-                    };
-                    fn_ctx.builder.ins().return_(&[zero]);
+                        fn_ctx.builder.ins().return_(&[]);
+                    }
                 }
             } else {
-                fn_ctx.builder.ins().return_(&[]);
+                // No TCO — original path
+                // Compile body
+                let body_val = fn_ctx.compile_body(&defn.body, &ret_ty)?;
+
+                // Pop shadow stack entries before returning
+                let depth = fn_ctx.shadow_depth;
+                fn_ctx.emit_shadow_pop(depth);
+
+                // Return
+                if fn_ctx.ty_cl(&ret_ty).is_some() {
+                    if let Some(val) = body_val {
+                        fn_ctx.builder.ins().return_(&[val]);
+                    } else {
+                        let cl_ty = fn_ctx.ty_cl(&ret_ty).unwrap();
+                        let zero = if cl_ty.is_float() {
+                            fn_ctx.builder.ins().f64const(0.0)
+                        } else {
+                            fn_ctx.builder.ins().iconst(cl_ty, 0)
+                        };
+                        fn_ctx.builder.ins().return_(&[zero]);
+                    }
+                } else {
+                    fn_ctx.builder.ins().return_(&[]);
+                }
             }
 
             // Extract pending lambdas before fn_ctx is dropped
@@ -938,17 +1020,18 @@ impl<'a, M: Module> Compiler<'a, M> {
         table_data_id: Option<DataId>,
     ) -> Result<Vec<LambdaInfo>, CodegenError> {
         let adts = &self.tagged_adts;
+        let snames = &self.struct_names;
 
         // Build signature: (env_ptr: i64, param_0, param_1, ...) -> ret
         let mut sig = self.module.make_signature();
         sig.call_conv = CallConv::SystemV;
         sig.params.push(AbiParam::new(types::I64)); // env_ptr
         for pty in &info.param_tys {
-            if let Some(cl_ty) = ty_to_cl_with(pty, Some(adts)) {
+            if let Some(cl_ty) = ty_to_cl_with(pty, Some(adts), Some(snames)) {
                 sig.params.push(AbiParam::new(cl_ty));
             }
         }
-        if let Some(cl_ty) = ty_to_cl_with(&info.ret_ty, Some(adts)) {
+        if let Some(cl_ty) = ty_to_cl_with(&info.ret_ty, Some(adts), Some(snames)) {
             sig.returns.push(AbiParam::new(cl_ty));
         }
 
@@ -976,11 +1059,17 @@ impl<'a, M: Module> Compiler<'a, M> {
                 table_data_id,
                 tagged_adts: &self.tagged_adts,
                 constructor_tags: &self.constructor_tags,
+                struct_names: &self.struct_names,
                 pending_lambdas: Vec::new(),
                 lambda_counter: &mut self.lambda_counter,
                 type_subst: info.type_subst.clone(),
                 shadow_depth: 0,
                 arena_stack: Vec::new(),
+                current_fn_name: None,
+                loop_header: None,
+                tail_positions: HashSet::new(),
+                tail_jump_emitted: false,
+                param_vars: Vec::new(),
             };
 
             let block_params: Vec<Value> = fn_ctx.builder.block_params(entry_block).to_vec();
@@ -1222,6 +1311,8 @@ struct FnCompileCtx<'a, 'b, M: Module> {
     tagged_adts: &'a HashMap<SmolStr, TaggedAdt>,
     /// Constructor name -> ConstructorInfo
     constructor_tags: &'a HashMap<SmolStr, ConstructorInfo>,
+    /// Struct type names (from Compiler)
+    struct_names: &'a HashSet<SmolStr>,
     /// Lambdas collected during expression compilation, compiled after the enclosing function.
     pending_lambdas: Vec<LambdaInfo>,
     /// Counter for generating unique lambda names (shared with Compiler).
@@ -1234,11 +1325,22 @@ struct FnCompileCtx<'a, 'b, M: Module> {
     /// Stack of active arena variables (outermost to innermost).
     /// Used for cleanup on early return (? operator) and allocation redirection.
     arena_stack: Vec<Variable>,
+    // ── TCO (tail-call optimization) fields ──
+    /// Name of the function currently being compiled (for self-tail-call detection).
+    current_fn_name: Option<SmolStr>,
+    /// Loop header block for TCO (jump target for self-tail-calls).
+    loop_header: Option<cranelift_codegen::ir::Block>,
+    /// ExprIds that are in tail position within this function body.
+    tail_positions: HashSet<ExprId>,
+    /// Set to true when a tail-call jump was just emitted (suppresses merge jumps).
+    tail_jump_emitted: bool,
+    /// Parameter variables for TCO reassignment at tail-call sites.
+    param_vars: Vec<(SmolStr, Variable, Ty)>,
 }
 
 impl<M: Module> FnCompileCtx<'_, '_, M> {
     fn ty_cl(&self, ty: &Ty) -> Option<Type> {
-        ty_to_cl_with(ty, Some(self.tagged_adts))
+        ty_to_cl_with(ty, Some(self.tagged_adts), Some(self.struct_names))
     }
 
     /// Returns true if a value of this type is a GC heap pointer.
@@ -1246,6 +1348,10 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
         match ty {
             Ty::Str | Ty::Vector(_) | Ty::Fn(_, _) => true,
             Ty::Con(name, _) => {
+                // Structs are always GC heap pointers
+                if self.struct_names.contains(name) {
+                    return true;
+                }
                 // ADTs with any variant that has a payload field are heap-relevant
                 // (the payload might be a heap pointer when packed)
                 if let Some(adt) = self.tagged_adts.get(name) {
@@ -1432,7 +1538,7 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                 }
             }
 
-            ExprKind::Call { func, args } => self.compile_call(*func, args, &resolved_ty),
+            ExprKind::Call { func, args } => self.compile_call(expr_id, *func, args, &resolved_ty),
 
             ExprKind::Let { bindings, body } => {
                 let mut let_push_count = 0usize;
@@ -1453,8 +1559,10 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                     }
                 }
                 let result = self.compile_body(body, &resolved_ty);
-                // Pop let-scoped shadow stack entries
-                self.emit_shadow_pop(let_push_count);
+                // Pop let-scoped shadow stack entries (unless a tail-call jump was emitted)
+                if !self.tail_jump_emitted {
+                    self.emit_shadow_pop(let_push_count);
+                }
                 result
             }
 
@@ -1666,15 +1774,16 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
 
                 // Build lambda signature: (env_ptr: i64, param_0, ...) -> ret
                 let adts = self.tagged_adts;
+                let snames = self.struct_names;
                 let mut sig = self.module.make_signature();
                 sig.call_conv = CallConv::SystemV;
                 sig.params.push(AbiParam::new(types::I64)); // env_ptr
                 for pty in &param_tys {
-                    if let Some(cl_ty) = ty_to_cl_with(pty, Some(adts)) {
+                    if let Some(cl_ty) = ty_to_cl_with(pty, Some(adts), Some(snames)) {
                         sig.params.push(AbiParam::new(cl_ty));
                     }
                 }
-                if let Some(cl_ty) = ty_to_cl_with(&ret_ty, Some(adts)) {
+                if let Some(cl_ty) = ty_to_cl_with(&ret_ty, Some(adts), Some(snames)) {
                     sig.returns.push(AbiParam::new(cl_ty));
                 }
 
@@ -1833,11 +1942,17 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
 
     fn compile_call(
         &mut self,
+        call_expr_id: ExprId,
         func_id: ExprId,
         args: &[Arg],
         result_ty: &Ty,
     ) -> Result<Option<Value>, CodegenError> {
         let func_expr = &self.ast_module.exprs[func_id];
+
+        // Field access: (.field obj) → load from struct pointer + offset
+        if let ExprKind::FieldAccess(field_name) = &func_expr.kind {
+            return self.compile_field_access(field_name, args, result_ty);
+        }
 
         if let ExprKind::Var(name) = &func_expr.kind {
             // Check if this is a typeclass method call with a resolved instance
@@ -1909,6 +2024,11 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                     // Nullary constructor called as (None) — emit tag
                     return Ok(Some(self.builder.ins().iconst(types::I64, info.tag)));
                 }
+            }
+
+            // Check if this is a struct constructor call
+            if let Some(sinfo) = self.type_info.struct_defs.get(name) {
+                return self.compile_struct_construction(name, sinfo, args);
             }
 
             match name.as_str() {
@@ -2433,6 +2553,48 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
 
             // User function call
             if let Some((callee_id, param_tys, ret_ty)) = self.user_fns.get(name).cloned() {
+                // TCO: self-tail-call → compile args, pop shadow stack, reassign params, jump to loop header
+                if self.tail_positions.contains(&call_expr_id) {
+                    if let Some(ref fn_name) = self.current_fn_name {
+                        if name == fn_name {
+                            if let Some(loop_header) = self.loop_header {
+                                // Compile all argument values first
+                                let mut arg_vals = Vec::new();
+                                for (i, arg) in args.iter().enumerate() {
+                                    let pty = if i < param_tys.len() {
+                                        &param_tys[i]
+                                    } else {
+                                        return Err(CodegenError::new(format!(
+                                            "too many arguments for function '{}'",
+                                            name
+                                        )));
+                                    };
+                                    if let Some(val) = self.compile_expr(arg.value, pty)? {
+                                        arg_vals.push(val);
+                                    }
+                                }
+
+                                // Pop ALL GC shadow stack roots
+                                let depth = self.shadow_depth;
+                                self.emit_shadow_pop(depth);
+
+                                // Reassign parameter variables with new values
+                                let param_vars = self.param_vars.clone();
+                                for (i, (_name, var, _ty)) in param_vars.iter().enumerate() {
+                                    if i < arg_vals.len() {
+                                        self.builder.def_var(*var, arg_vals[i]);
+                                    }
+                                }
+
+                                // Jump back to loop header
+                                self.builder.ins().jump(loop_header, &[]);
+                                self.tail_jump_emitted = true;
+                                return Ok(None);
+                            }
+                        }
+                    }
+                }
+
                 let mut arg_vals = Vec::new();
                 for (i, arg) in args.iter().enumerate() {
                     let pty = if i < param_tys.len() {
@@ -2633,6 +2795,180 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
             // Unit return — return a dummy zero
             Ok(self.builder.ins().iconst(types::I64, 0))
         }
+    }
+
+    // ── Struct construction ──────────────────────────────────────
+
+    fn compile_struct_construction(
+        &mut self,
+        name: &SmolStr,
+        sinfo: &StructInfo,
+        args: &[Arg],
+    ) -> Result<Option<Value>, CodegenError> {
+        let num_fields = sinfo.fields.len();
+
+        // Determine field order: named args → match by name, positional → in order
+        let has_named = args.iter().any(|a| a.name.is_some());
+        let field_values: Vec<(Value, Ty)> = if has_named {
+            let mut vals = vec![None; num_fields];
+            for arg in args {
+                let arg_name = arg.name.as_ref().ok_or_else(|| {
+                    CodegenError::new("cannot mix positional and named args in struct construction")
+                })?;
+                let field_idx = sinfo
+                    .fields
+                    .iter()
+                    .position(|(n, _)| n == arg_name)
+                    .ok_or_else(|| {
+                        CodegenError::new(format!("struct {} has no field '{}'", name, arg_name))
+                    })?;
+                let field_ty = &sinfo.fields[field_idx].1;
+                let val = self
+                    .compile_expr(arg.value, field_ty)?
+                    .ok_or_else(|| CodegenError::new("struct field must produce a value"))?;
+                vals[field_idx] = Some((val, field_ty.clone()));
+            }
+            vals.into_iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    v.ok_or_else(|| {
+                        CodegenError::new(format!(
+                            "missing field '{}' in struct {} construction",
+                            sinfo.fields[i].0, name
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            if args.len() != num_fields {
+                return Err(CodegenError::new(format!(
+                    "struct {} has {} fields, got {} arguments",
+                    name,
+                    num_fields,
+                    args.len()
+                )));
+            }
+            args.iter()
+                .zip(sinfo.fields.iter())
+                .map(|(arg, (_, field_ty))| {
+                    let val = self
+                        .compile_expr(arg.value, field_ty)?
+                        .ok_or_else(|| CodegenError::new("struct field must produce a value"))?;
+                    Ok((val, field_ty.clone()))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        // Build shape descriptor
+        let mut pointer_mask: u64 = 0;
+        for (i, (_, ty)) in field_values.iter().enumerate() {
+            if self.is_heap_pointer(ty) {
+                pointer_mask |= 1u64 << i;
+            }
+        }
+        let shape_val = self.emit_shape_desc(num_fields as u32, SHAPE_FIXED, pointer_mask);
+
+        // Allocate
+        let alloc_size = (num_fields * 8) as i64;
+        let alloc_size_val = self.builder.ins().iconst(types::I64, alloc_size);
+        let struct_ptr = if let Some(&arena_v) = self.arena_stack.last() {
+            let arena_val = self.builder.use_var(arena_v);
+            let alloc_id = self.runtime_fns["arena_alloc"];
+            let alloc_ref = self
+                .module
+                .declare_func_in_func(alloc_id, self.builder.func);
+            let call = self
+                .builder
+                .ins()
+                .call(alloc_ref, &[arena_val, alloc_size_val]);
+            self.builder.inst_results(call)[0]
+        } else {
+            let alloc_id = self.runtime_fns["gc_alloc"];
+            let alloc_ref = self
+                .module
+                .declare_func_in_func(alloc_id, self.builder.func);
+            let call = self
+                .builder
+                .ins()
+                .call(alloc_ref, &[alloc_size_val, shape_val]);
+            self.builder.inst_results(call)[0]
+        };
+
+        // Store each field
+        for (i, (val, ty)) in field_values.iter().enumerate() {
+            let widened = self.widen_to_i64(*val, ty);
+            let offset = (i * 8) as i32;
+            self.builder
+                .ins()
+                .store(MemFlags::trusted(), widened, struct_ptr, offset);
+        }
+
+        // Push onto GC shadow stack
+        self.push_gc_root(struct_ptr);
+
+        Ok(Some(struct_ptr))
+    }
+
+    // ── Field access ──────────────────────────────────────────────
+
+    fn compile_field_access(
+        &mut self,
+        field_name: &SmolStr,
+        args: &[Arg],
+        result_ty: &Ty,
+    ) -> Result<Option<Value>, CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::new(format!(
+                "field access .{} expects exactly 1 argument, got {}",
+                field_name,
+                args.len()
+            )));
+        }
+
+        let obj_ty = self.expr_ty(args[0].value);
+        let struct_name = match &obj_ty {
+            Ty::Con(name, _) => name.clone(),
+            _ => {
+                return Err(CodegenError::new(format!(
+                    "field access .{} on non-struct type {}",
+                    field_name, obj_ty
+                )));
+            }
+        };
+
+        let sinfo = self
+            .type_info
+            .struct_defs
+            .get(&struct_name)
+            .ok_or_else(|| {
+                CodegenError::new(format!(
+                    "field access .{} on unknown struct type {}",
+                    field_name, struct_name
+                ))
+            })?;
+
+        let field_idx = sinfo
+            .fields
+            .iter()
+            .position(|(n, _)| n == field_name)
+            .ok_or_else(|| {
+                CodegenError::new(format!(
+                    "struct {} has no field '{}'",
+                    struct_name, field_name
+                ))
+            })?;
+
+        let obj_ptr = self.compile_expr(args[0].value, &obj_ty)?.ok_or_else(|| {
+            CodegenError::new("struct field access on void value")
+        })?;
+
+        let offset = (field_idx * 8) as i32;
+        let raw = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::trusted(), obj_ptr, offset);
+        let val = self.narrow_from_i64(raw, result_ty);
+        Ok(Some(val))
     }
 
     // ── Arithmetic ──────────────────────────────────────────────
@@ -3116,31 +3452,48 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
         self.builder.switch_to_block(then_block);
         self.builder.seal_block(then_block);
         let then_val = self.compile_expr(then_branch, result_ty)?;
-        if has_value {
-            let val = then_val.unwrap_or_else(|| self.zero_value(result_ty));
-            self.builder
-                .ins()
-                .jump(merge_block, &[BlockArg::Value(val)]);
-        } else {
-            self.builder.ins().jump(merge_block, &[]);
-        }
-
-        // Else branch
-        self.builder.switch_to_block(else_block);
-        self.builder.seal_block(else_block);
-        if let Some(else_id) = else_branch {
-            let else_val = self.compile_expr(else_id, result_ty)?;
+        let then_jumped = std::mem::replace(&mut self.tail_jump_emitted, false);
+        if !then_jumped {
             if has_value {
-                let val = else_val.unwrap_or_else(|| self.zero_value(result_ty));
+                let val = then_val.unwrap_or_else(|| self.zero_value(result_ty));
                 self.builder
                     .ins()
                     .jump(merge_block, &[BlockArg::Value(val)]);
             } else {
                 self.builder.ins().jump(merge_block, &[]);
             }
+        }
+
+        // Else branch
+        self.builder.switch_to_block(else_block);
+        self.builder.seal_block(else_block);
+        let mut else_jumped = false;
+        if let Some(else_id) = else_branch {
+            let else_val = self.compile_expr(else_id, result_ty)?;
+            else_jumped = std::mem::replace(&mut self.tail_jump_emitted, false);
+            if !else_jumped {
+                if has_value {
+                    let val = else_val.unwrap_or_else(|| self.zero_value(result_ty));
+                    self.builder
+                        .ins()
+                        .jump(merge_block, &[BlockArg::Value(val)]);
+                } else {
+                    self.builder.ins().jump(merge_block, &[]);
+                }
+            }
         } else {
             // No else branch — Unit result
             self.builder.ins().jump(merge_block, &[]);
+        }
+
+        // If both branches emitted tail jumps, propagate the flag up
+        if then_jumped && else_jumped {
+            self.tail_jump_emitted = true;
+            // merge_block has no predecessors but we still need to seal and switch to it
+            // for Cranelift validity — emit unreachable
+            self.builder.switch_to_block(merge_block);
+            self.builder.seal_block(merge_block);
+            return Ok(None);
         }
 
         // Merge
@@ -3182,13 +3535,15 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
             self.builder.switch_to_block(then_block);
             self.builder.seal_block(then_block);
             let body_val = self.compile_expr(*body_id, result_ty)?;
-            if has_value {
-                let val = body_val.unwrap_or_else(|| self.zero_value(result_ty));
-                self.builder
-                    .ins()
-                    .jump(merge_block, &[BlockArg::Value(val)]);
-            } else {
-                self.builder.ins().jump(merge_block, &[]);
+            if !std::mem::replace(&mut self.tail_jump_emitted, false) {
+                if has_value {
+                    let val = body_val.unwrap_or_else(|| self.zero_value(result_ty));
+                    self.builder
+                        .ins()
+                        .jump(merge_block, &[BlockArg::Value(val)]);
+                } else {
+                    self.builder.ins().jump(merge_block, &[]);
+                }
             }
 
             self.builder.switch_to_block(next_block);
@@ -3198,13 +3553,15 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
         // Else clause (or default)
         if let Some(else_id) = else_clause {
             let else_val = self.compile_expr(else_id, result_ty)?;
-            if has_value {
-                let val = else_val.unwrap_or_else(|| self.zero_value(result_ty));
-                self.builder
-                    .ins()
-                    .jump(merge_block, &[BlockArg::Value(val)]);
-            } else {
-                self.builder.ins().jump(merge_block, &[]);
+            if !std::mem::replace(&mut self.tail_jump_emitted, false) {
+                if has_value {
+                    let val = else_val.unwrap_or_else(|| self.zero_value(result_ty));
+                    self.builder
+                        .ins()
+                        .jump(merge_block, &[BlockArg::Value(val)]);
+                } else {
+                    self.builder.ins().jump(merge_block, &[]);
+                }
             }
         } else {
             // No else — jump to merge with default
@@ -3315,13 +3672,15 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                             self.bind_pattern_var(&sub_pat.kind, payload, &payload_ty)?;
                         }
                         let body_val = self.compile_body(&arm.body, result_ty)?;
-                        if has_value {
-                            let val = body_val.unwrap_or_else(|| self.zero_value(result_ty));
-                            self.builder
-                                .ins()
-                                .jump(merge_block, &[BlockArg::Value(val)]);
-                        } else {
-                            self.builder.ins().jump(merge_block, &[]);
+                        if !std::mem::replace(&mut self.tail_jump_emitted, false) {
+                            if has_value {
+                                let val = body_val.unwrap_or_else(|| self.zero_value(result_ty));
+                                self.builder
+                                    .ins()
+                                    .jump(merge_block, &[BlockArg::Value(val)]);
+                            } else {
+                                self.builder.ins().jump(merge_block, &[]);
+                            }
                         }
                     } else {
                         let arm_block = self.builder.create_block();
@@ -3348,13 +3707,15 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                         }
 
                         let body_val = self.compile_body(&arm.body, result_ty)?;
-                        if has_value {
-                            let val = body_val.unwrap_or_else(|| self.zero_value(result_ty));
-                            self.builder
-                                .ins()
-                                .jump(merge_block, &[BlockArg::Value(val)]);
-                        } else {
-                            self.builder.ins().jump(merge_block, &[]);
+                        if !std::mem::replace(&mut self.tail_jump_emitted, false) {
+                            if has_value {
+                                let val = body_val.unwrap_or_else(|| self.zero_value(result_ty));
+                                self.builder
+                                    .ins()
+                                    .jump(merge_block, &[BlockArg::Value(val)]);
+                            } else {
+                                self.builder.ins().jump(merge_block, &[]);
+                            }
                         }
 
                         // Continue to next arm
@@ -3366,13 +3727,15 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                 PatternKind::Wildcard => {
                     // Catch-all: compile body directly in current block
                     let body_val = self.compile_body(&arm.body, result_ty)?;
-                    if has_value {
-                        let val = body_val.unwrap_or_else(|| self.zero_value(result_ty));
-                        self.builder
-                            .ins()
-                            .jump(merge_block, &[BlockArg::Value(val)]);
-                    } else {
-                        self.builder.ins().jump(merge_block, &[]);
+                    if !std::mem::replace(&mut self.tail_jump_emitted, false) {
+                        if has_value {
+                            let val = body_val.unwrap_or_else(|| self.zero_value(result_ty));
+                            self.builder
+                                .ins()
+                                .jump(merge_block, &[BlockArg::Value(val)]);
+                        } else {
+                            self.builder.ins().jump(merge_block, &[]);
+                        }
                     }
                 }
 
@@ -3386,13 +3749,78 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                     self.vars.insert(name.clone(), (var, scrut_ty.clone()));
 
                     let body_val = self.compile_body(&arm.body, result_ty)?;
-                    if has_value {
-                        let val = body_val.unwrap_or_else(|| self.zero_value(result_ty));
-                        self.builder
-                            .ins()
-                            .jump(merge_block, &[BlockArg::Value(val)]);
-                    } else {
-                        self.builder.ins().jump(merge_block, &[]);
+                    if !std::mem::replace(&mut self.tail_jump_emitted, false) {
+                        if has_value {
+                            let val = body_val.unwrap_or_else(|| self.zero_value(result_ty));
+                            self.builder
+                                .ins()
+                                .jump(merge_block, &[BlockArg::Value(val)]);
+                        } else {
+                            self.builder.ins().jump(merge_block, &[]);
+                        }
+                    }
+                }
+
+                PatternKind::StructDestructure { fields } => {
+                    // Struct destructuring — irrefutable, bind fields from pointer
+                    let struct_name = match &scrut_ty {
+                        Ty::Con(name, _) => name.clone(),
+                        _ => {
+                            return Err(CodegenError::new(format!(
+                                "struct destructure on non-struct type {}",
+                                scrut_ty
+                            )));
+                        }
+                    };
+                    let sinfo = self
+                        .type_info
+                        .struct_defs
+                        .get(&struct_name)
+                        .ok_or_else(|| {
+                            CodegenError::new(format!(
+                                "struct destructure on unknown struct {}",
+                                struct_name
+                            ))
+                        })?;
+
+                    for fp in fields {
+                        let field_idx = sinfo
+                            .fields
+                            .iter()
+                            .position(|(n, _)| n == &fp.field_name)
+                            .ok_or_else(|| {
+                                CodegenError::new(format!(
+                                    "struct {} has no field '{}'",
+                                    struct_name, fp.field_name
+                                ))
+                            })?;
+                        let field_ty = &sinfo.fields[field_idx].1;
+                        let offset = (field_idx * 8) as i32;
+                        let raw = self.builder.ins().load(
+                            types::I64,
+                            MemFlags::trusted(),
+                            scrut_val,
+                            offset,
+                        );
+                        let val = self.narrow_from_i64(raw, field_ty);
+                        let cl_ty = self.ty_cl(field_ty).unwrap_or(types::I64);
+                        let var = self.declare_variable(cl_ty);
+                        self.builder.def_var(var, val);
+                        let binding_name = fp.binding.as_ref().unwrap_or(&fp.field_name);
+                        self.vars
+                            .insert(binding_name.clone(), (var, field_ty.clone()));
+                    }
+
+                    let body_val = self.compile_body(&arm.body, result_ty)?;
+                    if !std::mem::replace(&mut self.tail_jump_emitted, false) {
+                        if has_value {
+                            let val = body_val.unwrap_or_else(|| self.zero_value(result_ty));
+                            self.builder
+                                .ins()
+                                .jump(merge_block, &[BlockArg::Value(val)]);
+                        } else {
+                            self.builder.ins().jump(merge_block, &[]);
+                        }
                     }
                 }
 

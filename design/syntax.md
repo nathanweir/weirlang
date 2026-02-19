@@ -599,17 +599,19 @@ Destructuring is supported in `let` bindings and function parameters, but restri
 
 ### Struct destructuring (curly-brace syntax)
 
+Keywords (`:field`) denote field names. A bare symbol after a keyword is an explicit binding name; without one, the binding uses the field name.
+
 ```lisp
-;; Destructure struct fields into local bindings
-(let (({x y} my-vec))
+;; Destructure struct fields into local bindings (same-name)
+(let (({:x :y} my-vec))
   (+ x y))
 
-;; In function parameters
-(defn distance (({x ax y ay} : Vec2) ({x bx y by} : Vec2)) : f32
+;; In function parameters with renamed bindings
+(defn distance (({:x ax :y ay} : Vec2) ({:x bx :y by} : Vec2)) : f32
   (sqrt (+ (square (- bx ax)) (square (- by ay)))))
 
 ;; Partial destructuring (only some fields)
-(let (({health} enemy))
+(let (({:health} enemy))
   (> health 0))
 ```
 
@@ -624,7 +626,7 @@ Destructuring is supported in `let` bindings and function parameters, but restri
 
 ```lisp
 ;; OK — struct destructuring always succeeds
-(let (({x y} my-vec))
+(let (({:x :y} my-vec))
   (+ x y))
 
 ;; COMPILE ERROR — Option might be None, use match instead
