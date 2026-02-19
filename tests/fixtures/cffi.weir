@@ -1,0 +1,9 @@
+;; CFFI test — calls C standard library functions via extern "C"
+
+(extern "C"
+  (defn abs ((n : i32)) : i32))
+
+(defn main ()
+  (unsafe
+    (println (abs -42))
+    (println (abs 7))))

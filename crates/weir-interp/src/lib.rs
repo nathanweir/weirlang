@@ -104,6 +104,15 @@ pub enum Value {
     Builtin(SmolStr),
     Atom(Rc<RefCell<Value>>),
     Channel(Rc<ChannelPair>),
+    /// FFI function resolved via dlsym
+    ExternFn {
+        name: SmolStr,
+        fn_ptr: usize,
+        /// Type annotation names for parameters (e.g., "i32", "f64", "Ptr")
+        param_type_names: Vec<SmolStr>,
+        /// Type annotation name for return type
+        return_type_name: SmolStr,
+    },
 }
 
 impl fmt::Display for Value {
@@ -178,6 +187,7 @@ impl fmt::Display for Value {
                 write!(f, "(atom {})", *val)
             }
             Value::Channel(_) => write!(f, "<channel>"),
+            Value::ExternFn { name, .. } => write!(f, "<extern {}>", name),
         }
     }
 }
@@ -213,6 +223,10 @@ impl PartialEq for Value {
             (Value::Vector(a), Value::Vector(b)) => a == b,
             (Value::Atom(a), Value::Atom(b)) => Rc::ptr_eq(a, b),
             (Value::Channel(a), Value::Channel(b)) => Rc::ptr_eq(a, b),
+            (
+                Value::ExternFn { fn_ptr: a, .. },
+                Value::ExternFn { fn_ptr: b, .. },
+            ) => a == b,
             _ => false,
         }
     }
@@ -388,10 +402,8 @@ impl<'a> Interpreter<'a> {
             Item::Defstruct(d) => self.process_defstruct(d),
             Item::Defclass(d) => self.process_defclass(d),
             Item::Instance(d) => self.process_instance(d),
-            Item::Import(_) | Item::Declare(_) | Item::ExternC(_) => {
-                // Skip for now
-                Ok(())
-            }
+            Item::Import(_) | Item::Declare(_) => Ok(()),
+            Item::ExternC(ext) => self.process_extern_c(ext),
         }
     }
 
@@ -469,6 +481,51 @@ impl<'a> Interpreter<'a> {
             .or_default();
         entry.push(RuntimeInstance { type_tag, methods });
 
+        Ok(())
+    }
+
+    fn process_extern_c(&mut self, ext: &ExternC) -> Result<(), InterpError> {
+        for decl in &ext.declarations {
+            // Resolve type annotation names for parameters and return type
+            let param_type_names: Vec<SmolStr> = decl
+                .params
+                .iter()
+                .map(|p| {
+                    if let Some(type_id) = p.type_ann {
+                        self.type_expr_to_tag(&self.module.type_exprs[type_id])
+                    } else {
+                        SmolStr::new("i64")
+                    }
+                })
+                .collect();
+
+            let return_type_name = if let Some(ret_id) = decl.return_type {
+                self.type_expr_to_tag(&self.module.type_exprs[ret_id])
+            } else {
+                SmolStr::new("Unit")
+            };
+
+            // Resolve the function pointer via dlsym
+            let c_name = std::ffi::CString::new(decl.name.as_str()).unwrap();
+            let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr()) };
+            if ptr.is_null() {
+                return Err(InterpError::new(format!(
+                    "extern function '{}' not found — is the library loaded?",
+                    decl.name
+                )));
+            }
+
+            self.global_env.define(
+                decl.name.clone(),
+                Value::ExternFn {
+                    name: decl.name.clone(),
+                    fn_ptr: ptr as usize,
+                    param_type_names,
+                    return_type_name,
+                },
+                false,
+            );
+        }
         Ok(())
     }
 
@@ -946,11 +1003,267 @@ impl<'a> Interpreter<'a> {
 
             Value::Builtin(name) => self.call_builtin(name, args, span),
 
+            Value::ExternFn {
+                name,
+                fn_ptr,
+                param_type_names,
+                return_type_name,
+            } => self.call_extern_fn(name, *fn_ptr, param_type_names, return_type_name, args, span),
+
             _ => Err(InterpError::with_span(
                 format!("cannot call value: {}", func),
                 span,
             )),
         }
+    }
+
+    // ── Extern function calls via libffi ──────────────────────────
+
+    fn call_extern_fn(
+        &self,
+        name: &SmolStr,
+        fn_ptr: usize,
+        param_type_names: &[SmolStr],
+        return_type_name: &SmolStr,
+        args: &[Value],
+        span: Span,
+    ) -> Result<Value, InterpError> {
+        use libffi::middle::{Arg, Cif, CodePtr, Type};
+
+        if args.len() != param_type_names.len() {
+            return Err(InterpError::with_span(
+                format!(
+                    "extern function '{}' expects {} arguments, got {}",
+                    name,
+                    param_type_names.len(),
+                    args.len()
+                ),
+                span,
+            ));
+        }
+
+        let code_ptr = CodePtr::from_ptr(fn_ptr as *const _);
+
+        // Map type name to libffi Type
+        fn ffi_type_for(type_name: &str) -> Type {
+            match type_name {
+                "i8" | "u8" | "Bool" => Type::u8(),
+                "i16" | "u16" => Type::i16(),
+                "i32" | "u32" => Type::i32(),
+                "i64" | "u64" => Type::i64(),
+                "f32" => Type::f32(),
+                "f64" => Type::f64(),
+                "Ptr" | "String" => Type::pointer(),
+                "Unit" => Type::void(),
+                _ => Type::i64(),
+            }
+        }
+
+        // Build CIF
+        let arg_types: Vec<Type> = param_type_names
+            .iter()
+            .map(|t| ffi_type_for(t.as_str()))
+            .collect();
+        let ret_type = ffi_type_for(return_type_name.as_str());
+        let cif = Cif::new(arg_types, ret_type);
+
+        // Prepare argument storage and build Arg references.
+        // Each value is stored in its own typed slot so the pointer stays valid.
+        let mut i32_vals: Vec<i32> = Vec::new();
+        let mut i64_vals: Vec<i64> = Vec::new();
+        let mut f32_vals: Vec<f32> = Vec::new();
+        let mut f64_vals: Vec<f64> = Vec::new();
+        let mut u8_vals: Vec<u8> = Vec::new();
+        let mut i16_vals: Vec<i16> = Vec::new();
+        let mut ptr_vals: Vec<*const std::ffi::c_void> = Vec::new();
+
+        for (val, type_name) in args.iter().zip(param_type_names.iter()) {
+            match type_name.as_str() {
+                "i8" | "u8" | "Bool" => {
+                    let v = match val {
+                        Value::Int(n) => *n as u8,
+                        Value::Bool(b) => if *b { 1u8 } else { 0u8 },
+                        _ => return Err(InterpError::with_span(
+                            format!("extern '{}': expected integer/bool for {} parameter", name, type_name),
+                            span,
+                        )),
+                    };
+                    u8_vals.push(v);
+                }
+                "i16" | "u16" => {
+                    let v = match val {
+                        Value::Int(n) => *n as i16,
+                        _ => return Err(InterpError::with_span(
+                            format!("extern '{}': expected integer for {} parameter", name, type_name),
+                            span,
+                        )),
+                    };
+                    i16_vals.push(v);
+                }
+                "i32" | "u32" => {
+                    let v = match val {
+                        Value::Int(n) => *n as i32,
+                        _ => return Err(InterpError::with_span(
+                            format!("extern '{}': expected integer for {} parameter", name, type_name),
+                            span,
+                        )),
+                    };
+                    i32_vals.push(v);
+                }
+                "i64" | "u64" => {
+                    let v = match val {
+                        Value::Int(n) => *n,
+                        _ => return Err(InterpError::with_span(
+                            format!("extern '{}': expected integer for i64 parameter", name),
+                            span,
+                        )),
+                    };
+                    i64_vals.push(v);
+                }
+                "f32" => {
+                    let v = match val {
+                        Value::Float(n) => *n as f32,
+                        Value::Int(n) => *n as f32,
+                        _ => return Err(InterpError::with_span(
+                            format!("extern '{}': expected number for f32 parameter", name),
+                            span,
+                        )),
+                    };
+                    f32_vals.push(v);
+                }
+                "f64" => {
+                    let v = match val {
+                        Value::Float(n) => *n,
+                        Value::Int(n) => *n as f64,
+                        _ => return Err(InterpError::with_span(
+                            format!("extern '{}': expected number for f64 parameter", name),
+                            span,
+                        )),
+                    };
+                    f64_vals.push(v);
+                }
+                "Ptr" => {
+                    let v = match val {
+                        Value::Int(n) => *n as *const std::ffi::c_void,
+                        _ => return Err(InterpError::with_span(
+                            format!("extern '{}': expected integer (pointer) for Ptr parameter", name),
+                            span,
+                        )),
+                    };
+                    ptr_vals.push(v);
+                }
+                "String" => {
+                    let v = match val {
+                        Value::String(s) => s.as_ptr() as *const std::ffi::c_void,
+                        Value::Int(n) => *n as *const std::ffi::c_void,
+                        _ => return Err(InterpError::with_span(
+                            format!("extern '{}': expected string for String parameter", name),
+                            span,
+                        )),
+                    };
+                    ptr_vals.push(v);
+                }
+                _ => {
+                    let v = match val {
+                        Value::Int(n) => *n,
+                        _ => return Err(InterpError::with_span(
+                            format!("extern '{}': unsupported type '{}' for parameter", name, type_name),
+                            span,
+                        )),
+                    };
+                    i64_vals.push(v);
+                }
+            }
+        }
+
+        // Second pass: build Arg references from storage (now that Vecs won't reallocate)
+        let mut ffi_args: Vec<Arg> = Vec::new();
+        let mut u8_idx = 0;
+        let mut i16_idx = 0;
+        let mut i32_idx = 0;
+        let mut i64_idx = 0;
+        let mut f32_idx = 0;
+        let mut f64_idx = 0;
+        let mut ptr_idx = 0;
+
+        for type_name in param_type_names.iter() {
+            match type_name.as_str() {
+                "i8" | "u8" | "Bool" => {
+                    ffi_args.push(Arg::new(&u8_vals[u8_idx]));
+                    u8_idx += 1;
+                }
+                "i16" | "u16" => {
+                    ffi_args.push(Arg::new(&i16_vals[i16_idx]));
+                    i16_idx += 1;
+                }
+                "i32" | "u32" => {
+                    ffi_args.push(Arg::new(&i32_vals[i32_idx]));
+                    i32_idx += 1;
+                }
+                "i64" | "u64" => {
+                    ffi_args.push(Arg::new(&i64_vals[i64_idx]));
+                    i64_idx += 1;
+                }
+                "f32" => {
+                    ffi_args.push(Arg::new(&f32_vals[f32_idx]));
+                    f32_idx += 1;
+                }
+                "f64" => {
+                    ffi_args.push(Arg::new(&f64_vals[f64_idx]));
+                    f64_idx += 1;
+                }
+                "Ptr" | "String" => {
+                    ffi_args.push(Arg::new(&ptr_vals[ptr_idx]));
+                    ptr_idx += 1;
+                }
+                _ => {
+                    ffi_args.push(Arg::new(&i64_vals[i64_idx]));
+                    i64_idx += 1;
+                }
+            }
+        }
+
+        // Call and interpret result based on return type
+        let result = match return_type_name.as_str() {
+            "i8" | "u8" | "Bool" => {
+                let r: u8 = unsafe { cif.call(code_ptr, &ffi_args) };
+                Value::Int(r as i64)
+            }
+            "i16" | "u16" => {
+                let r: i16 = unsafe { cif.call(code_ptr, &ffi_args) };
+                Value::Int(r as i64)
+            }
+            "i32" | "u32" => {
+                let r: i32 = unsafe { cif.call(code_ptr, &ffi_args) };
+                Value::Int(r as i64)
+            }
+            "i64" | "u64" => {
+                let r: i64 = unsafe { cif.call(code_ptr, &ffi_args) };
+                Value::Int(r)
+            }
+            "f32" => {
+                let r: f32 = unsafe { cif.call(code_ptr, &ffi_args) };
+                Value::Float(r as f64)
+            }
+            "f64" => {
+                let r: f64 = unsafe { cif.call(code_ptr, &ffi_args) };
+                Value::Float(r)
+            }
+            "Ptr" => {
+                let r: *const std::ffi::c_void = unsafe { cif.call(code_ptr, &ffi_args) };
+                Value::Int(r as i64)
+            }
+            "Unit" | "()" => {
+                unsafe { cif.call::<()>(code_ptr, &ffi_args) };
+                Value::Unit
+            }
+            _ => {
+                let r: i64 = unsafe { cif.call(code_ptr, &ffi_args) };
+                Value::Int(r)
+            }
+        };
+
+        Ok(result)
     }
 
     // ── Struct construction ──────────────────────────────────────
@@ -1362,6 +1675,7 @@ impl<'a> Interpreter<'a> {
                     Value::Builtin(_) => "Builtin",
                     Value::Atom(_) => "Atom",
                     Value::Channel(_) => "Channel",
+                    Value::ExternFn { .. } => "ExternFn",
                 };
                 Ok(Value::String(type_name.to_string()))
             }

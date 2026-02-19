@@ -42,6 +42,9 @@ enum Command {
         /// Output binary path (defaults to source file stem)
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Link against a C library (e.g. -l glfw3 -l GL)
+        #[arg(short = 'l', long = "link")]
+        link: Vec<String>,
     },
     /// Run a .weir file with live reload — watches for changes and hot-swaps functions
     Dev {
@@ -193,7 +196,7 @@ fn main() {
                 }
             }
         }
-        Command::Build { file, output } => {
+        Command::Build { file, output, link } => {
             let source = with_prelude(&read_file(&file));
             let expanded = expand_source(&source, &file);
 
@@ -230,7 +233,9 @@ fn main() {
             let output_path =
                 output.unwrap_or_else(|| PathBuf::from(file.file_stem().unwrap_or_default()));
 
-            match weir_codegen::build_executable(&module, &type_info, &output_path) {
+            let link_flags: Vec<String> = link.iter().map(|l| format!("-l{}", l)).collect();
+
+            match weir_codegen::build_executable(&module, &type_info, &output_path, &link_flags) {
                 Ok(()) => {}
                 Err(e) => {
                     eprintln!("{}: build error: {}", file.display(), e);

@@ -9,6 +9,8 @@ doctest = false
 [dependencies]
 weir-ast.workspace = true
 smol_str.workspace = true
+libc = "0.2"
+libffi = "4"
 
 [dev-dependencies]
 weir-parser.workspace = true

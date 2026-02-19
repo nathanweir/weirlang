@@ -454,6 +454,7 @@ pub fn build_executable(
     module: &weir_ast::Module,
     type_info: &weir_typeck::TypeCheckResult,
     output_path: &Path,
+    link_flags: &[String],
 ) -> Result<(), CodegenError> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -474,12 +475,17 @@ pub fn build_executable(
     std::fs::write(&runtime_path, AOT_RUNTIME_C)
         .map_err(|e| CodegenError::new(format!("write runtime: {}", e)))?;
 
-    let status = std::process::Command::new("cc")
+    let mut cc_cmd = std::process::Command::new("cc");
+    cc_cmd
         .arg("-o")
         .arg(output_path)
         .arg(&obj_path)
         .arg(&runtime_path)
-        .arg("-lm")
+        .arg("-lm");
+    for flag in link_flags {
+        cc_cmd.arg(flag);
+    }
+    let status = cc_cmd
         .status()
         .map_err(|e| CodegenError::new(format!("run cc: {}", e)))?;
 

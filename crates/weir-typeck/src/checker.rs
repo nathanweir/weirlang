@@ -60,6 +60,10 @@ pub(crate) struct TypeChecker<'a> {
     /// Dependency graph built during typechecking.
     pub(crate) dep_graph: DependencyGraph,
 
+    /// Names of functions declared in extern "C" blocks.
+    pub(crate) extern_fns: HashSet<SmolStr>,
+    /// Current unsafe nesting depth (0 = not inside unsafe block)
+    unsafe_depth: u32,
     /// Current arena nesting depth (0 = not inside with-arena)
     arena_depth: u32,
     task_depth: u32,
@@ -92,6 +96,8 @@ impl<'a> TypeChecker<'a> {
             current_fn_return_type: None,
             current_fn_name: None,
             dep_graph: DependencyGraph::default(),
+            extern_fns: HashSet::new(),
+            unsafe_depth: 0,
             arena_depth: 0,
             task_depth: 0,
             var_provenance: vec![HashMap::new()],
@@ -592,6 +598,7 @@ impl<'a> TypeChecker<'a> {
             "Bool" => Ty::Bool,
             "String" => Ty::Str,
             "Unit" => Ty::Unit,
+            "Ptr" => Ty::Ptr,
             _ => {
                 if self.type_defs.contains_key(name)
                     || self.struct_defs.contains_key(name)
@@ -647,6 +654,16 @@ impl<'a> TypeChecker<'a> {
             if let Item::Defn(d) = item {
                 if !self.fn_schemes.contains_key(&d.name) {
                     self.collect_defn_sig(d);
+                }
+            }
+        }
+
+        // Pass 4.5: extern "C" function signatures
+        for item in &items {
+            if let Item::ExternC(ext) = item {
+                for decl in &ext.declarations {
+                    self.collect_defn_sig(decl);
+                    self.extern_fns.insert(decl.name.clone());
                 }
             }
         }
@@ -1172,6 +1189,7 @@ impl<'a> TypeChecker<'a> {
             | Ty::Bool
             | Ty::Str
             | Ty::Unit
+            | Ty::Ptr
             | Ty::Error => TyKind::Star,
             Ty::Con(name, args) => {
                 if let Some(registered) = self.type_kinds.get(name) {
@@ -1897,7 +1915,12 @@ impl<'a> TypeChecker<'a> {
                 Ty::Map(Box::new(key_ty), Box::new(val_ty))
             }
 
-            ExprKind::Unsafe { body } => self.check_body(body),
+            ExprKind::Unsafe { body } => {
+                self.unsafe_depth += 1;
+                let result = self.check_body(body);
+                self.unsafe_depth -= 1;
+                result
+            }
 
             ExprKind::WithArena { name: _, body } => {
                 self.arena_depth += 1;
@@ -2076,6 +2099,19 @@ impl<'a> TypeChecker<'a> {
             }
         }
 
+        // Check if calling an extern C function without unsafe
+        if let ExprKind::Var(name) = &func_expr.kind {
+            if self.extern_fns.contains(name) && self.unsafe_depth == 0 {
+                self.error(
+                    format!(
+                        "calling extern function '{}' requires an unsafe block",
+                        name
+                    ),
+                    span,
+                );
+            }
+        }
+
         // Check for builtin call
         if let ExprKind::Var(name) = &func_expr.kind {
             if self.is_builtin(name) {
@@ -2133,6 +2169,7 @@ impl<'a> TypeChecker<'a> {
             // Regular function call — instantiate the scheme
             if let Some(scheme) = self.fn_schemes.get(name).cloned() {
                 self.record_call_dep(name);
+
                 let (param_tys, ret_ty, constraints) = self.instantiate(&scheme);
                 let arg_tys: Vec<Ty> = args.iter().map(|a| self.check_expr(a.value)).collect();
 

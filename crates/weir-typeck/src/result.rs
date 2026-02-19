@@ -62,6 +62,8 @@ pub struct TypeCheckResult {
     pub deps: DependencyGraph,
     /// Struct definitions with resolved field types, for codegen.
     pub struct_defs: HashMap<SmolStr, StructInfo>,
+    /// Names of functions declared in extern "C" blocks.
+    pub extern_fns: HashSet<SmolStr>,
 }
 
 /// Check if a type contains any unresolved type variables.

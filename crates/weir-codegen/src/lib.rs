@@ -59,6 +59,7 @@ pub(crate) fn ty_to_cl_with(
         Ty::I64 | Ty::U64 => Some(types::I64),
         Ty::F32 => Some(types::F32),
         Ty::F64 => Some(types::F64),
+        Ty::Ptr => Some(types::I64), // raw pointer (FFI), same size as i64
         Ty::Str => Some(types::I64), // pointer to null-terminated C string
         Ty::Vector(_) => Some(types::I64), // pointer to heap [len, elem_0, ...]
         Ty::Fn(_, _) => Some(types::I64), // pointer to heap closure object
@@ -127,6 +128,23 @@ pub fn compile_and_run(
 
     // Register runtime print helpers as in-process function pointers
     jit_helpers::register_jit_symbols(&mut builder);
+
+    // Register extern "C" symbols via dlsym
+    for (item, _) in &module.items {
+        if let Item::ExternC(ext) = item {
+            for decl in &ext.declarations {
+                let c_name = std::ffi::CString::new(decl.name.as_str()).unwrap();
+                let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr()) };
+                if ptr.is_null() {
+                    return Err(CodegenError::new(format!(
+                        "extern function '{}' not found — is the library loaded?",
+                        decl.name
+                    )));
+                }
+                builder.symbol(decl.name.as_str(), ptr as *const u8);
+            }
+        }
+    }
 
     let jit_module = JITModule::new(builder);
 
@@ -430,6 +448,42 @@ impl<'a, M: Module> Compiler<'a, M> {
             }
         }
 
+        // Declare extern "C" function signatures (imported, not compiled)
+        for (item, _span) in &self.ast_module.items {
+            if let Item::ExternC(ext) = item {
+                for decl in &ext.declarations {
+                    let (param_tys, ret_ty) = match self.resolve_fn_signature(decl) {
+                        Ok(sig) => sig,
+                        Err(_) => continue,
+                    };
+
+                    let mut sig = self.module.make_signature();
+                    sig.call_conv = CallConv::SystemV;
+                    for pty in &param_tys {
+                        if let Some(cl_ty) = self.ty_cl(pty) {
+                            sig.params.push(AbiParam::new(cl_ty));
+                        }
+                    }
+                    if let Some(cl_ty) = self.ty_cl(&ret_ty) {
+                        sig.returns.push(AbiParam::new(cl_ty));
+                    }
+
+                    let func_id = self
+                        .module
+                        .declare_function(&decl.name, Linkage::Import, &sig)
+                        .map_err(|e| {
+                            CodegenError::new(format!(
+                                "declare extern fn '{}': {}",
+                                decl.name, e
+                            ))
+                        })?;
+
+                    self.user_fns
+                        .insert(decl.name.clone(), (func_id, param_tys, ret_ty));
+                }
+            }
+        }
+
         // Declare specializations (instance methods + generic function instantiations)
         self.declare_specializations(linkage)?;
 
@@ -516,6 +570,42 @@ impl<'a, M: Module> Compiler<'a, M> {
             }
         }
 
+        // Declare extern "C" function signatures for AOT (all imported)
+        for (item, _span) in &self.ast_module.items {
+            if let Item::ExternC(ext) = item {
+                for decl in &ext.declarations {
+                    let (param_tys, ret_ty) = match self.resolve_fn_signature(decl) {
+                        Ok(sig) => sig,
+                        Err(_) => continue,
+                    };
+
+                    let mut sig = self.module.make_signature();
+                    sig.call_conv = CallConv::SystemV;
+                    for pty in &param_tys {
+                        if let Some(cl_ty) = self.ty_cl(pty) {
+                            sig.params.push(AbiParam::new(cl_ty));
+                        }
+                    }
+                    if let Some(cl_ty) = self.ty_cl(&ret_ty) {
+                        sig.returns.push(AbiParam::new(cl_ty));
+                    }
+
+                    let func_id = self
+                        .module
+                        .declare_function(&decl.name, Linkage::Import, &sig)
+                        .map_err(|e| {
+                            CodegenError::new(format!(
+                                "declare extern fn '{}': {}",
+                                decl.name, e
+                            ))
+                        })?;
+
+                    self.user_fns
+                        .insert(decl.name.clone(), (func_id, param_tys, ret_ty));
+                }
+            }
+        }
+
         // Declare specializations for AOT too
         self.declare_specializations(Linkage::Local)?;
 
@@ -570,6 +660,7 @@ impl<'a, M: Module> Compiler<'a, M> {
                 "Bool" | "bool" => Ok(Ty::Bool),
                 "String" => Ok(Ty::Str),
                 "Unit" => Ok(Ty::Unit),
+                "Ptr" => Ok(Ty::Ptr),
                 other => {
                     // Check if it's a tagged ADT type or struct
                     let name_smol = SmolStr::new(other);
@@ -1587,7 +1678,9 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                 Ok(None)
             }
 
-            ExprKind::Do { body } => self.compile_body(body, &resolved_ty),
+            ExprKind::Do { body } | ExprKind::Unsafe { body } => {
+                self.compile_body(body, &resolved_ty)
+            }
 
             ExprKind::WithArena { name: _, body } => {
                 // 1. Create arena
@@ -4496,7 +4589,7 @@ mod tests {
 
         let tmp_dir = std::env::temp_dir();
         let binary_path = tmp_dir.join("weir_test_aot");
-        build_executable(&module, &type_info, &binary_path).expect("build_executable failed");
+        build_executable(&module, &type_info, &binary_path, &[]).expect("build_executable failed");
 
         let output = std::process::Command::new(&binary_path)
             .output()
@@ -4526,7 +4619,7 @@ mod tests {
 
         let tmp_dir = std::env::temp_dir();
         let binary_path = tmp_dir.join("weir_test_aot_factorial");
-        build_executable(&module, &type_info, &binary_path).expect("build_executable failed");
+        build_executable(&module, &type_info, &binary_path, &[]).expect("build_executable failed");
         let output = std::process::Command::new(&binary_path)
             .output()
             .expect("failed to run AOT binary");
@@ -4553,7 +4646,7 @@ mod tests {
 
         let tmp_dir = std::env::temp_dir();
         let binary_path = tmp_dir.join(format!("weir_test_aot_{}", name));
-        build_executable(&module, &type_info, &binary_path).expect("build_executable failed");
+        build_executable(&module, &type_info, &binary_path, &[]).expect("build_executable failed");
         let output = std::process::Command::new(&binary_path)
             .output()
             .expect("failed to run AOT binary");
@@ -5976,7 +6069,7 @@ mod tests {
 
         let tmp_dir = std::env::temp_dir();
         let binary_path = tmp_dir.join("weir_test_aot_arena");
-        build_executable(&module, &type_info, &binary_path).expect("build_executable failed");
+        build_executable(&module, &type_info, &binary_path, &[]).expect("build_executable failed");
         let output = std::process::Command::new(&binary_path)
             .output()
             .expect("failed to run AOT binary");
@@ -6066,7 +6159,7 @@ mod tests {
 
         let tmp_dir = std::env::temp_dir();
         let binary_path = tmp_dir.join("weir_test_aot_atom");
-        build_executable(&module, &type_info, &binary_path).expect("build_executable failed");
+        build_executable(&module, &type_info, &binary_path, &[]).expect("build_executable failed");
         let output = std::process::Command::new(&binary_path)
             .output()
             .expect("failed to run AOT binary");

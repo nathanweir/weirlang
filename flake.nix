@@ -39,11 +39,14 @@
             pkgs.cargo-insta
             pkgs.nodejs
             pkgs.tree-sitter
+            pkgs.libffi
+            pkgs.pkg-config
           ];
 
           NIX_LD_LIBRARY_PATH = pkgs.lib.optionalString pkgs.stdenv.isLinux (
             pkgs.lib.makeLibraryPath [
               pkgs.stdenv.cc.cc
+              pkgs.libffi
             ]
           );
 

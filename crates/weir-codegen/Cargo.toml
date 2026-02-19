@@ -20,6 +20,7 @@ cranelift-module.workspace = true
 cranelift-native.workspace = true
 cranelift-object.workspace = true
 target-lexicon.workspace = true
+libc = "0.2"
 notify.workspace = true
 
 [dev-dependencies]

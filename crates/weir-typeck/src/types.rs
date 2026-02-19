@@ -36,6 +36,8 @@ pub enum Ty {
     Channel(Box<Ty>),
     /// Higher-kinded type application: F applied to args
     App(Box<Ty>, Vec<Ty>),
+    /// Raw pointer (for FFI). Contents are opaque to Weir.
+    Ptr,
     /// Error sentinel — prevents cascading errors
     Error,
 }
@@ -86,6 +88,7 @@ impl fmt::Display for Ty {
                 write!(f, ")")
             }
             Ty::Var(id) => write!(f, "?{}", id),
+            Ty::Ptr => write!(f, "Ptr"),
             Ty::Error => write!(f, "<error>"),
         }
     }

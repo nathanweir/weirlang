@@ -255,3 +255,63 @@ fn build_tco() {
     assert!(stdout.contains("500000500000"), "sum-to 1000000");
     assert!(stdout.contains("12586269025"), "fib-iter 50");
 }
+
+// ── CFFI / extern "C" ─────────────────────────────────────
+
+#[test]
+fn interp_cffi() {
+    weir()
+        .args(["interp", &fixture_path("cffi")])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("42"))
+        .stdout(predicate::str::contains("7"));
+}
+
+#[test]
+fn run_cffi() {
+    weir()
+        .args(["run", &fixture_path("cffi")])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("42"))
+        .stdout(predicate::str::contains("7"));
+}
+
+#[test]
+fn build_cffi() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("cffi_bin");
+    weir()
+        .args([
+            "build",
+            &fixture_path("cffi"),
+            "-o",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let out = std::process::Command::new(&output)
+        .output()
+        .expect("failed to run compiled CFFI binary");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("42"), "abs(-42) = 42");
+    assert!(stdout.contains("7"), "abs(7) = 7");
+}
+
+#[test]
+fn check_cffi_unsafe_required() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("bad_cffi.weir");
+    fs::write(
+        &file,
+        r#"(extern "C" (defn abs ((n : i32)) : i32))
+(defn main () (println (abs -42)))"#,
+    )
+    .unwrap();
+    weir()
+        .args(["check", file.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unsafe"));
+}

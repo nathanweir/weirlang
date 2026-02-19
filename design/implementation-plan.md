@@ -1,4 +1,4 @@
-# Implementation Plan: Struct Codegen & Tail-Call Optimization
+# Implementation Plan: Struct Codegen, TCO & CFFI
 
 **Status:** Active
 **Prerequisite:** Phases 0-10 complete (see `archive/implementation-plan-phases-0-10.md`)
@@ -204,7 +204,52 @@ Test that previously stack-overflowing programs now work:
 
 ---
 
-## Phase 13: General tail calls (future)
+## Phase 13: CFFI — extern "C" Support ✅
+
+**Completed 2026-02-19.** 623 tests passing (was 616). `extern "C"` declarations now work end-to-end across the type checker, JIT codegen, AOT codegen, and interpreter. Calling extern functions requires an `unsafe` block.
+
+Without working CFFI, Weir cannot call external C libraries (OpenGL, SDL, GLFW, etc.) and is limited to only the built-in runtime functions. CFFI is essential for the language to be useful for real programs.
+
+### Current state
+
+- [x] `Ty::Ptr` raw pointer type for FFI
+- [x] Type checker collects extern "C" signatures, enforces `unsafe` requirement
+- [x] Codegen: extern functions declared with `Linkage::Import`, JIT resolves via `dlsym`
+- [x] AOT: `--link` / `-l` flag passes library link flags to `cc`
+- [x] Interpreter: extern calls via `libffi` + `dlsym`
+- [x] `ExprKind::Unsafe` compiles as passthrough (safety enforced at type-check time)
+- [x] 4 CLI tests (interp, JIT, AOT, unsafe enforcement) + 3 typeck unit tests
+
+### Key design decisions
+
+- **`Ty::Ptr`** is represented as `i64` in codegen (pointer-sized), not GC-managed
+- **`unsafe` enforcement** happens at the very start of `check_call`, before builtin resolution — this ensures extern functions that shadow builtins (e.g. `abs`) still require `unsafe`
+- **JIT symbol resolution** uses `dlsym(RTLD_DEFAULT, ...)` to find symbols in already-loaded shared libraries
+- **Interpreter** uses the `libffi` crate's `Cif` API for dynamic C function invocation
+- **AOT** relies on the system linker (`cc`) with `-l` flags to resolve extern symbols
+
+### Files changed
+
+| File | Changes |
+|------|---------|
+| `crates/weir-typeck/src/types.rs` | `Ty::Ptr` variant + Display |
+| `crates/weir-typeck/src/checker.rs` | Resolve `Ptr` type, collect extern C sigs, `extern_fns` set, unsafe enforcement, `ExprKind::Unsafe` depth tracking |
+| `crates/weir-typeck/src/result.rs` | `extern_fns: HashSet<SmolStr>` in `TypeCheckResult` |
+| `crates/weir-typeck/src/lib.rs` | Populate `extern_fns` from checker |
+| `crates/weir-typeck/src/tests.rs` | 3 extern C unit tests |
+| `crates/weir-codegen/src/lib.rs` | `Ty::Ptr` handling, extern function declaration (`Linkage::Import`), JIT dlsym, `ExprKind::Unsafe` passthrough |
+| `crates/weir-codegen/src/aot.rs` | `link_flags` parameter for `build_executable` |
+| `crates/weir-codegen/Cargo.toml` | `libc` dependency |
+| `crates/weir-interp/src/lib.rs` | `Value::ExternFn`, `process_extern_c`, `call_extern_fn` via libffi |
+| `crates/weir-interp/Cargo.toml` | `libffi` and `libc` dependencies |
+| `crates/weir-cli/src/main.rs` | `--link` / `-l` flag on build command |
+| `crates/weir-cli/tests/cli.rs` | 4 CFFI CLI tests |
+| `tests/fixtures/cffi.weir` | Test fixture calling C `abs()` |
+| `flake.nix` | `libffi` + `pkg-config` in buildInputs |
+
+---
+
+## Phase 14: General tail calls (future)
 
 Not in immediate scope, but documenting the path forward:
 
@@ -222,7 +267,7 @@ After each phase, all existing tests must continue to pass:
 nix develop --command cargo test --workspace
 ```
 
-Current baseline: 616 tests passing.
+Current baseline: 623 tests passing.
 
 ### Phase 11 acceptance criteria
 - [x] `(defstruct Vec3 (x : f64) (y : f64) (z : f64))` compiles and runs via JIT and AOT
@@ -238,16 +283,27 @@ Current baseline: 616 tests passing.
 - [x] Higher resolution renders (320x180, 640x360) succeed
 - [x] Non-tail recursion still works correctly (doesn't get incorrectly optimized)
 
+### Phase 13 acceptance criteria
+- [x] `extern "C"` declarations type-check and register function signatures
+- [x] Calling extern functions without `unsafe` block produces type error
+- [x] `abs(-42)` works via interpreter (libffi), JIT (dlsym), and AOT (linker)
+- [x] `--link` / `-l` flag passes library names to AOT linker
+- [x] `Ty::Ptr` resolves in type checker and maps to `i64` in codegen
+- [x] `ExprKind::Unsafe` compiles correctly in codegen (passthrough to body)
+
 ---
 
 ## File change summary
 
-| File | Phase 11 | Phase 12 |
-|------|----------|----------|
-| `crates/weir-typeck/src/result.rs` | Add `StructInfo`, populate `struct_defs` | — |
-| `crates/weir-typeck/src/checker.rs` | Export struct info in `finish()` | — |
-| `crates/weir-codegen/src/lib.rs` | Struct type recognition, construction, field access, destructure | Tail-position analysis, loop-header codegen |
-| `crates/weir-codegen/src/aot.rs` | Verify struct path works | — |
-| `crates/weir-interp/src/lib.rs` | — | Trampoline for self-tail-calls |
-| `crates/weir-lsp/src/completion.rs` | — | — |
-| `design/implementation-plan.md` | This document | This document |
+| File | Phase 11 | Phase 12 | Phase 13 |
+|------|----------|----------|----------|
+| `crates/weir-typeck/src/types.rs` | — | — | `Ty::Ptr` variant |
+| `crates/weir-typeck/src/result.rs` | Add `StructInfo`, populate `struct_defs` | — | `extern_fns` field |
+| `crates/weir-typeck/src/checker.rs` | Export struct info in `finish()` | — | Extern C collection, unsafe enforcement |
+| `crates/weir-codegen/src/lib.rs` | Struct type recognition, construction, field access, destructure | Tail-position analysis, loop-header codegen | Extern decls, JIT dlsym, Unsafe passthrough |
+| `crates/weir-codegen/src/aot.rs` | Verify struct path works | — | Link flags parameter |
+| `crates/weir-interp/src/lib.rs` | — | Trampoline for self-tail-calls | ExternFn value, libffi calls |
+| `crates/weir-cli/src/main.rs` | — | — | `--link` / `-l` flag |
+| `tests/fixtures/cffi.weir` | — | — | New fixture |
+| `flake.nix` | — | — | libffi + pkg-config |
+| `design/implementation-plan.md` | This document | This document | This document |

@@ -154,5 +154,6 @@ pub fn check_with_externals(module: &Module, externals: &HashSet<SmolStr>) -> Ty
         specializations,
         deps: checker.dep_graph,
         struct_defs,
+        extern_fns: checker.extern_fns,
     }
 }

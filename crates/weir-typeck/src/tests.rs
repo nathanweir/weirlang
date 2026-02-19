@@ -1347,3 +1347,40 @@ use super::*;
         );
         assert!(msg.contains("Shareable"), "expected Shareable error, got: {}", msg);
     }
+
+    // ── Extern C / CFFI ──────────────────────────────────────────
+
+    #[test]
+    fn extern_c_with_unsafe() {
+        check_ok(
+            "(extern \"C\"
+               (defn abs ((n : i32)) : i32))
+             (defn main () : i32
+               (unsafe (abs -42)))",
+        );
+    }
+
+    #[test]
+    fn extern_c_without_unsafe_errors() {
+        let msg = check_err(
+            "(extern \"C\"
+               (defn abs ((n : i32)) : i32))
+             (defn main () : i32
+               (abs -42))",
+        );
+        assert!(
+            msg.contains("unsafe"),
+            "expected unsafe error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn extern_c_ptr_type() {
+        check_ok(
+            "(extern \"C\"
+               (defn atoi ((s : Ptr)) : i32))
+             (defn main ((p : Ptr)) : i32
+               (unsafe (atoi p)))",
+        );
+    }
