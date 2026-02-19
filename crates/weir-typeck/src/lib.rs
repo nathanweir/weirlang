@@ -733,18 +733,25 @@ impl<'a> TypeChecker<'a> {
     /// Instantiate a function scheme with fresh type variables.
     /// Returns (param_types, return_type, instantiated_constraints).
     fn instantiate(&mut self, scheme: &FnScheme) -> (Vec<Ty>, Ty, Vec<ClassConstraint>) {
+        // Resolve scheme types through the current substitution first.
+        // This is necessary for functions with unannotated params/returns, where
+        // the scheme stores raw Var(N) that gets resolved during check_defn.
+        // Without this, the fresh vars created below would lose the structural
+        // relationships discovered during body type-checking.
+        let resolved_params: Vec<Ty> = scheme.param_types.iter().map(|t| self.apply(t)).collect();
+        let resolved_ret = self.apply(&scheme.return_type);
+
         let mapping: HashMap<TyVarId, Ty> = scheme
             .quantified
             .iter()
             .map(|&v| (v, self.fresh_var()))
             .collect();
 
-        let params = scheme
-            .param_types
+        let params = resolved_params
             .iter()
             .map(|t| self.subst_vars(t, &mapping))
             .collect();
-        let ret = self.subst_vars(&scheme.return_type, &mapping);
+        let ret = self.subst_vars(&resolved_ret, &mapping);
         let constraints = scheme
             .constraints
             .iter()
@@ -753,7 +760,10 @@ impl<'a> TypeChecker<'a> {
                 type_args: c
                     .type_args
                     .iter()
-                    .map(|t| self.subst_vars(t, &mapping))
+                    .map(|t| {
+                        let resolved = self.apply(t);
+                        self.subst_vars(&resolved, &mapping)
+                    })
                     .collect(),
             })
             .collect();
@@ -1039,7 +1049,12 @@ impl<'a> TypeChecker<'a> {
                 if let Some(type_id) = p.type_ann {
                     self.resolve_type_expr(type_id)
                 } else {
-                    self.fresh_var()
+                    let ty = self.fresh_var();
+                    // Unannotated params are implicitly generic — quantify them
+                    if let Ty::Var(id) = &ty {
+                        quantified.push(*id);
+                    }
+                    ty
                 }
             })
             .collect();
@@ -1047,10 +1062,14 @@ impl<'a> TypeChecker<'a> {
         let return_type = if let Some(ret_id) = d.return_type {
             self.resolve_type_expr(ret_id)
         } else {
-            self.fresh_var()
+            let ty = self.fresh_var();
+            if let Ty::Var(id) = &ty {
+                quantified.push(*id);
+            }
+            ty
         };
 
-        // Any type variables created during resolution are quantified
+        // Any type variables created during resolution of explicit annotations are quantified
         for ty in self.type_param_scope.values() {
             if let Ty::Var(id) = ty {
                 quantified.push(*id);

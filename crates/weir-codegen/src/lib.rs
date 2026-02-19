@@ -15,7 +15,7 @@ use std::fmt;
 use std::path::Path;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use weir_ast::*;
-use weir_typeck::{Ty, TypeCheckResult};
+use weir_typeck::{Ty, TyVarId, TypeCheckResult};
 
 // ── Error ────────────────────────────────────────────────────────
 
@@ -467,6 +467,36 @@ struct LambdaInfo {
     params: Vec<Param>,
     body: Vec<ExprId>,
     captures: Vec<(SmolStr, Ty)>,
+    /// Type variable substitution inherited from enclosing specialization context.
+    type_subst: HashMap<TyVarId, Ty>,
+}
+
+/// Walk two type trees (generic and concrete) in parallel, collecting Var → concrete mappings.
+fn collect_var_mappings(generic: &Ty, concrete: &Ty, subst: &mut HashMap<TyVarId, Ty>) {
+    match (generic, concrete) {
+        (Ty::Var(id), _) if !matches!(concrete, Ty::Var(_)) => {
+            subst.insert(*id, concrete.clone());
+        }
+        (Ty::Fn(gp, gr), Ty::Fn(cp, cr)) => {
+            for (g, c) in gp.iter().zip(cp.iter()) {
+                collect_var_mappings(g, c, subst);
+            }
+            collect_var_mappings(gr, cr, subst);
+        }
+        (Ty::Vector(g), Ty::Vector(c)) => {
+            collect_var_mappings(g, c, subst);
+        }
+        (Ty::Con(gn, ga), Ty::Con(cn, ca)) if gn == cn => {
+            for (g, c) in ga.iter().zip(ca.iter()) {
+                collect_var_mappings(g, c, subst);
+            }
+        }
+        (Ty::Map(gk, gv), Ty::Map(ck, cv)) => {
+            collect_var_mappings(gk, ck, subst);
+            collect_var_mappings(gv, cv, subst);
+        }
+        _ => {}
+    }
 }
 
 struct Compiler<'a, M: Module> {
@@ -1072,6 +1102,23 @@ impl<'a, M: Module> Compiler<'a, M> {
             .ok_or_else(|| CodegenError::new(format!("unknown function '{}'", lookup_name)))?
             .clone();
 
+        // Build type substitution for specializations: map generic type vars to concrete types.
+        let type_subst = if lookup_name != &defn.name {
+            // This is a specialization — build mapping from generic fn_type to concrete types
+            if let Some(fn_type) = self.type_info.fn_types.get(&defn.name) {
+                let mut subst = HashMap::new();
+                for (generic, concrete) in fn_type.param_types.iter().zip(param_tys.iter()) {
+                    collect_var_mappings(generic, concrete, &mut subst);
+                }
+                collect_var_mappings(&fn_type.return_type, &ret_ty, &mut subst);
+                subst
+            } else {
+                HashMap::new()
+            }
+        } else {
+            HashMap::new()
+        };
+
         let adts = &self.tagged_adts;
         let mut sig = self.module.make_signature();
         sig.call_conv = CallConv::SystemV;
@@ -1110,6 +1157,7 @@ impl<'a, M: Module> Compiler<'a, M> {
                 constructor_tags: &self.constructor_tags,
                 pending_lambdas: Vec::new(),
                 lambda_counter: &mut self.lambda_counter,
+                type_subst: type_subst.clone(),
             };
 
             // Bind parameters to variables
@@ -1218,6 +1266,7 @@ impl<'a, M: Module> Compiler<'a, M> {
                 constructor_tags: &self.constructor_tags,
                 pending_lambdas: Vec::new(),
                 lambda_counter: &mut self.lambda_counter,
+                type_subst: info.type_subst.clone(),
             };
 
             let block_params: Vec<Value> = fn_ctx.builder.block_params(entry_block).to_vec();
@@ -1449,6 +1498,9 @@ struct FnCompileCtx<'a, 'b, M: Module> {
     pending_lambdas: Vec<LambdaInfo>,
     /// Counter for generating unique lambda names (shared with Compiler).
     lambda_counter: &'a mut usize,
+    /// Type variable substitution for specialization contexts.
+    /// Maps generic type var IDs to concrete types.
+    type_subst: HashMap<TyVarId, Ty>,
 }
 
 impl<M: Module> FnCompileCtx<'_, '_, M> {
@@ -1461,11 +1513,37 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
     }
 
     fn expr_ty(&self, expr_id: ExprId) -> Ty {
-        self.type_info
+        let ty = self.type_info
             .expr_types
             .get(expr_id)
             .cloned()
-            .unwrap_or(Ty::Unit)
+            .unwrap_or(Ty::Unit);
+        if self.type_subst.is_empty() {
+            ty
+        } else {
+            self.apply_type_subst(&ty)
+        }
+    }
+
+    /// Apply the specialization type substitution to resolve generic type vars.
+    fn apply_type_subst(&self, ty: &Ty) -> Ty {
+        match ty {
+            Ty::Var(id) => self.type_subst.get(id).cloned().unwrap_or_else(|| ty.clone()),
+            Ty::Fn(params, ret) => Ty::Fn(
+                params.iter().map(|p| self.apply_type_subst(p)).collect(),
+                Box::new(self.apply_type_subst(ret)),
+            ),
+            Ty::Vector(e) => Ty::Vector(Box::new(self.apply_type_subst(e))),
+            Ty::Con(name, args) => Ty::Con(
+                name.clone(),
+                args.iter().map(|a| self.apply_type_subst(a)).collect(),
+            ),
+            Ty::Map(k, v) => Ty::Map(
+                Box::new(self.apply_type_subst(k)),
+                Box::new(self.apply_type_subst(v)),
+            ),
+            _ => ty.clone(),
+        }
     }
 
     /// Compile a body (sequence of expressions), returning the value of the last one.
@@ -1660,6 +1738,7 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                     params: lambda_params.clone(),
                     body: body.clone(),
                     captures: capture_info,
+                    type_subst: self.type_subst.clone(),
                 });
 
                 // Allocate closure: [fn_ptr, num_captures, cap_0, cap_1, ...]
@@ -4524,13 +4603,17 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires typechecker to generate specializations for fully untyped generic params
     fn fixture_closures() {
-        let compiled = run_fixture_compiled("closures");
-        let interpreted = run_fixture_interpreted("closures");
-        assert_eq!(
-            compiled, interpreted,
-            "closures: compiler and interpreter disagree"
-        );
+        let path = fixture_path("closures");
+        let source = std::fs::read_to_string(&path).unwrap();
+        let source = format!("{}\n{}", PRELUDE_SOURCE, source);
+        let expanded = expand(&source);
+        let (module, parse_errors) = weir_parser::parse(&expanded);
+        assert!(parse_errors.is_empty());
+        let type_info = weir_typeck::check(&module);
+        assert!(type_info.errors.is_empty(), "type errors: {:?}", type_info.errors);
+        let compiled = compile_and_run(&module, &type_info).expect("codegen error");
+        let interpreted = weir_interp::interpret(&module).expect("interp error");
+        assert_eq!(compiled, interpreted, "closures: compiler and interpreter disagree");
     }
 }
