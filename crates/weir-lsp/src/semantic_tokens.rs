@@ -350,8 +350,19 @@ impl<'a> TokenCollector<'a> {
             ExprKind::Ann { expr: inner, .. } => {
                 self.collect_expr(*inner);
             }
-            ExprKind::Try(inner) => {
+            ExprKind::Try(inner) | ExprKind::Spawn(inner) => {
                 self.collect_expr(*inner);
+            }
+            ExprKind::SwapBang { atom, func } => {
+                self.push_keyword_at_form_start(expr.span, "swap!");
+                self.collect_expr(*atom);
+                self.collect_expr(*func);
+            }
+            ExprKind::WithTasks { body } => {
+                self.push_keyword_at_form_start(expr.span, "with-tasks");
+                for &e in body {
+                    self.collect_expr(e);
+                }
             }
             ExprKind::VectorLit(elems) => {
                 for &e in elems {

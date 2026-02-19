@@ -216,7 +216,7 @@ fn collect_expr_hints(
             }
         }
 
-        ExprKind::Do { body } | ExprKind::Unsafe { body } | ExprKind::WithArena { body, .. } => {
+        ExprKind::Do { body } | ExprKind::Unsafe { body } | ExprKind::WithArena { body, .. } | ExprKind::WithTasks { body } => {
             for &b in body {
                 collect_expr_hints(b, module, type_result, line_index, range, hints);
             }
@@ -238,8 +238,13 @@ fn collect_expr_hints(
             collect_expr_hints(*expr, module, type_result, line_index, range, hints);
         }
 
-        ExprKind::Try(inner) => {
+        ExprKind::Try(inner) | ExprKind::Spawn(inner) => {
             collect_expr_hints(*inner, module, type_result, line_index, range, hints);
+        }
+
+        ExprKind::SwapBang { atom, func } => {
+            collect_expr_hints(*atom, module, type_result, line_index, range, hints);
+            collect_expr_hints(*func, module, type_result, line_index, range, hints);
         }
 
         ExprKind::VectorLit(elems) => {

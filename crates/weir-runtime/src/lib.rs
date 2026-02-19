@@ -465,6 +465,133 @@ pub extern "C" fn weir_gc_unsuppress() {
     });
 }
 
+// ── Atomic operations ───────────────────────────────────────────
+
+/// Create an atom: heap-allocated AtomicI64 (not GC-managed).
+#[unsafe(no_mangle)]
+pub extern "C" fn weir_atom_create(initial: i64) -> i64 {
+    use std::sync::atomic::AtomicI64;
+    let atom = Box::new(AtomicI64::new(initial));
+    Box::into_raw(atom) as i64
+}
+
+/// Dereference an atom: atomic load with Acquire ordering.
+#[unsafe(no_mangle)]
+pub extern "C" fn weir_atom_deref(atom_ptr: i64) -> i64 {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    unsafe { &*(atom_ptr as *const AtomicI64) }.load(Ordering::Acquire)
+}
+
+/// Compare-and-swap on an atom. Returns the actual old value.
+/// If actual == expected, the swap succeeded.
+#[unsafe(no_mangle)]
+pub extern "C" fn weir_atom_cas(atom_ptr: i64, expected: i64, new: i64) -> i64 {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    let atom = unsafe { &*(atom_ptr as *const AtomicI64) };
+    match atom.compare_exchange(expected, new, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(old) => old,
+        Err(actual) => actual,
+    }
+}
+
+// ── Channel operations ──────────────────────────────────────────
+
+/// Create an mpsc channel. Returns a boxed pair (sender_ptr, receiver_ptr) as i64.
+#[unsafe(no_mangle)]
+pub extern "C" fn weir_channel_create() -> i64 {
+    let (tx, rx) = std::sync::mpsc::channel::<i64>();
+    let pair: Box<(std::sync::mpsc::Sender<i64>, std::sync::mpsc::Receiver<i64>)> =
+        Box::new((tx, rx));
+    Box::into_raw(pair) as i64
+}
+
+/// Send a value on a channel.
+#[unsafe(no_mangle)]
+pub extern "C" fn weir_channel_send(ch_ptr: i64, val: i64) {
+    let pair = unsafe {
+        &*(ch_ptr as *const (std::sync::mpsc::Sender<i64>, std::sync::mpsc::Receiver<i64>))
+    };
+    let _ = pair.0.send(val);
+}
+
+/// Receive a value from a channel (blocking).
+#[unsafe(no_mangle)]
+pub extern "C" fn weir_channel_recv(ch_ptr: i64) -> i64 {
+    let pair = unsafe {
+        &*(ch_ptr as *const (std::sync::mpsc::Sender<i64>, std::sync::mpsc::Receiver<i64>))
+    };
+    pair.1.recv().unwrap_or(0)
+}
+
+// ── Thread operations ───────────────────────────────────────────
+
+/// Spawn a thread that calls a zero-arg function pointer.
+/// Returns a boxed JoinHandle as i64.
+#[unsafe(no_mangle)]
+pub extern "C" fn weir_thread_spawn(fn_ptr: i64) -> i64 {
+    let func: extern "C" fn() -> i64 = unsafe { std::mem::transmute(fn_ptr) };
+    let handle = std::thread::spawn(move || {
+        func();
+    });
+    Box::into_raw(Box::new(handle)) as i64
+}
+
+/// Join a thread, blocking until it completes.
+#[unsafe(no_mangle)]
+pub extern "C" fn weir_thread_join(handle_ptr: i64) -> i64 {
+    let handle = unsafe { Box::from_raw(handle_ptr as *mut std::thread::JoinHandle<()>) };
+    match handle.join() {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+// ── Parallel iteration (sequential for now) ─────────────────────
+
+/// par-map: apply a closure to each element of a vector, returning a new vector.
+/// closure_ptr: pointer to heap closure (slot 0 = fn_ptr)
+/// vec_ptr: pointer to heap vector [len, elem0, elem1, ...]
+/// result_shape_ptr: shape descriptor for the result vector
+/// Returns: pointer to new vector
+#[unsafe(no_mangle)]
+pub extern "C" fn weir_par_map(closure_ptr: i64, vec_ptr: i64, result_shape_ptr: i64) -> i64 {
+    let vec_data = vec_ptr as *const i64;
+    let len = unsafe { *vec_data } as usize;
+
+    // Read fn_ptr from closure slot 0
+    let fn_ptr_raw = unsafe { *(closure_ptr as *const i64) };
+    let func: extern "C" fn(i64, i64) -> i64 = unsafe { std::mem::transmute(fn_ptr_raw) };
+
+    // Allocate result vector
+    let result_ptr = weir_gc_vec_alloc(len as i64, result_shape_ptr as *const ShapeDesc);
+    let result_data = result_ptr as *mut i64;
+
+    for i in 0..len {
+        let elem = unsafe { *vec_data.add(1 + i) };
+        let mapped = func(closure_ptr, elem);
+        unsafe { *result_data.add(1 + i) = mapped };
+    }
+
+    result_ptr
+}
+
+/// par-for-each: apply a closure to each element of a vector for side effects.
+/// closure_ptr: pointer to heap closure (slot 0 = fn_ptr)
+/// vec_ptr: pointer to heap vector [len, elem0, elem1, ...]
+#[unsafe(no_mangle)]
+pub extern "C" fn weir_par_for_each(closure_ptr: i64, vec_ptr: i64) {
+    let vec_data = vec_ptr as *const i64;
+    let len = unsafe { *vec_data } as usize;
+
+    let fn_ptr_raw = unsafe { *(closure_ptr as *const i64) };
+    let func: extern "C" fn(i64, i64) -> i64 = unsafe { std::mem::transmute(fn_ptr_raw) };
+
+    for i in 0..len {
+        let elem = unsafe { *vec_data.add(1 + i) };
+        func(closure_ptr, elem);
+    }
+}
+
 // ── Reset (for testing) ─────────────────────────────────────────
 
 /// Reset the GC heap (free everything). Used for test isolation.

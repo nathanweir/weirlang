@@ -505,6 +505,7 @@ struct TypeChecker<'a> {
 
     /// Current arena nesting depth (0 = not inside with-arena)
     arena_depth: u32,
+    task_depth: u32,
     /// Per-variable arena provenance depth (0 = GC/stack, >0 = arena), scope-aware
     var_provenance: Vec<HashMap<SmolStr, u32>>,
     /// Per-expression arena provenance depth
@@ -535,6 +536,7 @@ impl<'a> TypeChecker<'a> {
             current_fn_name: None,
             dep_graph: DependencyGraph::default(),
             arena_depth: 0,
+            task_depth: 0,
             var_provenance: vec![HashMap::new()],
             expr_provenance: ArenaMap::default(),
         }
@@ -1073,6 +1075,9 @@ impl<'a> TypeChecker<'a> {
                 self.collect_instance(d);
             }
         }
+
+        // Pass 6: register built-in Shareable marker typeclass + instances
+        self.register_shareable_typeclass();
     }
 
     fn collect_deftype(&mut self, d: &Deftype) {
@@ -1728,6 +1733,52 @@ impl<'a> TypeChecker<'a> {
             .insert(SmolStr::new("Vector"), TyKind::from_param_count(1));
         self.type_kinds
             .insert(SmolStr::new("Map"), TyKind::from_param_count(2));
+        self.type_kinds
+            .insert(SmolStr::new("Atom"), TyKind::from_param_count(1));
+        self.type_kinds
+            .insert(SmolStr::new("Channel"), TyKind::from_param_count(1));
+    }
+
+    fn register_shareable_typeclass(&mut self) {
+        // Shareable is a built-in marker typeclass (no methods).
+        // Types that are Shareable can be shared across threads.
+        self.class_defs.insert(
+            SmolStr::new("Shareable"),
+            ClassDef {
+                name: SmolStr::new("Shareable"),
+                type_params: vec![SmolStr::new("a")],
+                type_param_kinds: vec![TyKind::from_param_count(0)],
+                methods: vec![],
+            },
+        );
+
+        // Auto-register instances for primitive types
+        let shareable_primitives: Vec<Ty> = vec![
+            Ty::I8, Ty::I16, Ty::I32, Ty::I64,
+            Ty::U8, Ty::U16, Ty::U32, Ty::U64,
+            Ty::F32, Ty::F64,
+            Ty::Bool, Ty::Unit, Ty::Str,
+        ];
+        for ty in shareable_primitives {
+            self.instances.push(InstanceEntry {
+                class_name: SmolStr::new("Shareable"),
+                type_args: vec![ty],
+                constraints: vec![],
+                methods: HashMap::new(),
+            });
+        }
+
+        // (Atom T) is Shareable if T is Shareable
+        let atom_var = self.fresh_var();
+        self.instances.push(InstanceEntry {
+            class_name: SmolStr::new("Shareable"),
+            type_args: vec![Ty::Con(SmolStr::new("Atom"), vec![atom_var.clone()])],
+            constraints: vec![ClassConstraint {
+                class_name: SmolStr::new("Shareable"),
+                type_args: vec![atom_var],
+            }],
+            methods: HashMap::new(),
+        });
     }
 
     // ── Second pass: check items ─────────────────────────────────
@@ -2356,6 +2407,47 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
             }
+
+            ExprKind::SwapBang { atom, func } => {
+                let atom_ty = self.check_expr(*atom);
+                let func_ty = self.check_expr(*func);
+
+                // atom must be (Atom T)
+                let inner_ty = self.fresh_var();
+                let expected_atom = Ty::Con(SmolStr::new("Atom"), vec![inner_ty.clone()]);
+                self.unify(&atom_ty, &expected_atom, span);
+
+                // func must be (Fn [T] T)
+                let expected_fn = Ty::Fn(vec![inner_ty.clone()], Box::new(inner_ty.clone()));
+                self.unify(&func_ty, &expected_fn, span);
+
+                // T must be Shareable (atoms are shared across threads)
+                self.deferred_constraints.push((
+                    ClassConstraint {
+                        class_name: SmolStr::new("Shareable"),
+                        type_args: vec![inner_ty.clone()],
+                    },
+                    expr_id,
+                    span,
+                ));
+
+                inner_ty
+            }
+
+            ExprKind::WithTasks { body } => {
+                self.task_depth += 1;
+                let body_ty = self.check_body(body);
+                self.task_depth -= 1;
+                body_ty
+            }
+
+            ExprKind::Spawn(inner) => {
+                if self.task_depth == 0 {
+                    self.error("spawn must be inside a with-tasks block", span);
+                }
+                let _inner_ty = self.check_expr(*inner);
+                Ty::Unit
+            }
         }
     }
 
@@ -2857,6 +2949,13 @@ impl<'a> TypeChecker<'a> {
                 | "nth"
                 | "append"
                 | "type-of"
+                | "atom"
+                | "deref"
+                | "channel"
+                | "send"
+                | "recv"
+                | "par-map"
+                | "par-for-each"
         )
     }
 
@@ -2971,6 +3070,77 @@ impl<'a> TypeChecker<'a> {
                     self.error("type-of requires 1 argument", span);
                 }
                 Ty::Str
+            }
+            "atom" => {
+                if arg_tys.len() != 1 {
+                    self.error("atom requires exactly 1 argument", span);
+                    return Ty::Error;
+                }
+                Ty::Con(SmolStr::new("Atom"), vec![arg_tys[0].clone()])
+            }
+            "deref" => {
+                if arg_tys.len() != 1 {
+                    self.error("deref requires exactly 1 argument", span);
+                    return Ty::Error;
+                }
+                let inner = self.fresh_var();
+                let atom_ty = Ty::Con(SmolStr::new("Atom"), vec![inner.clone()]);
+                self.unify(&arg_tys[0], &atom_ty, span);
+                inner
+            }
+            "channel" => {
+                if !arg_tys.is_empty() {
+                    self.error("channel takes no arguments", span);
+                    return Ty::Error;
+                }
+                let elem = self.fresh_var();
+                Ty::Con(SmolStr::new("Channel"), vec![elem])
+            }
+            "send" => {
+                if arg_tys.len() != 2 {
+                    self.error("send requires exactly 2 arguments (channel, value)", span);
+                    return Ty::Error;
+                }
+                let elem = self.fresh_var();
+                let ch_ty = Ty::Con(SmolStr::new("Channel"), vec![elem.clone()]);
+                self.unify(&arg_tys[0], &ch_ty, span);
+                self.unify(&arg_tys[1], &elem, span);
+                Ty::Unit
+            }
+            "recv" => {
+                if arg_tys.len() != 1 {
+                    self.error("recv requires exactly 1 argument", span);
+                    return Ty::Error;
+                }
+                let elem = self.fresh_var();
+                let ch_ty = Ty::Con(SmolStr::new("Channel"), vec![elem.clone()]);
+                self.unify(&arg_tys[0], &ch_ty, span);
+                elem
+            }
+            "par-map" => {
+                if arg_tys.len() != 2 {
+                    self.error("par-map requires exactly 2 arguments (func, vector)", span);
+                    return Ty::Error;
+                }
+                let t = self.fresh_var();
+                let u = self.fresh_var();
+                let fn_ty = Ty::Fn(vec![t.clone()], Box::new(u.clone()));
+                self.unify(&arg_tys[0], &fn_ty, span);
+                let vec_t = Ty::Vector(Box::new(t));
+                self.unify(&arg_tys[1], &vec_t, span);
+                Ty::Vector(Box::new(u))
+            }
+            "par-for-each" => {
+                if arg_tys.len() != 2 {
+                    self.error("par-for-each requires exactly 2 arguments (func, vector)", span);
+                    return Ty::Error;
+                }
+                let t = self.fresh_var();
+                let fn_ty = Ty::Fn(vec![t.clone()], Box::new(Ty::Unit));
+                self.unify(&arg_tys[0], &fn_ty, span);
+                let vec_t = Ty::Vector(Box::new(t));
+                self.unify(&arg_tys[1], &vec_t, span);
+                Ty::Unit
             }
             _ => {
                 self.error(format!("unknown builtin '{}'", name), span);
@@ -4088,5 +4258,213 @@ mod tests {
         let deps = &result.deps;
         assert!(deps.type_deps.get("unwrap").unwrap().contains("Option"));
         assert!(deps.type_users.get("Option").unwrap().contains("unwrap"));
+    }
+
+    // ── Atom type checking ──────────────────────────────────────────
+
+    #[test]
+    fn atom_create_and_deref() {
+        check_ok(
+            "(defn main () : Unit
+               (let ((a (atom 42)))
+                 (println (deref a))))",
+        );
+    }
+
+    #[test]
+    fn atom_typed_annotation() {
+        // Test that atom type propagates correctly through a typed helper
+        check_ok(
+            "(defn make-atom ((x : i64)) : (Atom i64) (atom x))
+             (defn main () : Unit
+               (let ((a (make-atom 42)))
+                 (println (deref a))))",
+        );
+    }
+
+    #[test]
+    fn atom_swap_bang_basic() {
+        check_ok(
+            "(defn inc ((x : i64)) : i64 (+ x 1))
+             (defn main () : Unit
+               (let ((a (atom 0)))
+                 (swap! a inc)
+                 (println (deref a))))",
+        );
+    }
+
+    #[test]
+    fn atom_swap_bang_with_lambda() {
+        check_ok(
+            "(defn main () : Unit
+               (let ((a (atom 10)))
+                 (swap! a (fn ((x : i64)) : i64 (+ x 5)))
+                 (println (deref a))))",
+        );
+    }
+
+    #[test]
+    fn error_deref_non_atom() {
+        let msg = check_err(
+            "(defn main () : Unit (println (deref 42)))",
+        );
+        assert!(msg.contains("Atom"), "expected Atom error, got: {}", msg);
+    }
+
+    #[test]
+    fn error_swap_bang_wrong_func_type() {
+        let msg = check_err(
+            "(defn to-str ((x : i64)) : String (str x))
+             (defn main () : Unit
+               (let ((a (atom 0)))
+                 (swap! a to-str)))",
+        );
+        assert!(msg.contains("mismatch") || msg.contains("expected"), "expected type error, got: {}", msg);
+    }
+
+    #[test]
+    fn atom_nested_in_let() {
+        check_ok(
+            "(defn main () : Unit
+               (let ((a (atom 100))
+                     (b (deref a)))
+                 (println b)))",
+        );
+    }
+
+    // ── Shareable typeclass ─────────────────────────────────────────
+
+    #[test]
+    fn shareable_primitives_ok() {
+        // Primitives are Shareable — swap! on atom of i64 should work
+        check_ok(
+            "(defn main () : Unit
+               (let ((a (atom 42)))
+                 (println (swap! a (fn ((x : i64)) : i64 (+ x 1))))))",
+        );
+    }
+
+    #[test]
+    fn shareable_bool_ok() {
+        check_ok(
+            "(defn main () : Unit
+               (let ((a (atom true)))
+                 (println (swap! a (fn ((x : Bool)) : Bool (not x))))))",
+        );
+    }
+
+    #[test]
+    fn shareable_string_ok() {
+        check_ok(
+            "(defn main () : Unit
+               (let ((a (atom (str 0))))
+                 (println (swap! a (fn ((x : String)) : String x)))))",
+        );
+    }
+
+    // ── spawn / with-tasks type checking ──────────────────────────
+
+    #[test]
+    fn spawn_outside_with_tasks_error() {
+        let msg = check_err(
+            "(defn main () : Unit (spawn (println 1)))",
+        );
+        assert!(msg.contains("with-tasks"), "expected with-tasks error, got: {}", msg);
+    }
+
+    #[test]
+    fn with_tasks_basic() {
+        check_ok(
+            "(defn main () : Unit
+               (with-tasks
+                 (spawn (println 1))
+                 (spawn (println 2))))",
+        );
+    }
+
+    #[test]
+    fn with_tasks_returns_last_body() {
+        check_ok(
+            "(defn main () : Unit
+               (with-tasks
+                 (spawn (println 1))
+                 (println 3)))",
+        );
+    }
+
+    // ── Channel type checking ────────────────────────────────────
+
+    #[test]
+    fn channel_create_send_recv() {
+        check_ok(
+            "(defn main () : Unit
+               (let ((ch (channel)))
+                 (send ch 42)
+                 (println (recv ch))))",
+        );
+    }
+
+    #[test]
+    fn channel_type_inference() {
+        // Channel type should be inferred from usage
+        check_ok(
+            "(defn main () : Unit
+               (let ((ch (channel)))
+                 (send ch true)
+                 (println (recv ch))))",
+        );
+    }
+
+    // ── par-map / par-for-each type checking ──────────────────────
+
+    #[test]
+    fn par_map_basic() {
+        check_ok(
+            "(defn main () : Unit
+               (let ((v [1 2 3])
+                     (doubled (par-map (fn ((x : i64)) : i64 (* x 2)) v)))
+                 (println (len doubled))))",
+        );
+    }
+
+    #[test]
+    fn par_for_each_basic() {
+        check_ok(
+            "(defn main () : Unit
+               (par-for-each (fn ((x : i64)) : Unit (println x)) [1 2 3]))",
+        );
+    }
+
+    #[test]
+    fn error_par_map_wrong_type() {
+        let msg = check_err(
+            "(defn main () : Unit
+               (let ((v [1 2 3]))
+                 (par-map (fn ((x : String)) : String x) v)))",
+        );
+        assert!(msg.contains("mismatch"), "expected type mismatch, got: {}", msg);
+    }
+
+    #[test]
+    fn error_send_wrong_type() {
+        let msg = check_err(
+            "(defn main () : Unit
+               (let ((ch (channel)))
+                 (send ch 42)
+                 (send ch true)))",
+        );
+        assert!(msg.contains("mismatch"), "expected type mismatch, got: {}", msg);
+    }
+
+    #[test]
+    fn shareable_closure_rejected() {
+        // Closures are NOT Shareable — swap! on atom of closure should fail
+        let msg = check_err(
+            "(defn main () : Unit
+               (let ((f (fn ((x : i64)) : i64 x))
+                     (a (atom f)))
+                 (swap! a (fn ((g : (Fn [i64] i64))) : (Fn [i64] i64) g))))",
+        );
+        assert!(msg.contains("Shareable"), "expected Shareable error, got: {}", msg);
     }
 }

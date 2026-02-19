@@ -161,9 +161,11 @@ extern "C" fn weir_str_cmp(a: i64, b: i64) -> i64 {
 // The following re-exports make them available for JIT symbol registration.
 use weir_runtime::{
     weir_arena_alloc, weir_arena_create, weir_arena_destroy, weir_arena_vec_alloc,
-    weir_gc_alloc, weir_gc_collect, weir_gc_suppress, weir_gc_unsuppress, weir_gc_vec_alloc,
-    weir_shadow_pop, weir_shadow_push, weir_vec_append, weir_vec_get, weir_vec_len, SHAPE_FIXED,
-    SHAPE_VECTOR,
+    weir_atom_cas, weir_atom_create, weir_atom_deref, weir_channel_create, weir_channel_recv,
+    weir_channel_send, weir_gc_alloc, weir_gc_collect, weir_gc_suppress, weir_gc_unsuppress,
+    weir_gc_vec_alloc, weir_par_for_each, weir_par_map, weir_shadow_pop, weir_shadow_push,
+    weir_thread_join, weir_thread_spawn, weir_vec_append, weir_vec_get, weir_vec_len,
+    SHAPE_FIXED, SHAPE_VECTOR,
 };
 
 // ── C runtime for AOT binaries ──────────────────────────────────
@@ -429,6 +431,28 @@ void weir_gc_unsuppress(void) {
     if (gc_suppress_depth == 0 && gc_bytes_since > gc_threshold) gc_collect();
 }
 
+/* ── Atoms (lock-free AtomicI64) ── */
+#include <stdatomic.h>
+
+int64_t weir_atom_create(int64_t initial) {
+    _Atomic int64_t *atom = (_Atomic int64_t *)malloc(sizeof(_Atomic int64_t));
+    atomic_store_explicit(atom, initial, memory_order_release);
+    return (int64_t)(intptr_t)atom;
+}
+
+int64_t weir_atom_deref(int64_t atom_ptr) {
+    _Atomic int64_t *atom = (_Atomic int64_t *)(intptr_t)atom_ptr;
+    return atomic_load_explicit(atom, memory_order_acquire);
+}
+
+int64_t weir_atom_cas(int64_t atom_ptr, int64_t expected, int64_t new_val) {
+    _Atomic int64_t *atom = (_Atomic int64_t *)(intptr_t)atom_ptr;
+    int64_t exp = expected;
+    atomic_compare_exchange_strong_explicit(atom, &exp, new_val,
+        memory_order_acq_rel, memory_order_acquire);
+    return exp;
+}
+
 int main(void) { weir_main(); return 0; }
 "#;
 
@@ -447,6 +471,10 @@ fn ty_to_cl_with(ty: &Ty, tagged_adts: Option<&HashMap<SmolStr, TaggedAdt>>) -> 
         Ty::Fn(_, _) => Some(types::I64), // pointer to heap closure object
         Ty::Unit => None, // void — no value
         Ty::Con(name, _) => {
+            // Atom and Channel are i64 pointers (not GC-managed)
+            if name == "Atom" || name == "Channel" {
+                return Some(types::I64);
+            }
             if let Some(adts) = tagged_adts {
                 if adts.contains_key(name) {
                     return Some(types::I64); // packed tag+payload representation
@@ -527,6 +555,16 @@ pub fn compile_and_run(
     builder.symbol("weir_arena_destroy", weir_arena_destroy as *const u8);
     builder.symbol("weir_gc_suppress", weir_gc_suppress as *const u8);
     builder.symbol("weir_gc_unsuppress", weir_gc_unsuppress as *const u8);
+    builder.symbol("weir_atom_create", weir_atom_create as *const u8);
+    builder.symbol("weir_atom_deref", weir_atom_deref as *const u8);
+    builder.symbol("weir_atom_cas", weir_atom_cas as *const u8);
+    builder.symbol("weir_channel_create", weir_channel_create as *const u8);
+    builder.symbol("weir_channel_send", weir_channel_send as *const u8);
+    builder.symbol("weir_channel_recv", weir_channel_recv as *const u8);
+    builder.symbol("weir_thread_spawn", weir_thread_spawn as *const u8);
+    builder.symbol("weir_thread_join", weir_thread_join as *const u8);
+    builder.symbol("weir_par_map", weir_par_map as *const u8);
+    builder.symbol("weir_par_for_each", weir_par_for_each as *const u8);
 
     let jit_module = JITModule::new(builder);
 
@@ -1047,6 +1085,119 @@ impl<'a, M: Module> Compiler<'a, M> {
             .declare_function("weir_gc_unsuppress", Linkage::Import, &sig)
             .map_err(|e| CodegenError::new(format!("declare weir_gc_unsuppress: {}", e)))?;
         self.runtime_fns.insert("gc_unsuppress", id);
+
+        // weir_atom_create(i64) -> i64
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.call_conv = CallConv::SystemV;
+        let id = self
+            .module
+            .declare_function("weir_atom_create", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::new(format!("declare weir_atom_create: {}", e)))?;
+        self.runtime_fns.insert("atom_create", id);
+
+        // weir_atom_deref(i64) -> i64
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.call_conv = CallConv::SystemV;
+        let id = self
+            .module
+            .declare_function("weir_atom_deref", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::new(format!("declare weir_atom_deref: {}", e)))?;
+        self.runtime_fns.insert("atom_deref", id);
+
+        // weir_atom_cas(i64, i64, i64) -> i64
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.call_conv = CallConv::SystemV;
+        let id = self
+            .module
+            .declare_function("weir_atom_cas", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::new(format!("declare weir_atom_cas: {}", e)))?;
+        self.runtime_fns.insert("atom_cas", id);
+
+        // weir_channel_create() -> i64
+        let mut sig = self.module.make_signature();
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.call_conv = CallConv::SystemV;
+        let id = self
+            .module
+            .declare_function("weir_channel_create", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::new(format!("declare weir_channel_create: {}", e)))?;
+        self.runtime_fns.insert("channel_create", id);
+
+        // weir_channel_send(i64, i64) -> void
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.call_conv = CallConv::SystemV;
+        let id = self
+            .module
+            .declare_function("weir_channel_send", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::new(format!("declare weir_channel_send: {}", e)))?;
+        self.runtime_fns.insert("channel_send", id);
+
+        // weir_channel_recv(i64) -> i64
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.call_conv = CallConv::SystemV;
+        let id = self
+            .module
+            .declare_function("weir_channel_recv", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::new(format!("declare weir_channel_recv: {}", e)))?;
+        self.runtime_fns.insert("channel_recv", id);
+
+        // weir_thread_spawn(i64) -> i64
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.call_conv = CallConv::SystemV;
+        let id = self
+            .module
+            .declare_function("weir_thread_spawn", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::new(format!("declare weir_thread_spawn: {}", e)))?;
+        self.runtime_fns.insert("thread_spawn", id);
+
+        // weir_thread_join(i64) -> i64
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.call_conv = CallConv::SystemV;
+        let id = self
+            .module
+            .declare_function("weir_thread_join", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::new(format!("declare weir_thread_join: {}", e)))?;
+        self.runtime_fns.insert("thread_join", id);
+
+        // weir_par_map(closure: i64, vec: i64, shape: i64) -> i64
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.call_conv = CallConv::SystemV;
+        let id = self
+            .module
+            .declare_function("weir_par_map", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::new(format!("declare weir_par_map: {}", e)))?;
+        self.runtime_fns.insert("par_map", id);
+
+        // weir_par_for_each(closure: i64, vec: i64) -> void
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.call_conv = CallConv::SystemV;
+        let id = self
+            .module
+            .declare_function("weir_par_for_each", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::new(format!("declare weir_par_for_each: {}", e)))?;
+        self.runtime_fns.insert("par_for_each", id);
 
         Ok(())
     }
@@ -2201,6 +2352,85 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
 
             ExprKind::Try(inner) => self.compile_try(*inner, &resolved_ty),
 
+            ExprKind::SwapBang { atom, func } => {
+                // Compile atom pointer
+                let atom_ty = self.expr_ty(*atom);
+                let atom_ptr = self.compile_expr(*atom, &atom_ty)?.unwrap();
+
+                // Extract inner type T from (Atom T)
+                let inner_ty = match &atom_ty {
+                    Ty::Con(name, args) if name == "Atom" && args.len() == 1 => args[0].clone(),
+                    _ => resolved_ty.clone(),
+                };
+
+                // Compile func (should be a closure or function pointer)
+                let func_ty = self.expr_ty(*func);
+                let func_val = self.compile_expr(*func, &func_ty)?.unwrap();
+
+                // CAS loop:
+                //   loop_header:
+                //     old = atom_deref(atom_ptr)
+                //     new = call func(old)
+                //     actual = atom_cas(atom_ptr, old, new)
+                //     if actual == old: goto exit, else goto loop_header
+                //   exit:
+                //     return new
+                let inner_cl_ty = self.ty_cl(&inner_ty).unwrap_or(types::I64);
+
+                let loop_header = self.builder.create_block();
+                let exit_block = self.builder.create_block();
+                self.builder.append_block_param(exit_block, inner_cl_ty);
+
+                self.builder.ins().jump(loop_header, &[]);
+                self.builder.switch_to_block(loop_header);
+
+                // old_raw = atom_deref(atom_ptr) — returns i64
+                let deref_id = self.runtime_fns["atom_deref"];
+                let deref_ref = self.module.declare_func_in_func(deref_id, self.builder.func);
+                let call = self.builder.ins().call(deref_ref, &[atom_ptr]);
+                let old_raw = self.builder.inst_results(call)[0];
+
+                // Narrow old_raw from i64 to inner type for func call
+                let old_narrowed = self.narrow_from_i64(old_raw, &inner_ty);
+
+                // new = call func(old_narrowed)
+                let new_val = self.compile_indirect_call(func_val, &[old_narrowed], &func_ty)?;
+
+                // Widen new_val back to i64 for atom_cas
+                let new_widened = self.widen_to_i64(new_val, &inner_ty);
+
+                // actual = atom_cas(atom_ptr, old_raw, new_widened)
+                let cas_id = self.runtime_fns["atom_cas"];
+                let cas_ref = self.module.declare_func_in_func(cas_id, self.builder.func);
+                let call = self.builder.ins().call(cas_ref, &[atom_ptr, old_raw, new_widened]);
+                let actual = self.builder.inst_results(call)[0];
+
+                // if actual == old_raw: goto exit(new_val), else retry
+                let cmp = self.builder.ins().icmp(IntCC::Equal, actual, old_raw);
+                self.builder
+                    .ins()
+                    .brif(cmp, exit_block, &[BlockArg::Value(new_val)], loop_header, &[]);
+
+                // Seal both blocks now that all predecessors are known
+                self.builder.seal_block(loop_header);
+                self.builder.seal_block(exit_block);
+                self.builder.switch_to_block(exit_block);
+                let result = self.builder.block_params(exit_block)[0];
+                Ok(Some(result))
+            }
+
+            ExprKind::WithTasks { body } => {
+                // Compile body, collecting any spawn handles
+                self.compile_body(body, &resolved_ty)
+            }
+
+            ExprKind::Spawn(inner) => {
+                // For now, just evaluate the inner expression sequentially
+                // (full thread spawning requires compiling the expr as a separate function)
+                let _inner_val = self.compile_expr(*inner, &Ty::Unit)?;
+                Ok(None) // Unit
+            }
+
             ExprKind::Lambda {
                 params: lambda_params,
                 body,
@@ -2596,6 +2826,107 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                         }
                     }
                 }
+                "atom" => {
+                    if args.len() != 1 {
+                        return Err(CodegenError::new("atom expects exactly 1 argument"));
+                    }
+                    let arg_ty = self.expr_ty(args[0].value);
+                    let val = self.compile_expr(args[0].value, &arg_ty)?.unwrap();
+                    let widened = self.widen_to_i64(val, &arg_ty);
+                    let func_id = self.runtime_fns["atom_create"];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    let call = self.builder.ins().call(func_ref, &[widened]);
+                    let result = self.builder.inst_results(call)[0];
+                    return Ok(Some(result));
+                }
+                "deref" => {
+                    if args.len() != 1 {
+                        return Err(CodegenError::new("deref expects exactly 1 argument"));
+                    }
+                    let arg_ty = self.expr_ty(args[0].value);
+                    let atom_ptr = self.compile_expr(args[0].value, &arg_ty)?.unwrap();
+                    let func_id = self.runtime_fns["atom_deref"];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    let call = self.builder.ins().call(func_ref, &[atom_ptr]);
+                    let raw = self.builder.inst_results(call)[0];
+                    // Narrow from i64 to the inner type T of (Atom T)
+                    let result = self.narrow_from_i64(raw, result_ty);
+                    return Ok(Some(result));
+                }
+                "channel" => {
+                    let func_id = self.runtime_fns["channel_create"];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    let call = self.builder.ins().call(func_ref, &[]);
+                    let result = self.builder.inst_results(call)[0];
+                    return Ok(Some(result));
+                }
+                "send" => {
+                    if args.len() != 2 {
+                        return Err(CodegenError::new("send expects exactly 2 arguments"));
+                    }
+                    let ch_ty = self.expr_ty(args[0].value);
+                    let ch_ptr = self.compile_expr(args[0].value, &ch_ty)?.unwrap();
+                    let val_ty = self.expr_ty(args[1].value);
+                    let val = self.compile_expr(args[1].value, &val_ty)?.unwrap();
+                    let widened = self.widen_to_i64(val, &val_ty);
+                    let func_id = self.runtime_fns["channel_send"];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    self.builder.ins().call(func_ref, &[ch_ptr, widened]);
+                    return Ok(None);
+                }
+                "recv" => {
+                    if args.len() != 1 {
+                        return Err(CodegenError::new("recv expects exactly 1 argument"));
+                    }
+                    let ch_ty = self.expr_ty(args[0].value);
+                    let ch_ptr = self.compile_expr(args[0].value, &ch_ty)?.unwrap();
+                    let func_id = self.runtime_fns["channel_recv"];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    let call = self.builder.ins().call(func_ref, &[ch_ptr]);
+                    let raw = self.builder.inst_results(call)[0];
+                    // Narrow from i64 to the inner type T of (Channel T)
+                    let result = self.narrow_from_i64(raw, result_ty);
+                    return Ok(Some(result));
+                }
+                "par-map" => {
+                    if args.len() != 2 {
+                        return Err(CodegenError::new("par-map expects exactly 2 arguments"));
+                    }
+                    // args[0] = func (closure), args[1] = vec
+                    let fn_ty = self.expr_ty(args[0].value);
+                    let closure_ptr = self.compile_expr(args[0].value, &fn_ty)?.unwrap();
+                    let vec_ty = self.expr_ty(args[1].value);
+                    let vec_ptr = self.compile_expr(args[1].value, &vec_ty)?.unwrap();
+                    // Emit shape for result vector: (Vector U)
+                    let result_elem_ty = match result_ty {
+                        Ty::Vector(inner) => inner.as_ref(),
+                        _ => &Ty::I64,
+                    };
+                    let elems_are_ptrs = self.is_heap_pointer(result_elem_ty);
+                    let shape_val = self.emit_shape_desc(
+                        0,
+                        SHAPE_VECTOR,
+                        if elems_are_ptrs { 1 } else { 0 },
+                    );
+                    let func_id = self.runtime_fns["par_map"];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    let call = self.builder.ins().call(func_ref, &[closure_ptr, vec_ptr, shape_val]);
+                    let result = self.builder.inst_results(call)[0];
+                    return Ok(Some(result));
+                }
+                "par-for-each" => {
+                    if args.len() != 2 {
+                        return Err(CodegenError::new("par-for-each expects exactly 2 arguments"));
+                    }
+                    let fn_ty = self.expr_ty(args[0].value);
+                    let closure_ptr = self.compile_expr(args[0].value, &fn_ty)?.unwrap();
+                    let vec_ty = self.expr_ty(args[1].value);
+                    let vec_ptr = self.compile_expr(args[1].value, &vec_ty)?.unwrap();
+                    let func_id = self.runtime_fns["par_for_each"];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    self.builder.ins().call(func_ref, &[closure_ptr, vec_ptr]);
+                    return Ok(None); // returns Unit
+                }
                 _ => {}
             }
 
@@ -2791,6 +3122,59 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
             Ok(Some(results[0]))
         } else {
             Ok(None)
+        }
+    }
+
+    /// Call a closure with pre-compiled IR value arguments (not AST Arg nodes).
+    fn compile_indirect_call(
+        &mut self,
+        closure_ptr: Value,
+        arg_vals: &[Value],
+        func_ty: &Ty,
+    ) -> Result<Value, CodegenError> {
+        let (param_tys, ret_ty) = match func_ty {
+            Ty::Fn(p, r) => (p.clone(), r.as_ref().clone()),
+            _ => {
+                return Err(CodegenError::new(format!(
+                    "indirect call on non-function type: {}",
+                    func_ty
+                )));
+            }
+        };
+
+        // Load fn_ptr from closure offset 0
+        let fn_ptr =
+            self.builder
+                .ins()
+                .load(types::I64, MemFlags::trusted(), closure_ptr, 0);
+
+        // Build callee signature: (env_ptr: i64, param_0, ...) -> ret
+        let mut sig = cranelift_codegen::ir::Signature::new(CallConv::SystemV);
+        sig.params.push(AbiParam::new(types::I64)); // env_ptr
+        for pty in &param_tys {
+            if let Some(cl_ty) = self.ty_cl(pty) {
+                sig.params.push(AbiParam::new(cl_ty));
+            }
+        }
+        if let Some(cl_ty) = self.ty_cl(&ret_ty) {
+            sig.returns.push(AbiParam::new(cl_ty));
+        }
+
+        let mut call_args = vec![closure_ptr]; // first arg is env_ptr
+        call_args.extend_from_slice(arg_vals);
+
+        let sig_ref = self.builder.import_signature(sig);
+        let call_inst = self
+            .builder
+            .ins()
+            .call_indirect(sig_ref, fn_ptr, &call_args);
+
+        if self.ty_cl(&ret_ty).is_some() {
+            let results = self.builder.inst_results(call_inst);
+            Ok(results[0])
+        } else {
+            // Unit return — return a dummy zero
+            Ok(self.builder.ins().iconst(types::I64, 0))
         }
     }
 
@@ -3771,6 +4155,16 @@ fn register_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol("weir_arena_destroy", weir_arena_destroy as *const u8);
     builder.symbol("weir_gc_suppress", weir_gc_suppress as *const u8);
     builder.symbol("weir_gc_unsuppress", weir_gc_unsuppress as *const u8);
+    builder.symbol("weir_atom_create", weir_atom_create as *const u8);
+    builder.symbol("weir_atom_deref", weir_atom_deref as *const u8);
+    builder.symbol("weir_atom_cas", weir_atom_cas as *const u8);
+    builder.symbol("weir_channel_create", weir_channel_create as *const u8);
+    builder.symbol("weir_channel_send", weir_channel_send as *const u8);
+    builder.symbol("weir_channel_recv", weir_channel_recv as *const u8);
+    builder.symbol("weir_thread_spawn", weir_thread_spawn as *const u8);
+    builder.symbol("weir_thread_join", weir_thread_join as *const u8);
+    builder.symbol("weir_par_map", weir_par_map as *const u8);
+    builder.symbol("weir_par_for_each", weir_par_for_each as *const u8);
 }
 
 /// What changed between two versions of the source.
@@ -6337,5 +6731,141 @@ mod tests {
         assert_eq!(jit_output, "40\n3\n");
         assert_eq!(jit_output, interp_output, "JIT and interpreter disagree");
         assert_eq!(jit_output, aot_output, "JIT and AOT disagree");
+    }
+
+    // ── Atom tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn oracle_atom_create_deref() {
+        oracle_test(
+            "(defn main () : Unit
+               (let ((a (atom 42)))
+                 (println (deref a))))",
+        );
+    }
+
+    #[test]
+    fn oracle_atom_swap_bang() {
+        oracle_test(
+            "(defn main () : Unit
+               (let ((a (atom 0))
+                     (inc (fn ((x : i64)) : i64 (+ x 1))))
+                 (swap! a inc)
+                 (println (deref a))))",
+        );
+    }
+
+    #[test]
+    fn oracle_atom_swap_bang_lambda() {
+        oracle_test(
+            "(defn main () : Unit
+               (let ((a (atom 10)))
+                 (swap! a (fn ((x : i64)) : i64 (* x 2)))
+                 (println (deref a))))",
+        );
+    }
+
+    #[test]
+    fn oracle_atom_multiple_swaps() {
+        oracle_test(
+            "(defn main () : Unit
+               (let ((a (atom 0))
+                     (inc (fn ((x : i64)) : i64 (+ x 1))))
+                 (swap! a inc)
+                 (swap! a inc)
+                 (swap! a inc)
+                 (println (deref a))))",
+        );
+    }
+
+    #[test]
+    fn oracle_atom_swap_returns_new_value() {
+        oracle_test(
+            "(defn main () : Unit
+               (let ((a (atom 5))
+                     (double (fn ((x : i64)) : i64 (* x 2))))
+                 (println (swap! a double))))",
+        );
+    }
+
+    #[test]
+    fn atom_aot_build_and_run() {
+        let source = r#"
+(defn main () : Unit
+  (let ((a (atom 0))
+        (inc (fn ((x : i64)) : i64 (+ x 1))))
+    (swap! a inc)
+    (swap! a inc)
+    (swap! a inc)
+    (println (deref a))))
+"#;
+        let expanded = expand(source);
+        let (module, parse_errors) = weir_parser::parse(&expanded);
+        assert!(parse_errors.is_empty());
+        let type_info = weir_typeck::check(&module);
+        assert!(type_info.errors.is_empty());
+
+        let jit_output = compile_and_run(&module, &type_info).expect("JIT failed");
+        let interp_output = weir_interp::interpret(&module).expect("interp failed");
+
+        let tmp_dir = std::env::temp_dir();
+        let binary_path = tmp_dir.join("weir_test_aot_atom");
+        build_executable(&module, &type_info, &binary_path).expect("build_executable failed");
+        let output = std::process::Command::new(&binary_path)
+            .output()
+            .expect("failed to run AOT binary");
+        let _ = std::fs::remove_file(&binary_path);
+
+        assert!(output.status.success(), "AOT binary exited with error");
+        let aot_output = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(jit_output, "3\n");
+        assert_eq!(jit_output, interp_output, "JIT and interpreter disagree");
+        assert_eq!(jit_output, aot_output, "JIT and AOT disagree");
+    }
+
+    // ── spawn / with-tasks tests ────────────────────────────────────
+
+    #[test]
+    fn oracle_with_tasks_basic() {
+        oracle_test(
+            "(defn main () : Unit
+               (with-tasks
+                 (spawn (println 1))
+                 (spawn (println 2))))",
+        );
+    }
+
+    #[test]
+    fn oracle_with_tasks_shared_atom() {
+        oracle_test(
+            "(defn main () : Unit
+               (let ((counter (atom 0))
+                     (inc (fn ((x : i64)) : i64 (+ x 1))))
+                 (with-tasks
+                   (spawn (swap! counter inc))
+                   (spawn (swap! counter inc)))
+                 (println (deref counter))))",
+        );
+    }
+
+    // ── par-map / par-for-each tests ────────────────────────────────
+
+    #[test]
+    fn oracle_par_for_each() {
+        oracle_test(
+            "(defn main () : Unit
+               (par-for-each (fn ((x : i64)) : Unit (println x)) [10 20 30]))",
+        );
+    }
+
+    #[test]
+    fn oracle_par_map() {
+        oracle_test(
+            "(defn main () : Unit
+               (let ((doubled (par-map (fn ((x : i64)) : i64 (* x 2)) [1 2 3])))
+                 (println (nth doubled 0))
+                 (println (nth doubled 1))
+                 (println (nth doubled 2))))",
+        );
     }
 }

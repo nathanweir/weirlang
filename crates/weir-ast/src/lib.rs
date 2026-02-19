@@ -260,6 +260,13 @@ pub enum ExprKind {
     WithArena { name: SmolStr, body: Vec<ExprId> },
     /// Try/question operator: `expr?`
     Try(ExprId),
+
+    /// Atomic swap: `(swap! atom func)` — CAS loop
+    SwapBang { atom: ExprId, func: ExprId },
+    /// Structured concurrency block: `(with-tasks body...)`
+    WithTasks { body: Vec<ExprId> },
+    /// Spawn a task: `(spawn expr)` — must be inside with-tasks
+    Spawn(ExprId),
 }
 
 /// A function call argument (positional or named).
@@ -829,6 +836,27 @@ impl<'a> PrettyPrinter<'a> {
             ExprKind::Try(inner) => {
                 self.print_expr(*inner);
                 self.buf.push('?');
+            }
+
+            ExprKind::SwapBang { atom, func } => {
+                self.buf.push_str("(swap! ");
+                self.print_expr(*atom);
+                self.buf.push(' ');
+                self.print_expr(*func);
+                self.buf.push(')');
+            }
+            ExprKind::WithTasks { body } => {
+                self.buf.push_str("(with-tasks");
+                for &e in body {
+                    self.buf.push(' ');
+                    self.print_expr(e);
+                }
+                self.buf.push(')');
+            }
+            ExprKind::Spawn(inner) => {
+                self.buf.push_str("(spawn ");
+                self.print_expr(*inner);
+                self.buf.push(')');
             }
         }
     }

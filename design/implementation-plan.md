@@ -246,7 +246,7 @@ Run `just test` on every commit. Tests must pass before merging.
   - Constraint resolution with deferred checking
   - [x] Core typeclasses beyond Eq/Show: `Ord`, `From` — *done in Phase 8b*
   - [x] Coherence checking (Rust-style: only defining module can write instance) — *done in Phase 8b*
-  - [ ] `Shareable` typeclass (auto-derived based on type contents) — *deferred; needs concurrency (Phase 10)*
+  - [x] `Shareable` typeclass (auto-derived based on type contents) — *implemented in Phase 10b*
 - [x] **HKTs**:
   - Kind system (`TyKind::Star`, `TyKind::Arrow`)
   - `Ty::App` for type application (`('f 'a)`)
@@ -301,12 +301,13 @@ Items deferred from earlier phases that don't depend on the runtime (Phase 9) or
   - Soft restart warnings: type redefinition prints stale-layout warning to stderr
   - `ReloadResult`: recompiled names, skipped count, type warnings
   - 570 tests pass (10 new: 4 dep graph + 6 selective reload)
-- [ ] **Concurrency primitives**:
-  - `spawn` / `with-tasks` (structured concurrency)
-  - `par-map` / `par-for-each` (parallel iteration)
-  - `channel` (typed channels)
-  - `atom` (compare-and-swap)
-  - `Shareable` enforcement at spawn/send boundaries
+- [x] **Concurrency primitives** (Phase 10b):
+  - [x] `atom` / `deref` / `swap!` — lock-free AtomicI64 with CAS loop (JIT, AOT, interpreter)
+  - [x] `Shareable` marker typeclass — auto-instances for primitives, constraint on swap!/atom
+  - [x] `spawn` / `with-tasks` — structured concurrency syntax (sequential execution for now)
+  - [x] `channel` / `send` / `recv` — typed MPSC channels (typechecker + interpreter + codegen)
+  - [x] `par-map` / `par-for-each` — parallel iteration (sequential; runtime dispatch through closures)
+  - 603 tests pass (33 new: parser, typechecker, codegen oracle, AOT)
 - [x] **Result + ? operator**: error propagation in codegen — *done in Phase 8b*
 - [ ] Verify: cascade works for all change types, concurrency primitives are thread-safe
 
@@ -319,7 +320,7 @@ Items deferred from earlier phases that don't depend on the runtime (Phase 9) or
 | **M2: "Standalone binary + live reload"** | Phase 5 | `weir build` produces native binaries; `weir dev` enables live reload | **Done** |
 | **M3: "Editor support"** | Phase 6 | Syntax highlighting, inline errors, type hover in Zed | **Done** (LSP: diagnostics, hover, goto-def, references, rename, completion, inlay hints, formatting, semantic tokens, signature help, cross-file support, workspace symbol search; Zed: tree-sitter highlighting + LSP) |
 | **M4: "Real language"** | Phase 8 | Generics, typeclasses, macros — write non-trivial programs | **Done** (macros, generics, typeclasses, HKTs all working) |
-| **M5: "Production-ready runtime"** | Phase 10 | GC, arenas, concurrency, full cascade — the complete vision | Not started |
+| **M5: "Production-ready runtime"** | Phase 10 | GC, arenas, concurrency, full cascade — the complete vision | **In progress** (10a: dependency tracking + selective recompilation; 10b: concurrency primitives) |
 
 ## Verification strategy
 

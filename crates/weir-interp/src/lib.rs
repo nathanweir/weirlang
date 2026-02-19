@@ -55,6 +55,8 @@ impl std::error::Error for InterpError {}
 
 // ── Value ────────────────────────────────────────────────────────
 
+type ChannelPair = (RefCell<std::sync::mpsc::Sender<Value>>, RefCell<std::sync::mpsc::Receiver<Value>>);
+
 #[derive(Clone, Debug)]
 pub enum Value {
     Int(i64),
@@ -86,6 +88,8 @@ pub enum Value {
         fields: Vec<(SmolStr, Value)>,
     },
     Builtin(SmolStr),
+    Atom(Rc<RefCell<Value>>),
+    Channel(Rc<ChannelPair>),
 }
 
 impl fmt::Display for Value {
@@ -155,6 +159,11 @@ impl fmt::Display for Value {
                 write!(f, ")")
             }
             Value::Builtin(name) => write!(f, "<builtin {}>", name),
+            Value::Atom(inner) => {
+                let val = inner.borrow();
+                write!(f, "(atom {})", *val)
+            }
+            Value::Channel(_) => write!(f, "<channel>"),
         }
     }
 }
@@ -188,6 +197,8 @@ impl PartialEq for Value {
                 },
             ) => a_name == b_name && a_args == b_args,
             (Value::Vector(a), Value::Vector(b)) => a == b,
+            (Value::Atom(a), Value::Atom(b)) => Rc::ptr_eq(a, b),
+            (Value::Channel(a), Value::Channel(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -325,6 +336,7 @@ impl<'a> Interpreter<'a> {
         let builtins = [
             "+", "-", "*", "/", "mod", "<", ">", "<=", ">=", "=", "!=", "not", "and", "or",
             "println", "print", "str", "len", "nth", "append", "type-of",
+            "atom", "deref", "channel", "send", "recv", "par-map", "par-for-each",
         ];
         for name in builtins {
             self.global_env.define(
@@ -737,6 +749,31 @@ impl<'a> Interpreter<'a> {
                         span,
                     )),
                 }
+            }
+
+            ExprKind::SwapBang { atom, func } => {
+                let atom_val = self.eval_expr(env, *atom)?;
+                let func_val = self.eval_expr(env, *func)?;
+                match &atom_val {
+                    Value::Atom(inner) => {
+                        let old = inner.borrow().clone();
+                        let new = self.call_value(&func_val, &[old], span)?;
+                        *inner.borrow_mut() = new.clone();
+                        Ok(new)
+                    }
+                    _ => Err(InterpError::with_span(
+                        format!("swap! requires an atom, got {}", atom_val),
+                        span,
+                    )),
+                }
+            }
+
+            ExprKind::WithTasks { body } => self.eval_body(env, body),
+
+            ExprKind::Spawn(inner) => {
+                // In interpreter, spawn runs sequentially
+                let _val = self.eval_expr(env, *inner)?;
+                Ok(Value::Unit)
             }
         }
     }
@@ -1230,8 +1267,113 @@ impl<'a> Interpreter<'a> {
                     Value::StructConstructor { type_name, .. } => type_name.as_str(),
                     Value::StructInstance { type_name, .. } => type_name.as_str(),
                     Value::Builtin(_) => "Builtin",
+                    Value::Atom(_) => "Atom",
+                    Value::Channel(_) => "Channel",
                 };
                 Ok(Value::String(type_name.to_string()))
+            }
+
+            "atom" => {
+                if args.len() != 1 {
+                    return Err(InterpError::with_span("atom requires 1 argument", span));
+                }
+                Ok(Value::Atom(Rc::new(RefCell::new(args[0].clone()))))
+            }
+
+            "deref" => {
+                if args.len() != 1 {
+                    return Err(InterpError::with_span("deref requires 1 argument", span));
+                }
+                match &args[0] {
+                    Value::Atom(inner) => {
+                        Ok(inner.borrow().clone())
+                    }
+                    _ => Err(InterpError::with_span(
+                        format!("deref requires an atom, got {}", args[0]),
+                        span,
+                    )),
+                }
+            }
+
+            "channel" => {
+                if !args.is_empty() {
+                    return Err(InterpError::with_span("channel takes no arguments", span));
+                }
+                let (tx, rx) = std::sync::mpsc::channel::<Value>();
+                Ok(Value::Channel(Rc::new((RefCell::new(tx), RefCell::new(rx)))))
+            }
+
+            "send" => {
+                if args.len() != 2 {
+                    return Err(InterpError::with_span("send requires 2 arguments", span));
+                }
+                match &args[0] {
+                    Value::Channel(ch) => {
+                        let tx = ch.0.borrow();
+                        let _ = tx.send(args[1].clone());
+                        Ok(Value::Unit)
+                    }
+                    _ => Err(InterpError::with_span(
+                        format!("send requires a channel, got {}", args[0]),
+                        span,
+                    )),
+                }
+            }
+
+            "recv" => {
+                if args.len() != 1 {
+                    return Err(InterpError::with_span("recv requires 1 argument", span));
+                }
+                match &args[0] {
+                    Value::Channel(ch) => {
+                        let rx = ch.1.borrow();
+                        match rx.recv() {
+                            Ok(val) => Ok(val),
+                            Err(_) => Ok(Value::Unit),
+                        }
+                    }
+                    _ => Err(InterpError::with_span(
+                        format!("recv requires a channel, got {}", args[0]),
+                        span,
+                    )),
+                }
+            }
+
+            "par-map" => {
+                if args.len() != 2 {
+                    return Err(InterpError::with_span("par-map requires 2 arguments", span));
+                }
+                match &args[1] {
+                    Value::Vector(v) => {
+                        let results: Vec<Value> = v
+                            .iter()
+                            .map(|elem| self.call_value(&args[0], std::slice::from_ref(elem), span))
+                            .collect::<Result<_, _>>()?;
+                        Ok(Value::Vector(results))
+                    }
+                    _ => Err(InterpError::with_span("par-map expects a vector", span)),
+                }
+            }
+
+            "par-for-each" => {
+                if args.len() != 2 {
+                    return Err(InterpError::with_span(
+                        "par-for-each requires 2 arguments",
+                        span,
+                    ));
+                }
+                match &args[1] {
+                    Value::Vector(v) => {
+                        for elem in v {
+                            self.call_value(&args[0], std::slice::from_ref(elem), span)?;
+                        }
+                        Ok(Value::Unit)
+                    }
+                    _ => Err(InterpError::with_span(
+                        "par-for-each expects a vector",
+                        span,
+                    )),
+                }
             }
 
             _ => Err(InterpError::with_span(

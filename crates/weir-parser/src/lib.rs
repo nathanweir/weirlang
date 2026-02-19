@@ -860,6 +860,15 @@ impl Parser {
         } else if self.check_symbol("with-arena") {
             self.advance();
             self.parse_with_arena_body(start)
+        } else if self.check_symbol("swap!") {
+            self.advance();
+            self.parse_swap_bang_body(start)
+        } else if self.check_symbol("with-tasks") {
+            self.advance();
+            self.parse_with_tasks_body(start)
+        } else if self.check_symbol("spawn") {
+            self.advance();
+            self.parse_spawn_body(start)
         } else {
             self.parse_call_body(start)
         };
@@ -1091,6 +1100,25 @@ impl Parser {
             body.push(self.parse_expr()?);
         }
         Some(ExprKind::WithArena { name, body })
+    }
+
+    fn parse_swap_bang_body(&mut self, _start: Span) -> Option<ExprKind> {
+        let atom = self.parse_expr()?;
+        let func = self.parse_expr()?;
+        Some(ExprKind::SwapBang { atom, func })
+    }
+
+    fn parse_with_tasks_body(&mut self, _start: Span) -> Option<ExprKind> {
+        let mut body = Vec::new();
+        while !self.at_end() && !self.check(&Token::RParen) {
+            body.push(self.parse_expr()?);
+        }
+        Some(ExprKind::WithTasks { body })
+    }
+
+    fn parse_spawn_body(&mut self, _start: Span) -> Option<ExprKind> {
+        let inner = self.parse_expr()?;
+        Some(ExprKind::Spawn(inner))
     }
 
     fn parse_call_body(&mut self, _start: Span) -> Option<ExprKind> {
@@ -1643,4 +1671,23 @@ mod tests {
         }
     }
 
+    // ── Atom / concurrency parsing ──────────────────────────────────
+
+    #[test]
+    fn test_parse_swap_bang() {
+        let result = parse_and_print("(defn main () : Unit (swap! a inc))");
+        insta::assert_snapshot!(result);
+    }
+
+    #[test]
+    fn test_parse_with_tasks() {
+        let result = parse_and_print("(defn main () : Unit (with-tasks (spawn (println 1)) (spawn (println 2))))");
+        insta::assert_snapshot!(result);
+    }
+
+    #[test]
+    fn test_parse_spawn() {
+        let result = parse_and_print("(defn main () : Unit (with-tasks (spawn (+ 1 2))))");
+        insta::assert_snapshot!(result);
+    }
 }

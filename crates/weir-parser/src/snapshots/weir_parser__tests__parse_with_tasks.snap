@@ -1,0 +1,10 @@
+---
+source: crates/weir-parser/src/lib.rs
+expression: result
+---
+(defn main
+  params:
+  returns: Unit
+  body:
+    (with-tasks (spawn (println 1)) (spawn (println 2)))
+)

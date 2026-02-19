@@ -478,7 +478,10 @@ impl<'a> IndexBuilder<'a> {
                     self.walk_expr(e, scope);
                 }
             }
-            ExprKind::Do { body } | ExprKind::Unsafe { body } | ExprKind::WithArena { body, .. } => {
+            ExprKind::Do { body }
+            | ExprKind::Unsafe { body }
+            | ExprKind::WithArena { body, .. }
+            | ExprKind::WithTasks { body } => {
                 for &e in body {
                     self.walk_expr(e, scope);
                 }
@@ -490,8 +493,12 @@ impl<'a> IndexBuilder<'a> {
             ExprKind::Ann { expr, .. } => {
                 self.walk_expr(*expr, scope);
             }
-            ExprKind::Try(inner) => {
+            ExprKind::Try(inner) | ExprKind::Spawn(inner) => {
                 self.walk_expr(*inner, scope);
+            }
+            ExprKind::SwapBang { atom, func } => {
+                self.walk_expr(*atom, scope);
+                self.walk_expr(*func, scope);
             }
             ExprKind::VectorLit(elems) => {
                 for &e in elems {
