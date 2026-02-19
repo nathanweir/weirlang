@@ -216,7 +216,7 @@ fn collect_expr_hints(
             }
         }
 
-        ExprKind::Do { body } | ExprKind::Unsafe { body } => {
+        ExprKind::Do { body } | ExprKind::Unsafe { body } | ExprKind::WithArena { body, .. } => {
             for &b in body {
                 collect_expr_hints(b, module, type_result, line_index, range, hints);
             }

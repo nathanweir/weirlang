@@ -160,8 +160,10 @@ extern "C" fn weir_str_cmp(a: i64, b: i64) -> i64 {
 // Allocation and vector operations are provided by weir-runtime (GC-managed).
 // The following re-exports make them available for JIT symbol registration.
 use weir_runtime::{
-    weir_gc_alloc, weir_gc_collect, weir_gc_vec_alloc, weir_shadow_pop, weir_shadow_push,
-    weir_vec_append, weir_vec_get, weir_vec_len, SHAPE_FIXED, SHAPE_VECTOR,
+    weir_arena_alloc, weir_arena_create, weir_arena_destroy, weir_arena_vec_alloc,
+    weir_gc_alloc, weir_gc_collect, weir_gc_suppress, weir_gc_unsuppress, weir_gc_vec_alloc,
+    weir_shadow_pop, weir_shadow_push, weir_vec_append, weir_vec_get, weir_vec_len, SHAPE_FIXED,
+    SHAPE_VECTOR,
 };
 
 // ── C runtime for AOT binaries ──────────────────────────────────
@@ -238,6 +240,7 @@ static ObjHeader *gc_all_objects = NULL;
 static size_t gc_bytes_since = 0;
 static size_t gc_total_bytes = 0;
 static size_t gc_threshold = INITIAL_GC_THRESHOLD;
+static int gc_suppressed = 0;
 
 /* Shadow stack */
 static int64_t **shadow_stack = NULL;
@@ -316,7 +319,7 @@ void weir_gc_collect(void) { gc_collect(); }
 
 int64_t weir_gc_alloc(int64_t size_bytes, int64_t shape_ptr) {
     size_t user_size = (size_t)size_bytes;
-    if (gc_bytes_since + HEADER_SIZE + user_size > gc_threshold)
+    if (!gc_suppressed && gc_bytes_since + HEADER_SIZE + user_size > gc_threshold)
         gc_collect();
     size_t total = HEADER_SIZE + user_size;
     ObjHeader *h = (ObjHeader*)calloc(1, total);
@@ -350,6 +353,80 @@ int64_t weir_vec_append(int64_t ptr, int64_t elem, int64_t shape_ptr) {
     memcpy((int64_t*)(intptr_t)new_ptr + 1, (int64_t*)(intptr_t)ptr + 1, old_len * 8);
     ((int64_t*)(intptr_t)new_ptr)[1 + old_len] = elem;
     return new_ptr;
+}
+
+/* ── Arena allocator ── */
+
+#define ARENA_INITIAL_CAPACITY (64 * 1024)
+
+typedef struct ArenaChunk {
+    void *base;
+    size_t capacity;
+    struct ArenaChunk *next;
+} ArenaChunk;
+
+typedef struct Arena {
+    ArenaChunk *current_chunk;
+    size_t offset;
+} Arena;
+
+static ArenaChunk *arena_new_chunk(size_t capacity) {
+    ArenaChunk *c = (ArenaChunk*)malloc(sizeof(ArenaChunk));
+    c->base = calloc(1, capacity);
+    c->capacity = capacity;
+    c->next = NULL;
+    return c;
+}
+
+int64_t weir_arena_create(void) {
+    ArenaChunk *chunk = arena_new_chunk(ARENA_INITIAL_CAPACITY);
+    Arena *a = (Arena*)malloc(sizeof(Arena));
+    a->current_chunk = chunk;
+    a->offset = 0;
+    return (int64_t)(intptr_t)a;
+}
+
+int64_t weir_arena_alloc(int64_t arena_ptr, int64_t size) {
+    size_t aligned = ((size_t)size + 7) & ~(size_t)7;
+    Arena *a = (Arena*)(intptr_t)arena_ptr;
+    ArenaChunk *c = a->current_chunk;
+    if (a->offset + aligned <= c->capacity) {
+        void *ptr = (char*)c->base + a->offset;
+        a->offset += aligned;
+        return (int64_t)(intptr_t)ptr;
+    }
+    size_t new_cap = c->capacity * 2;
+    if (new_cap < aligned) new_cap = aligned;
+    ArenaChunk *nc = arena_new_chunk(new_cap);
+    nc->next = a->current_chunk;
+    a->current_chunk = nc;
+    a->offset = aligned;
+    return (int64_t)(intptr_t)nc->base;
+}
+
+int64_t weir_arena_vec_alloc(int64_t arena_ptr, int64_t len) {
+    int64_t total = (1 + len) * 8;
+    int64_t ptr = weir_arena_alloc(arena_ptr, total);
+    *(int64_t*)(intptr_t)ptr = len;
+    return ptr;
+}
+
+void weir_arena_destroy(int64_t arena_ptr) {
+    Arena *a = (Arena*)(intptr_t)arena_ptr;
+    ArenaChunk *c = a->current_chunk;
+    while (c) {
+        ArenaChunk *next = c->next;
+        free(c->base);
+        free(c);
+        c = next;
+    }
+    free(a);
+}
+
+void weir_gc_suppress(void) { gc_suppressed = 1; }
+void weir_gc_unsuppress(void) {
+    gc_suppressed = 0;
+    if (gc_bytes_since > gc_threshold) gc_collect();
 }
 
 int main(void) { weir_main(); return 0; }
@@ -444,6 +521,12 @@ pub fn compile_and_run(
     builder.symbol("weir_vec_append", weir_vec_append as *const u8);
     builder.symbol("weir_shadow_push", weir_shadow_push as *const u8);
     builder.symbol("weir_shadow_pop", weir_shadow_pop as *const u8);
+    builder.symbol("weir_arena_create", weir_arena_create as *const u8);
+    builder.symbol("weir_arena_alloc", weir_arena_alloc as *const u8);
+    builder.symbol("weir_arena_vec_alloc", weir_arena_vec_alloc as *const u8);
+    builder.symbol("weir_arena_destroy", weir_arena_destroy as *const u8);
+    builder.symbol("weir_gc_suppress", weir_gc_suppress as *const u8);
+    builder.symbol("weir_gc_unsuppress", weir_gc_unsuppress as *const u8);
 
     let jit_module = JITModule::new(builder);
 
@@ -903,6 +986,68 @@ impl<'a, M: Module> Compiler<'a, M> {
             .map_err(|e| CodegenError::new(format!("declare weir_shadow_pop: {}", e)))?;
         self.runtime_fns.insert("shadow_pop", id);
 
+        // weir_arena_create() -> i64
+        let mut sig = self.module.make_signature();
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.call_conv = CallConv::SystemV;
+        let id = self
+            .module
+            .declare_function("weir_arena_create", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::new(format!("declare weir_arena_create: {}", e)))?;
+        self.runtime_fns.insert("arena_create", id);
+
+        // weir_arena_alloc(i64, i64) -> i64  [arena, size]
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.call_conv = CallConv::SystemV;
+        let id = self
+            .module
+            .declare_function("weir_arena_alloc", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::new(format!("declare weir_arena_alloc: {}", e)))?;
+        self.runtime_fns.insert("arena_alloc", id);
+
+        // weir_arena_vec_alloc(i64, i64) -> i64  [arena, len]
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.call_conv = CallConv::SystemV;
+        let id = self
+            .module
+            .declare_function("weir_arena_vec_alloc", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::new(format!("declare weir_arena_vec_alloc: {}", e)))?;
+        self.runtime_fns.insert("arena_vec_alloc", id);
+
+        // weir_arena_destroy(i64) -> void  [arena]
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.call_conv = CallConv::SystemV;
+        let id = self
+            .module
+            .declare_function("weir_arena_destroy", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::new(format!("declare weir_arena_destroy: {}", e)))?;
+        self.runtime_fns.insert("arena_destroy", id);
+
+        // weir_gc_suppress() -> void
+        let mut sig = self.module.make_signature();
+        sig.call_conv = CallConv::SystemV;
+        let id = self
+            .module
+            .declare_function("weir_gc_suppress", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::new(format!("declare weir_gc_suppress: {}", e)))?;
+        self.runtime_fns.insert("gc_suppress", id);
+
+        // weir_gc_unsuppress() -> void
+        let mut sig = self.module.make_signature();
+        sig.call_conv = CallConv::SystemV;
+        let id = self
+            .module
+            .declare_function("weir_gc_unsuppress", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::new(format!("declare weir_gc_unsuppress: {}", e)))?;
+        self.runtime_fns.insert("gc_unsuppress", id);
+
         Ok(())
     }
 
@@ -1301,6 +1446,7 @@ impl<'a, M: Module> Compiler<'a, M> {
                 lambda_counter: &mut self.lambda_counter,
                 type_subst: type_subst.clone(),
                 shadow_depth: 0,
+                arena_var: None,
             };
 
             // Bind parameters to variables
@@ -1419,6 +1565,7 @@ impl<'a, M: Module> Compiler<'a, M> {
                 lambda_counter: &mut self.lambda_counter,
                 type_subst: info.type_subst.clone(),
                 shadow_depth: 0,
+                arena_var: None,
             };
 
             let block_params: Vec<Value> = fn_ctx.builder.block_params(entry_block).to_vec();
@@ -1626,6 +1773,11 @@ fn find_captures(
                     walk_expr(e, ast_module, param_names, local_names, enclosing_vars, captured, seen);
                 }
             }
+            ExprKind::WithArena { body, .. } => {
+                for &e in body {
+                    walk_expr(e, ast_module, param_names, local_names, enclosing_vars, captured, seen);
+                }
+            }
             _ => {}
         }
     }
@@ -1664,6 +1816,8 @@ struct FnCompileCtx<'a, 'b, M: Module> {
     type_subst: HashMap<TyVarId, Ty>,
     /// Number of entries currently pushed onto the GC shadow stack by this function.
     shadow_depth: usize,
+    /// If inside a with-arena block, the Cranelift variable holding the arena pointer.
+    arena_var: Option<Variable>,
 }
 
 impl<M: Module> FnCompileCtx<'_, '_, M> {
@@ -1889,6 +2043,46 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
 
             ExprKind::Do { body } => self.compile_body(body, &resolved_ty),
 
+            ExprKind::WithArena { name: _, body } => {
+                // 1. Create arena
+                let create_id = self.runtime_fns["arena_create"];
+                let create_ref = self.module.declare_func_in_func(create_id, self.builder.func);
+                let call = self.builder.ins().call(create_ref, &[]);
+                let arena_ptr = self.builder.inst_results(call)[0];
+
+                // Store arena pointer in a Cranelift variable
+                let arena_var = self.declare_variable(types::I64);
+                self.builder.def_var(arena_var, arena_ptr);
+
+                // 2. Suppress GC
+                let suppress_id = self.runtime_fns["gc_suppress"];
+                let suppress_ref = self.module.declare_func_in_func(suppress_id, self.builder.func);
+                self.builder.ins().call(suppress_ref, &[]);
+
+                // 3. Set arena_var so allocations redirect
+                let prev_arena = self.arena_var;
+                self.arena_var = Some(arena_var);
+
+                // 4. Compile body
+                let result = self.compile_body(body, &resolved_ty);
+
+                // 5. Restore arena_var
+                self.arena_var = prev_arena;
+
+                // 6. Unsuppress GC
+                let unsuppress_id = self.runtime_fns["gc_unsuppress"];
+                let unsuppress_ref = self.module.declare_func_in_func(unsuppress_id, self.builder.func);
+                self.builder.ins().call(unsuppress_ref, &[]);
+
+                // 7. Destroy arena
+                let arena_val = self.builder.use_var(arena_var);
+                let destroy_id = self.runtime_fns["arena_destroy"];
+                let destroy_ref = self.module.declare_func_in_func(destroy_id, self.builder.func);
+                self.builder.ins().call(destroy_ref, &[arena_val]);
+
+                result
+            }
+
             ExprKind::SetBang { place, value } => {
                 let place_expr = &self.ast_module.exprs[*place];
                 if let ExprKind::Var(name) = &place_expr.kind {
@@ -2002,10 +2196,18 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
 
                 let alloc_size = ((2 + num_captures) * 8) as i64;
                 let alloc_size_val = self.builder.ins().iconst(types::I64, alloc_size);
-                let alloc_id = self.runtime_fns["gc_alloc"];
-                let alloc_ref = self.module.declare_func_in_func(alloc_id, self.builder.func);
-                let call = self.builder.ins().call(alloc_ref, &[alloc_size_val, shape_val]);
-                let closure_ptr = self.builder.inst_results(call)[0];
+                let closure_ptr = if let Some(arena_v) = self.arena_var {
+                    let arena_val = self.builder.use_var(arena_v);
+                    let alloc_id = self.runtime_fns["arena_alloc"];
+                    let alloc_ref = self.module.declare_func_in_func(alloc_id, self.builder.func);
+                    let call = self.builder.ins().call(alloc_ref, &[arena_val, alloc_size_val]);
+                    self.builder.inst_results(call)[0]
+                } else {
+                    let alloc_id = self.runtime_fns["gc_alloc"];
+                    let alloc_ref = self.module.declare_func_in_func(alloc_id, self.builder.func);
+                    let call = self.builder.ins().call(alloc_ref, &[alloc_size_val, shape_val]);
+                    self.builder.inst_results(call)[0]
+                };
 
                 // Store fn_ptr at offset 0
                 let func_ref_for_addr = self.module.declare_func_in_func(func_id, self.builder.func);
@@ -2043,10 +2245,18 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
 
                 let len = elems.len() as i64;
                 let len_val = self.builder.ins().iconst(types::I64, len);
-                let alloc_id = self.runtime_fns["gc_vec_alloc"];
-                let alloc_ref = self.module.declare_func_in_func(alloc_id, self.builder.func);
-                let call = self.builder.ins().call(alloc_ref, &[len_val, shape_val]);
-                let ptr = self.builder.inst_results(call)[0];
+                let ptr = if let Some(arena_v) = self.arena_var {
+                    let arena_val = self.builder.use_var(arena_v);
+                    let alloc_id = self.runtime_fns["arena_vec_alloc"];
+                    let alloc_ref = self.module.declare_func_in_func(alloc_id, self.builder.func);
+                    let call = self.builder.ins().call(alloc_ref, &[arena_val, len_val]);
+                    self.builder.inst_results(call)[0]
+                } else {
+                    let alloc_id = self.runtime_fns["gc_vec_alloc"];
+                    let alloc_ref = self.module.declare_func_in_func(alloc_id, self.builder.func);
+                    let call = self.builder.ins().call(alloc_ref, &[len_val, shape_val]);
+                    self.builder.inst_results(call)[0]
+                };
                 for (i, &elem_id) in elems.iter().enumerate() {
                     let val = self.compile_expr(elem_id, &elem_ty)?.unwrap();
                     let widened = self.widen_to_i64(val, &elem_ty);
@@ -2265,11 +2475,38 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                             SHAPE_VECTOR,
                             if elems_are_ptrs { 1 } else { 0 },
                         );
-                        let func_id = self.runtime_fns["vec_append"];
-                        let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
-                        let call = self.builder.ins().call(func_ref, &[vec_ptr, widened, shape_val]);
-                        let new_ptr = self.builder.inst_results(call)[0];
-                        return Ok(Some(new_ptr));
+                        if let Some(arena_v) = self.arena_var {
+                            // Arena path: arena_vec_alloc + manual copy
+                            let old_len_id = self.runtime_fns["vec_len"];
+                            let old_len_ref = self.module.declare_func_in_func(old_len_id, self.builder.func);
+                            let call = self.builder.ins().call(old_len_ref, &[vec_ptr]);
+                            let old_len = self.builder.inst_results(call)[0];
+                            let one = self.builder.ins().iconst(types::I64, 1);
+                            let new_len = self.builder.ins().iadd(old_len, one);
+                            let arena_val = self.builder.use_var(arena_v);
+                            let alloc_id = self.runtime_fns["arena_vec_alloc"];
+                            let alloc_ref = self.module.declare_func_in_func(alloc_id, self.builder.func);
+                            let call = self.builder.ins().call(alloc_ref, &[arena_val, new_len]);
+                            let new_ptr = self.builder.inst_results(call)[0];
+                            // Copy old elements: memcpy(new+8, old+8, old_len*8)
+                            let eight = self.builder.ins().iconst(types::I64, 8);
+                            let src = self.builder.ins().iadd(vec_ptr, eight);
+                            let dst = self.builder.ins().iadd(new_ptr, eight);
+                            let byte_count = self.builder.ins().imul(old_len, eight);
+                            self.builder.call_memcpy(self.module.target_config(), dst, src, byte_count);
+                            // Store new element at new_ptr + (1+old_len)*8
+                            let offset_slots = self.builder.ins().iadd(old_len, one);
+                            let byte_off = self.builder.ins().imul(offset_slots, eight);
+                            let elem_addr = self.builder.ins().iadd(new_ptr, byte_off);
+                            self.builder.ins().store(MemFlags::trusted(), widened, elem_addr, 0);
+                            return Ok(Some(new_ptr));
+                        } else {
+                            let func_id = self.runtime_fns["vec_append"];
+                            let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                            let call = self.builder.ins().call(func_ref, &[vec_ptr, widened, shape_val]);
+                            let new_ptr = self.builder.inst_results(call)[0];
+                            return Ok(Some(new_ptr));
+                        }
                     }
                 }
                 _ => {}
@@ -3427,6 +3664,12 @@ fn register_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol("weir_vec_append", weir_vec_append as *const u8);
     builder.symbol("weir_shadow_push", weir_shadow_push as *const u8);
     builder.symbol("weir_shadow_pop", weir_shadow_pop as *const u8);
+    builder.symbol("weir_arena_create", weir_arena_create as *const u8);
+    builder.symbol("weir_arena_alloc", weir_arena_alloc as *const u8);
+    builder.symbol("weir_arena_vec_alloc", weir_arena_vec_alloc as *const u8);
+    builder.symbol("weir_arena_destroy", weir_arena_destroy as *const u8);
+    builder.symbol("weir_gc_suppress", weir_gc_suppress as *const u8);
+    builder.symbol("weir_gc_unsuppress", weir_gc_unsuppress as *const u8);
 }
 
 pub struct DevSession {
@@ -5240,5 +5483,275 @@ mod tests {
     (println (sum-vec v 0 0))))
 "#;
         oracle_test(source);
+    }
+
+    // ── Arena allocation tests ──────────────────────────────────────
+
+    #[test]
+    fn arena_vec_len() {
+        let source = r#"
+(defn main () : Unit
+  (with-arena a
+    (let ((v [1 2 3]))
+      (println (len v)))))
+"#;
+        let output = compile_run(source);
+        assert_eq!(output, "3\n");
+    }
+
+    #[test]
+    fn arena_vec_get() {
+        let source = r#"
+(defn main () : Unit
+  (with-arena a
+    (let ((v [10 20 30]))
+      (println (nth v 1)))))
+"#;
+        let output = compile_run(source);
+        assert_eq!(output, "20\n");
+    }
+
+    #[test]
+    fn arena_closure() {
+        let source = r#"
+(defn main () : Unit
+  (with-arena a
+    (let ((f (fn ((x : i64)) : i64 (+ x 1))))
+      (println (f 41)))))
+"#;
+        let output = compile_run(source);
+        assert_eq!(output, "42\n");
+    }
+
+    #[test]
+    fn arena_closure_captures() {
+        let source = r#"
+(defn main () : Unit
+  (with-arena a
+    (let ((y 10)
+          (f (fn ((x : i64)) : i64 (+ x y))))
+      (println (f 32)))))
+"#;
+        let output = compile_run(source);
+        assert_eq!(output, "42\n");
+    }
+
+    #[test]
+    fn arena_append() {
+        let source = r#"
+(defn main () : Unit
+  (with-arena a
+    (let ((v (append [1 2 3] 4)))
+      (println (len v))
+      (println (nth v 3)))))
+"#;
+        let output = compile_run(source);
+        assert_eq!(output, "4\n4\n");
+    }
+
+    #[test]
+    fn arena_returns_non_heap() {
+        // The with-arena block returns an i64 (non-heap), which is fine
+        let source = r#"
+(defn main () : Unit
+  (let ((result (with-arena a
+                  (let ((v [10 20 30]))
+                    (nth v 2)))))
+    (println result)))
+"#;
+        let output = compile_run(source);
+        assert_eq!(output, "30\n");
+    }
+
+    #[test]
+    fn arena_oracle_vec_operations() {
+        let source = r#"
+(defn main () : Unit
+  (with-arena a
+    (let ((v [1 2 3 4 5]))
+      (println (len v))
+      (println (nth v 0))
+      (println (nth v 4)))))
+"#;
+        oracle_test(source);
+    }
+
+    #[test]
+    fn arena_oracle_closure() {
+        let source = r#"
+(defn main () : Unit
+  (with-arena a
+    (let ((f (fn ((x : i64)) : i64 (* x x))))
+      (println (f 7)))))
+"#;
+        oracle_test(source);
+    }
+
+    #[test]
+    fn arena_oracle_mixed() {
+        let source = r#"
+(defn main () : Unit
+  (with-arena a
+    (let ((v [10 20 30])
+          (f (fn ((x : i64)) : i64 (+ x (nth v 0)))))
+      (println (f 5))
+      (println (len v)))))
+"#;
+        oracle_test(source);
+    }
+
+    #[test]
+    fn arena_nested() {
+        // Nested arenas: inner arena block returns a non-heap value
+        let source = r#"
+(defn main () : Unit
+  (with-arena outer
+    (let ((v [10 20 30]))
+      (let ((sum (with-arena inner
+                   (let ((w [1 2 3]))
+                     (+ (nth w 0) (nth w 1))))))
+        (println sum)
+        (println (nth v 2))))))
+"#;
+        let output = compile_run(source);
+        assert_eq!(output, "3\n30\n");
+    }
+
+    #[test]
+    fn arena_oracle_nested() {
+        let source = r#"
+(defn main () : Unit
+  (with-arena outer
+    (let ((v [10 20 30]))
+      (let ((sum (with-arena inner
+                   (let ((w [1 2 3]))
+                     (+ (nth w 0) (nth w 1))))))
+        (println sum)
+        (println (nth v 2))))))
+"#;
+        oracle_test(source);
+    }
+
+    #[test]
+    fn arena_gc_object_referenced_from_arena_block() {
+        // GC-allocated vector referenced from inside arena block.
+        // The GC is suppressed during the arena, so v must survive.
+        let source = r#"
+(defn main () : Unit
+  (let ((v [100 200 300]))
+    (with-arena a
+      (let ((w [1 2 3]))
+        (println (nth v 1))
+        (println (nth w 2))))))
+"#;
+        let output = compile_run(source);
+        assert_eq!(output, "200\n3\n");
+    }
+
+    #[test]
+    fn arena_oracle_gc_object_in_arena() {
+        let source = r#"
+(defn main () : Unit
+  (let ((v [100 200 300]))
+    (with-arena a
+      (let ((w [1 2 3]))
+        (println (nth v 1))
+        (println (nth w 2))))))
+"#;
+        oracle_test(source);
+    }
+
+    #[test]
+    fn arena_string_operations() {
+        // Strings inside arena blocks use system allocation (not arena),
+        // but should still work correctly.
+        let source = r#"
+(defn main () : Unit
+  (with-arena a
+    (println (str 42))
+    (println (str true))))
+"#;
+        let output = compile_run(source);
+        assert_eq!(output, "42\ntrue\n");
+    }
+
+    #[test]
+    fn arena_oracle_strings() {
+        let source = r#"
+(defn main () : Unit
+  (with-arena a
+    (println (str 42))
+    (println (str true))))
+"#;
+        oracle_test(source);
+    }
+
+    #[test]
+    fn arena_stress_many_vectors() {
+        // Allocate enough vectors to force chunk growth (64 KB initial)
+        let source = r#"
+(defn make-vecs ((n : i64) (acc : i64)) : i64
+  (if (<= n 0)
+    acc
+    (with-arena a
+      (let ((v [1 2 3 4 5 6 7 8]))
+        (make-vecs (- n 1) (+ acc (nth v 7)))))))
+
+(defn main () : Unit
+  (println (make-vecs 100 0)))
+"#;
+        let output = compile_run(source);
+        assert_eq!(output, "800\n");
+    }
+
+    #[test]
+    fn arena_closure_calling_allocating_fn() {
+        // Closure in arena calls a function that allocates
+        let source = r#"
+(defn make-pair ((x : i64)) : (Vector i64) [x (+ x 1)])
+
+(defn main () : Unit
+  (with-arena a
+    (let ((f (fn ((x : i64)) : i64
+               (let ((p (make-pair x)))
+                 (nth p 1)))))
+      (println (f 10)))))
+"#;
+        let output = compile_run(source);
+        assert_eq!(output, "11\n");
+    }
+
+    #[test]
+    fn arena_aot_build_and_run() {
+        let source = r#"
+(defn main () : Unit
+  (with-arena a
+    (let ((v [10 20 30])
+          (f (fn ((x : i64)) : i64 (* x 2))))
+      (println (f (nth v 1)))
+      (println (len v)))))
+"#;
+        let expanded = expand(source);
+        let (module, parse_errors) = weir_parser::parse(&expanded);
+        assert!(parse_errors.is_empty());
+        let type_info = weir_typeck::check(&module);
+        assert!(type_info.errors.is_empty());
+
+        let jit_output = compile_and_run(&module, &type_info).expect("JIT failed");
+        let interp_output = weir_interp::interpret(&module).expect("interp failed");
+
+        let tmp_dir = std::env::temp_dir();
+        let binary_path = tmp_dir.join("weir_test_aot_arena");
+        build_executable(&module, &type_info, &binary_path).expect("build_executable failed");
+        let output = std::process::Command::new(&binary_path)
+            .output()
+            .expect("failed to run AOT binary");
+        let _ = std::fs::remove_file(&binary_path);
+
+        assert!(output.status.success(), "AOT binary exited with error");
+        let aot_output = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(jit_output, "40\n3\n");
+        assert_eq!(jit_output, interp_output, "JIT and interpreter disagree");
+        assert_eq!(jit_output, aot_output, "JIT and AOT disagree");
     }
 }

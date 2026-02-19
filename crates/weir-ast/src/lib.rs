@@ -256,6 +256,8 @@ pub enum ExprKind {
 
     /// Unsafe block: `(unsafe exprs...)`
     Unsafe { body: Vec<ExprId> },
+    /// Arena block: `(with-arena name body...)`
+    WithArena { name: SmolStr, body: Vec<ExprId> },
     /// Try/question operator: `expr?`
     Try(ExprId),
 }
@@ -809,6 +811,15 @@ impl<'a> PrettyPrinter<'a> {
 
             ExprKind::Unsafe { body } => {
                 self.buf.push_str("(unsafe");
+                for &e in body {
+                    self.buf.push(' ');
+                    self.print_expr(e);
+                }
+                self.buf.push(')');
+            }
+            ExprKind::WithArena { name, body } => {
+                self.buf.push_str("(with-arena ");
+                self.buf.push_str(name);
                 for &e in body {
                     self.buf.push(' ');
                     self.print_expr(e);

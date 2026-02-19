@@ -480,6 +480,13 @@ struct TypeChecker<'a> {
 
     /// Return type of the function currently being checked (for `?` operator).
     current_fn_return_type: Option<Ty>,
+
+    /// Current arena nesting depth (0 = not inside with-arena)
+    arena_depth: u32,
+    /// Per-variable arena provenance depth (0 = GC/stack, >0 = arena), scope-aware
+    var_provenance: Vec<HashMap<SmolStr, u32>>,
+    /// Per-expression arena provenance depth
+    expr_provenance: ArenaMap<ExprId, u32>,
 }
 
 impl<'a> TypeChecker<'a> {
@@ -503,6 +510,9 @@ impl<'a> TypeChecker<'a> {
             method_resolutions: HashMap::new(),
             external_names: externals.clone(),
             current_fn_return_type: None,
+            arena_depth: 0,
+            var_provenance: vec![HashMap::new()],
+            expr_provenance: ArenaMap::default(),
         }
     }
 
@@ -798,10 +808,12 @@ impl<'a> TypeChecker<'a> {
 
     fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
+        self.var_provenance.push(HashMap::new());
     }
 
     fn pop_scope(&mut self) {
         self.scopes.pop();
+        self.var_provenance.pop();
     }
 
     fn define_var(&mut self, name: SmolStr, ty: Ty) {
@@ -815,6 +827,15 @@ impl<'a> TypeChecker<'a> {
             }
         }
         None
+    }
+
+    fn lookup_provenance(&self, name: &str) -> u32 {
+        for scope in self.var_provenance.iter().rev() {
+            if let Some(&prov) = scope.get(name) {
+                return prov;
+            }
+        }
+        0
     }
 
     fn error(&mut self, message: impl Into<String>, span: Span) {
@@ -1860,11 +1881,73 @@ impl<'a> TypeChecker<'a> {
         ty
     }
 
+    // ── Arena provenance ───────────────────────────────────────
+
+    fn is_heap_type(&self, ty: &Ty) -> bool {
+        matches!(ty, Ty::Str | Ty::Vector(_) | Ty::Fn(_, _) | Ty::Map(_, _) | Ty::Con(_, _))
+    }
+
+    fn compute_provenance(&self, expr_id: ExprId, ty: &Ty) -> u32 {
+        let expr = &self.module.exprs[expr_id];
+        match &expr.kind {
+            // Heap allocations inside arena get current arena depth
+            ExprKind::VectorLit(_) | ExprKind::Lambda { .. } | ExprKind::MapLit(_) => {
+                self.arena_depth
+            }
+            // Variable reference inherits provenance from the variable
+            ExprKind::Var(name) => self.lookup_provenance(name),
+            // Call returning a heap type inside arena gets arena provenance (conservative)
+            ExprKind::Call { .. } => {
+                if self.is_heap_type(ty) {
+                    self.arena_depth
+                } else {
+                    0
+                }
+            }
+            // Let inherits provenance from body's last expression
+            ExprKind::Let { body, .. } => {
+                if let Some(&last) = body.last() {
+                    self.expr_provenance.get(last).copied().unwrap_or(0)
+                } else {
+                    0
+                }
+            }
+            // Do inherits provenance from body's last expression
+            ExprKind::Do { body } | ExprKind::Unsafe { body } => {
+                if let Some(&last) = body.last() {
+                    self.expr_provenance.get(last).copied().unwrap_or(0)
+                } else {
+                    0
+                }
+            }
+            // If/Cond — take the max provenance from branches
+            ExprKind::If { then_branch, else_branch, .. } => {
+                let then_prov = self.expr_provenance.get(*then_branch).copied().unwrap_or(0);
+                let else_prov = else_branch
+                    .and_then(|e| self.expr_provenance.get(e).copied())
+                    .unwrap_or(0);
+                then_prov.max(else_prov)
+            }
+            // with-arena block itself returns provenance 0 (verified by escape check)
+            ExprKind::WithArena { .. } => 0,
+            _ => 0,
+        }
+    }
+
     // ── Expression checking ──────────────────────────────────────
 
     fn check_expr(&mut self, expr_id: ExprId) -> Ty {
         let ty = self.check_expr_inner(expr_id);
         self.expr_types.insert(expr_id, ty.clone());
+
+        // Compute arena provenance for this expression
+        if self.arena_depth > 0 {
+            let prov = self.compute_provenance(expr_id, &ty);
+            if prov > 0 {
+                self.expr_provenance.insert(expr_id, prov);
+            }
+        }
+
         ty
     }
 
@@ -1913,6 +1996,13 @@ impl<'a> TypeChecker<'a> {
                         self.define_var(b.name.clone(), ann_ty);
                     } else {
                         self.define_var(b.name.clone(), val_ty);
+                    }
+                    // Track arena provenance for the binding
+                    if self.arena_depth > 0 {
+                        let prov = self.expr_provenance.get(b.value).copied().unwrap_or(0);
+                        if prov > 0 {
+                            self.var_provenance.last_mut().unwrap().insert(b.name.clone(), prov);
+                        }
                     }
                 }
                 let result = self.check_body(body);
@@ -2040,6 +2130,24 @@ impl<'a> TypeChecker<'a> {
                 let place_ty = self.check_expr(*place);
                 let val_ty = self.check_expr(*value);
                 self.unify(&place_ty, &val_ty, span);
+
+                // Arena escape check: can't assign arena value to outer variable
+                if self.arena_depth > 0 {
+                    let val_prov = self.expr_provenance.get(*value).copied().unwrap_or(0);
+                    if val_prov > 0 {
+                        let place_expr = &self.module.exprs[*place];
+                        if let ExprKind::Var(name) = &place_expr.kind {
+                            let target_prov = self.lookup_provenance(name);
+                            if target_prov < val_prov {
+                                self.error(
+                                    "cannot assign arena-allocated value to outer variable".to_string(),
+                                    span,
+                                );
+                            }
+                        }
+                    }
+                }
+
                 Ty::Unit
             }
 
@@ -2082,6 +2190,25 @@ impl<'a> TypeChecker<'a> {
             }
 
             ExprKind::Unsafe { body } => self.check_body(body),
+
+            ExprKind::WithArena { name: _, body } => {
+                self.arena_depth += 1;
+                let body_ty = self.check_body(body);
+
+                // Check that the result type doesn't have arena provenance
+                if let Some(&last_id) = body.last() {
+                    let prov = self.expr_provenance.get(last_id).copied().unwrap_or(0);
+                    if prov >= self.arena_depth {
+                        self.error(
+                            "arena-allocated value cannot escape with-arena block".to_string(),
+                            span,
+                        );
+                    }
+                }
+
+                self.arena_depth -= 1;
+                body_ty
+            }
 
             ExprKind::Try(inner) => {
                 let inner_ty = self.check_expr(*inner);
@@ -3660,6 +3787,102 @@ mod tests {
                (defn compare ((a : Priority) (b : Priority)) : Ordering
                  LT))
              (defn main () : Bool (< Low High))",
+        );
+    }
+
+    // ── Arena escape analysis tests ─────────────────────────────
+
+    #[test]
+    fn arena_escape_vector() {
+        let msg = check_err(
+            "(defn main () (with-arena a [1 2 3]))",
+        );
+        assert!(msg.contains("arena-allocated value cannot escape"), "got: {}", msg);
+    }
+
+    #[test]
+    fn arena_escape_lambda() {
+        let msg = check_err(
+            "(defn main () (with-arena a (fn (x) x)))",
+        );
+        assert!(msg.contains("arena-allocated value cannot escape"), "got: {}", msg);
+    }
+
+    #[test]
+    fn arena_ok_returns_non_heap() {
+        check_ok(
+            "(defn main ()
+               (with-arena a
+                 (let ((v [1 2 3]))
+                   (len v))))",
+        );
+    }
+
+    #[test]
+    fn arena_ok_returns_pre_existing_value() {
+        check_ok(
+            "(defn main ()
+               (let ((x 42))
+                 (with-arena a x)))",
+        );
+    }
+
+    #[test]
+    fn arena_escape_via_set() {
+        let msg = check_err(
+            "(defn main ()
+               (let ((mut x [1]))
+                 (with-arena a
+                   (set! x [2 3]))))",
+        );
+        assert!(msg.contains("cannot assign arena-allocated value to outer variable"), "got: {}", msg);
+    }
+
+    #[test]
+    fn arena_nested_inner_escape() {
+        let msg = check_err(
+            "(defn main ()
+               (with-arena a
+                 (let ((v [1 2 3]))
+                   (with-arena b [4 5]))))",
+        );
+        assert!(msg.contains("arena-allocated value cannot escape"), "got: {}", msg);
+    }
+
+    #[test]
+    fn arena_ok_returns_pre_existing_gc_vector() {
+        check_ok(
+            "(defn main ()
+               (let ((v [1 2]))
+                 (with-arena a v)))",
+        );
+    }
+
+    #[test]
+    fn arena_provenance_does_not_leak_across_scopes() {
+        // After a let scope containing arena-provenance `x` pops,
+        // a new `x` in the outer scope should not inherit stale provenance.
+        check_ok(
+            "(defn main () : i64
+               (with-arena a
+                 (let ((x [1 2 3]))
+                   (len x))
+                 (let ((x 42))
+                   x)))",
+        );
+    }
+
+    #[test]
+    fn arena_shadowed_variable_independent_provenance() {
+        // Inner `v` has arena provenance, but outer `v` (GC) should be
+        // independently tracked and safe to return from the arena block.
+        check_ok(
+            "(defn main ()
+               (let ((v [1 2]))
+                 (with-arena a
+                   (let ((v [3 4]))
+                     (len v))
+                   v)))",
         );
     }
 

@@ -274,12 +274,15 @@ Items deferred from earlier phases that don't depend on the runtime (Phase 9) or
   - Collection triggered on allocation when byte threshold exceeded
   - Full AOT C runtime with matching GC implementation
   - 524 tests pass (519 original + 5 new GC stress tests)
-- [ ] **Arenas** (deferred to Phase 9b):
-  - `with-arena` block support
-  - Bump allocation via `bumpalo`
-  - Compile-time escape analysis in type checker
-  - Arena-scoped values cannot escape block, be stored in GC heap, or cross threads
-- [ ] Verify arenas: arenas free on block exit, escape analysis catches violations
+- [x] **Arenas** (Phase 9b):
+  - `with-arena` block support — AST, parser, typechecker, codegen, interpreter, LSP
+  - Bump allocation with linked chunks (64 KB initial, doubling) — custom arena allocator in `weir-runtime`
+  - Compile-time escape analysis in type checker — arena provenance tracking per variable/expression
+  - Arena-scoped values cannot escape block or be assigned to outer variables via `set!`
+  - GC suppression during arena blocks — no collection while arena active
+  - All heap allocations (closures, vectors, append) redirected to arena inside `with-arena`
+  - Full AOT C runtime support for arenas
+- [x] Verify arenas: arenas free on block exit, escape analysis catches violations, 9 codegen integration tests + 7 typechecker tests + 6 runtime unit tests
 
 ### Phase 10: Full cascade + concurrency
 - [ ] **Dependency tracker**:

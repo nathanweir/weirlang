@@ -711,6 +711,8 @@ impl<'a> Interpreter<'a> {
 
             ExprKind::Unsafe { body } => self.eval_body(env, body),
 
+            ExprKind::WithArena { body, .. } => self.eval_body(env, body),
+
             ExprKind::Try(inner) => {
                 let value = self.eval_expr(env, *inner)?;
                 match &value {

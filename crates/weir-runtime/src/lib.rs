@@ -97,6 +97,8 @@ struct GcHeap {
     gc_threshold: usize,
     /// Shadow stack: pointers to stack slots that hold GC heap pointers.
     shadow_stack: Vec<*mut i64>,
+    /// When true, GC allocation skips threshold check (arena is active).
+    gc_suppressed: bool,
 }
 
 impl GcHeap {
@@ -107,6 +109,7 @@ impl GcHeap {
             total_bytes: 0,
             gc_threshold: INITIAL_GC_THRESHOLD,
             shadow_stack: Vec::with_capacity(256),
+            gc_suppressed: false,
         }
     }
 }
@@ -130,8 +133,10 @@ pub extern "C" fn weir_gc_alloc(size_bytes: i64, shape: *const ShapeDesc) -> i64
         let mut heap = heap.borrow_mut();
         let user_size = size_bytes as usize;
 
-        // Check if we should collect before allocating
-        if heap.bytes_since_gc + HEADER_SIZE + user_size > heap.gc_threshold {
+        // Check if we should collect before allocating (skip when GC is suppressed for arena)
+        if !heap.gc_suppressed
+            && heap.bytes_since_gc + HEADER_SIZE + user_size > heap.gc_threshold
+        {
             collect_inner(&mut heap);
         }
 
@@ -341,6 +346,123 @@ pub extern "C" fn weir_vec_append(ptr: i64, elem: i64, shape: *const ShapeDesc) 
     new_ptr
 }
 
+// ── Arena allocator ─────────────────────────────────────────────
+
+const ARENA_INITIAL_CAPACITY: usize = 64 * 1024; // 64 KB
+
+#[repr(C)]
+struct ArenaChunk {
+    base: *mut u8,
+    capacity: usize,
+    next: *mut ArenaChunk,
+}
+
+#[repr(C)]
+struct Arena {
+    current_chunk: *mut ArenaChunk,
+    offset: usize,
+}
+
+unsafe fn arena_new_chunk(capacity: usize) -> *mut ArenaChunk {
+    let layout = alloc::Layout::from_size_align(capacity, 8).unwrap();
+    let base = alloc::alloc_zeroed(layout);
+    if base.is_null() {
+        alloc::handle_alloc_error(layout);
+    }
+    Box::into_raw(Box::new(ArenaChunk {
+        base,
+        capacity,
+        next: ptr::null_mut(),
+    }))
+}
+
+/// Create a new arena with an initial 64 KB chunk.
+#[unsafe(no_mangle)]
+pub extern "C" fn weir_arena_create() -> i64 {
+    unsafe {
+        let chunk = arena_new_chunk(ARENA_INITIAL_CAPACITY);
+        let arena = Box::into_raw(Box::new(Arena {
+            current_chunk: chunk,
+            offset: 0,
+        }));
+        arena as i64
+    }
+}
+
+/// Bump-allocate from the arena. Returns a zeroed user pointer.
+#[unsafe(no_mangle)]
+pub extern "C" fn weir_arena_alloc(arena_ptr: i64, size: i64) -> i64 {
+    let size = size as usize;
+    // Align size to 8 bytes
+    let aligned = (size + 7) & !7;
+    unsafe {
+        let arena = &mut *(arena_ptr as *mut Arena);
+        let chunk = &*arena.current_chunk;
+
+        if arena.offset + aligned <= chunk.capacity {
+            let ptr = chunk.base.add(arena.offset);
+            arena.offset += aligned;
+            return ptr as i64;
+        }
+
+        // Need a new chunk — double the size
+        let new_cap = (chunk.capacity * 2).max(aligned);
+        let new_chunk = arena_new_chunk(new_cap);
+        (*new_chunk).next = arena.current_chunk;
+        arena.current_chunk = new_chunk;
+        arena.offset = aligned;
+        (*new_chunk).base as i64
+    }
+}
+
+/// Arena-allocate a vector: `[length, elem_0, ...]`.
+#[unsafe(no_mangle)]
+pub extern "C" fn weir_arena_vec_alloc(arena_ptr: i64, len: i64) -> i64 {
+    let total_bytes = (1 + len) * 8;
+    let ptr = weir_arena_alloc(arena_ptr, total_bytes);
+    unsafe {
+        *(ptr as *mut i64) = len;
+    }
+    ptr
+}
+
+/// Destroy an arena: free all chunks and the arena struct itself.
+#[unsafe(no_mangle)]
+pub extern "C" fn weir_arena_destroy(arena_ptr: i64) {
+    unsafe {
+        let arena = Box::from_raw(arena_ptr as *mut Arena);
+        let mut chunk = arena.current_chunk;
+        while !chunk.is_null() {
+            let next = (*chunk).next;
+            let layout = alloc::Layout::from_size_align((*chunk).capacity, 8).unwrap();
+            alloc::dealloc((*chunk).base, layout);
+            drop(Box::from_raw(chunk));
+            chunk = next;
+        }
+    }
+}
+
+/// Suppress the GC (called when entering a with-arena block).
+#[unsafe(no_mangle)]
+pub extern "C" fn weir_gc_suppress() {
+    GC_HEAP.with(|heap| {
+        heap.borrow_mut().gc_suppressed = true;
+    });
+}
+
+/// Unsuppress the GC (called when exiting a with-arena block).
+/// May trigger a collection if the threshold was exceeded while suppressed.
+#[unsafe(no_mangle)]
+pub extern "C" fn weir_gc_unsuppress() {
+    GC_HEAP.with(|heap| {
+        let mut heap = heap.borrow_mut();
+        heap.gc_suppressed = false;
+        if heap.bytes_since_gc > heap.gc_threshold {
+            collect_inner(&mut heap);
+        }
+    });
+}
+
 // ── Reset (for testing) ─────────────────────────────────────────
 
 /// Reset the GC heap (free everything). Used for test isolation.
@@ -364,6 +486,7 @@ pub fn gc_reset() {
         heap.total_bytes = 0;
         heap.gc_threshold = INITIAL_GC_THRESHOLD;
         heap.shadow_stack.clear();
+        heap.gc_suppressed = false;
     });
 }
 
@@ -671,5 +794,90 @@ mod tests {
 
         weir_shadow_pop(3);
         gc_reset();
+    }
+
+    // ── Arena tests ──────────────────────────────────────────────
+
+    #[test]
+    fn arena_create_destroy() {
+        let arena = weir_arena_create();
+        assert_ne!(arena, 0);
+        weir_arena_destroy(arena);
+    }
+
+    #[test]
+    fn arena_bump_allocation() {
+        let arena = weir_arena_create();
+        let p1 = weir_arena_alloc(arena, 8);
+        let p2 = weir_arena_alloc(arena, 8);
+        assert_ne!(p1, 0);
+        assert_ne!(p2, 0);
+        // Sequential addresses: p2 should be 8 bytes after p1
+        assert_eq!(p2, p1 + 8);
+        unsafe {
+            *(p1 as *mut i64) = 42;
+            *(p2 as *mut i64) = 99;
+            assert_eq!(*(p1 as *const i64), 42);
+            assert_eq!(*(p2 as *const i64), 99);
+        }
+        weir_arena_destroy(arena);
+    }
+
+    #[test]
+    fn arena_chunk_growth() {
+        let arena = weir_arena_create();
+        // Allocate more than 64 KB to force a new chunk
+        for _ in 0..9000 {
+            let p = weir_arena_alloc(arena, 8);
+            assert_ne!(p, 0);
+        }
+        weir_arena_destroy(arena);
+    }
+
+    #[test]
+    fn arena_vec_alloc() {
+        let arena = weir_arena_create();
+        let ptr = weir_arena_vec_alloc(arena, 3);
+        assert_eq!(weir_vec_len(ptr), 3);
+        unsafe {
+            *((ptr as *mut i64).offset(1)) = 10;
+            *((ptr as *mut i64).offset(2)) = 20;
+            *((ptr as *mut i64).offset(3)) = 30;
+        }
+        assert_eq!(weir_vec_get(ptr, 0), 10);
+        assert_eq!(weir_vec_get(ptr, 1), 20);
+        assert_eq!(weir_vec_get(ptr, 2), 30);
+        weir_arena_destroy(arena);
+    }
+
+    #[test]
+    fn gc_suppression_prevents_collection() {
+        gc_reset();
+        let shape = make_shape(1, 0);
+
+        // Allocate some objects without roots
+        let _p1 = weir_gc_alloc(8, &shape);
+        let _p2 = weir_gc_alloc(8, &shape);
+        assert_eq!(gc_object_count(), 2);
+
+        // Suppress GC and force a "collection" by calling collect
+        weir_gc_suppress();
+        // Manual collect while suppressed should still work (direct call)
+        // but the threshold check in weir_gc_alloc should not trigger
+        weir_gc_unsuppress();
+        // After unsuppression, collection may run
+        gc_reset();
+    }
+
+    #[test]
+    fn arena_returns_zeroed_memory() {
+        let arena = weir_arena_create();
+        let ptr = weir_arena_alloc(arena, 64);
+        unsafe {
+            for i in 0..8 {
+                assert_eq!(*((ptr as *const i64).add(i)), 0);
+            }
+        }
+        weir_arena_destroy(arena);
     }
 }

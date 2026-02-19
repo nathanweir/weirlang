@@ -1,0 +1,9 @@
+---
+source: crates/weir-parser/src/lib.rs
+expression: result
+---
+(defn main
+  params:
+  body:
+    (with-arena foo (+ 1 2))
+)

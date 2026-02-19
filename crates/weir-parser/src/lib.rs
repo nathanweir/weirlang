@@ -857,6 +857,9 @@ impl Parser {
         } else if self.check_symbol("unsafe") {
             self.advance();
             self.parse_unsafe_body(start)
+        } else if self.check_symbol("with-arena") {
+            self.advance();
+            self.parse_with_arena_body(start)
         } else {
             self.parse_call_body(start)
         };
@@ -1079,6 +1082,15 @@ impl Parser {
             body.push(self.parse_expr()?);
         }
         Some(ExprKind::Unsafe { body })
+    }
+
+    fn parse_with_arena_body(&mut self, _start: Span) -> Option<ExprKind> {
+        let (name, _) = self.expect_symbol()?;
+        let mut body = Vec::new();
+        while !self.at_end() && !self.check(&Token::RParen) {
+            body.push(self.parse_expr()?);
+        }
+        Some(ExprKind::WithArena { name, body })
     }
 
     fn parse_call_body(&mut self, _start: Span) -> Option<ExprKind> {
@@ -1593,6 +1605,12 @@ mod tests {
     #[test]
     fn test_error_invalid_character() {
         let result = parse_and_print("(defn main () (+ 1 \\2))");
+        insta::assert_snapshot!(result);
+    }
+
+    #[test]
+    fn test_parse_with_arena() {
+        let result = parse_and_print("(defn main () (with-arena foo (+ 1 2)))");
         insta::assert_snapshot!(result);
     }
 

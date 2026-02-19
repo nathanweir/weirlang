@@ -336,6 +336,12 @@ impl<'a> TokenCollector<'a> {
                     self.collect_expr(e);
                 }
             }
+            ExprKind::WithArena { body, .. } => {
+                self.push_keyword_at_form_start(expr.span, "with-arena");
+                for &e in body {
+                    self.collect_expr(e);
+                }
+            }
             ExprKind::SetBang { place, value } => {
                 self.push_keyword_at_form_start(expr.span, "set!");
                 self.collect_expr(*place);

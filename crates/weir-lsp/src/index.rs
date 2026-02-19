@@ -478,7 +478,7 @@ impl<'a> IndexBuilder<'a> {
                     self.walk_expr(e, scope);
                 }
             }
-            ExprKind::Do { body } | ExprKind::Unsafe { body } => {
+            ExprKind::Do { body } | ExprKind::Unsafe { body } | ExprKind::WithArena { body, .. } => {
                 for &e in body {
                     self.walk_expr(e, scope);
                 }
