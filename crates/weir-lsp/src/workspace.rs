@@ -6,6 +6,7 @@ use weir_ast::Item;
 use weir_lexer::Span;
 
 use crate::document::LineIndex;
+use crate::expand;
 use crate::index::SymbolKind;
 
 /// A top-level symbol discovered from a workspace file.
@@ -112,37 +113,12 @@ impl WorkspaceIndex {
     }
 }
 
-/// Check whether macro expansion actually changed the token stream.
-fn macros_changed_source(original: &str, expanded: &str) -> bool {
-    let (orig_tokens, _) = weir_lexer::lex(original);
-    let (exp_tokens, _) = weir_lexer::lex(expanded);
-
-    if orig_tokens.len() != exp_tokens.len() {
-        return true;
-    }
-
-    orig_tokens
-        .iter()
-        .zip(exp_tokens.iter())
-        .any(|((t1, _), (t2, _))| t1 != t2)
-}
-
 /// Extract top-level symbols from source text.
 /// Returns symbols with spans that match the returned LineIndex.
 fn extract_symbols(uri: &Url, text: &str) -> (Vec<WorkspaceSymbol>, LineIndex) {
-    let expand_result = weir_macros::expand(text);
-
-    // Use the same logic as diagnostics.rs: parse the original source when
-    // macros didn't change anything, so that spans match the original file.
-    let (parse_source, line_index) =
-        if expand_result.errors.is_empty() && macros_changed_source(text, &expand_result.source) {
-            let li = LineIndex::new(&expand_result.source);
-            (expand_result.source, li)
-        } else {
-            (text.to_string(), LineIndex::new(text))
-        };
-
-    let (module, _errors) = weir_parser::parse(&parse_source);
+    let expanded = expand::expand_source(text);
+    let (module, _errors) = weir_parser::parse(&expanded.source);
+    let line_index = expanded.line_index;
 
     let mut symbols = Vec::new();
 

@@ -1,3 +1,10 @@
+mod jit_helpers;
+mod aot;
+mod dev_session;
+
+pub use aot::{compile_to_object, build_executable};
+pub use dev_session::{DevSession, ReloadResult};
+
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types;
 use cranelift_codegen::ir::MemFlags;
@@ -8,14 +15,14 @@ use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
-use cranelift_object::{ObjectBuilder, ObjectModule};
 use smol_str::SmolStr;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::path::Path;
-use std::sync::atomic::{AtomicPtr, Ordering};
 use weir_ast::*;
+use weir_runtime::{SHAPE_FIXED, SHAPE_VECTOR};
 use weir_typeck::{Ty, TyVarId, TypeCheckResult};
+
+use jit_helpers::{output_reset, output_take};
 
 // ── Error ────────────────────────────────────────────────────────
 
@@ -40,425 +47,7 @@ impl fmt::Display for CodegenError {
 
 impl std::error::Error for CodegenError {}
 
-// ── Runtime print helpers (JIT in-process) ───────────────────────
-//
-// These are extern "C" functions that JIT-compiled code calls to print.
-// They write to a thread-local String buffer for testability.
-
-std::thread_local! {
-    static OUTPUT_BUF: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
-}
-
-fn output_reset() {
-    OUTPUT_BUF.with(|buf| buf.borrow_mut().clear());
-}
-
-fn output_take() -> String {
-    OUTPUT_BUF.with(|buf| buf.borrow_mut().split_off(0))
-}
-
-extern "C" fn weir_print_i64(val: i64) {
-    OUTPUT_BUF.with(|buf| {
-        use std::fmt::Write;
-        write!(buf.borrow_mut(), "{}", val).unwrap();
-    });
-}
-
-extern "C" fn weir_print_f64(val: f64) {
-    OUTPUT_BUF.with(|buf| {
-        use std::fmt::Write;
-        if val.fract() == 0.0 {
-            write!(buf.borrow_mut(), "{:.1}", val).unwrap();
-        } else {
-            write!(buf.borrow_mut(), "{}", val).unwrap();
-        }
-    });
-}
-
-extern "C" fn weir_print_bool(val: i8) {
-    OUTPUT_BUF.with(|buf| {
-        use std::fmt::Write;
-        write!(
-            buf.borrow_mut(),
-            "{}",
-            if val != 0 { "true" } else { "false" }
-        )
-        .unwrap();
-    });
-}
-
-extern "C" fn weir_print_unit() {
-    OUTPUT_BUF.with(|buf| {
-        use std::fmt::Write;
-        write!(buf.borrow_mut(), "()").unwrap();
-    });
-}
-
-extern "C" fn weir_print_newline() {
-    OUTPUT_BUF.with(|buf| buf.borrow_mut().push('\n'));
-}
-
-extern "C" fn weir_sleep_ms(ms: i64) {
-    std::thread::sleep(std::time::Duration::from_millis(ms as u64));
-}
-
-extern "C" fn weir_print_str(ptr: i64) {
-    let c_str = unsafe { std::ffi::CStr::from_ptr(ptr as *const std::ffi::c_char) };
-    let s = c_str.to_str().unwrap_or("<invalid utf8>");
-    OUTPUT_BUF.with(|buf| buf.borrow_mut().push_str(s));
-}
-
-extern "C" fn weir_i64_to_str(val: i64) -> i64 {
-    let s = format!("{}", val);
-    let c_string = std::ffi::CString::new(s).unwrap();
-    c_string.into_raw() as i64
-}
-
-extern "C" fn weir_f64_to_str(val: f64) -> i64 {
-    let s = if val.fract() == 0.0 {
-        format!("{:.1}", val)
-    } else {
-        format!("{}", val)
-    };
-    let c_string = std::ffi::CString::new(s).unwrap();
-    c_string.into_raw() as i64
-}
-
-extern "C" fn weir_bool_to_str(val: i8) -> i64 {
-    let s = if val != 0 { "true" } else { "false" };
-    let c_string = std::ffi::CString::new(s).unwrap();
-    c_string.into_raw() as i64
-}
-
-extern "C" fn weir_str_concat(a: i64, b: i64) -> i64 {
-    let a_str = unsafe { std::ffi::CStr::from_ptr(a as *const _) }
-        .to_str()
-        .unwrap_or("");
-    let b_str = unsafe { std::ffi::CStr::from_ptr(b as *const _) }
-        .to_str()
-        .unwrap_or("");
-    let combined = format!("{}{}", a_str, b_str);
-    std::ffi::CString::new(combined).unwrap().into_raw() as i64
-}
-
-extern "C" fn weir_str_eq(a: i64, b: i64) -> i8 {
-    let a_str = unsafe { std::ffi::CStr::from_ptr(a as *const _) };
-    let b_str = unsafe { std::ffi::CStr::from_ptr(b as *const _) };
-    if a_str == b_str { 1 } else { 0 }
-}
-
-extern "C" fn weir_str_cmp(a: i64, b: i64) -> i64 {
-    let a_str = unsafe { std::ffi::CStr::from_ptr(a as *const _) };
-    let b_str = unsafe { std::ffi::CStr::from_ptr(b as *const _) };
-    match a_str.cmp(b_str) {
-        std::cmp::Ordering::Less => -1,
-        std::cmp::Ordering::Equal => 0,
-        std::cmp::Ordering::Greater => 1,
-    }
-}
-
-// Allocation and vector operations are provided by weir-runtime (GC-managed).
-// The following re-exports make them available for JIT symbol registration.
-use weir_runtime::{
-    weir_arena_alloc, weir_arena_create, weir_arena_destroy, weir_arena_vec_alloc,
-    weir_atom_cas, weir_atom_create, weir_atom_deref, weir_channel_create, weir_channel_recv,
-    weir_channel_send, weir_gc_alloc, weir_gc_collect, weir_gc_suppress, weir_gc_unsuppress,
-    weir_gc_vec_alloc, weir_par_for_each, weir_par_map, weir_shadow_pop, weir_shadow_push,
-    weir_thread_join, weir_thread_spawn, weir_vec_append, weir_vec_get, weir_vec_len,
-    SHAPE_FIXED, SHAPE_VECTOR,
-};
-
-// ── C runtime for AOT binaries ──────────────────────────────────
-
-const AOT_RUNTIME_C: &str = r#"
-#include <stdio.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
-
-extern void weir_main(void);
-
-void weir_print_i64(int64_t val) { printf("%lld", (long long)val); }
-void weir_print_f64(double val) {
-    if (val == (double)(long long)val) printf("%.1f", val);
-    else printf("%g", val);
-}
-void weir_print_bool(int8_t val) { printf("%s", val ? "true" : "false"); }
-void weir_print_unit(void) { printf("()"); }
-void weir_print_newline(void) { printf("\n"); }
-void weir_print_str(int64_t ptr) { printf("%s", (const char*)ptr); }
-
-int64_t weir_i64_to_str(int64_t val) {
-    char buf[32]; snprintf(buf, sizeof(buf), "%lld", (long long)val);
-    char *s = strdup(buf); return (int64_t)s;
-}
-int64_t weir_f64_to_str(double val) {
-    char buf[64];
-    if (val == (double)(long long)val) snprintf(buf, sizeof(buf), "%.1f", val);
-    else snprintf(buf, sizeof(buf), "%g", val);
-    char *s = strdup(buf); return (int64_t)s;
-}
-int64_t weir_bool_to_str(int8_t val) {
-    char *s = strdup(val ? "true" : "false"); return (int64_t)s;
-}
-int64_t weir_str_concat(int64_t a, int64_t b) {
-    const char *sa = (const char*)a, *sb = (const char*)b;
-    size_t la = strlen(sa), lb = strlen(sb);
-    char *out = malloc(la + lb + 1);
-    memcpy(out, sa, la); memcpy(out + la, sb, lb + 1);
-    return (int64_t)out;
-}
-int64_t weir_str_eq(int64_t a, int64_t b) {
-    return strcmp((const char*)a, (const char*)b) == 0 ? 1 : 0;
-}
-int64_t weir_str_cmp(int64_t a, int64_t b) {
-    int r = strcmp((const char*)a, (const char*)b);
-    return r < 0 ? -1 : (r > 0 ? 1 : 0);
-}
-
-/* ── GC runtime ── */
-
-#define SHAPE_FIXED  0
-#define SHAPE_VECTOR 1
-
-typedef struct ShapeDesc {
-    uint32_t num_slots;
-    uint32_t kind;
-    uint64_t pointer_mask;
-} ShapeDesc;
-
-typedef struct ObjHeader {
-    struct ObjHeader *next;
-    uint64_t mark;
-    const ShapeDesc *shape;
-    uint64_t user_size;
-} ObjHeader;
-
-#define HEADER_SIZE sizeof(ObjHeader)
-#define INITIAL_GC_THRESHOLD (256 * 1024)
-#define GC_GROWTH_FACTOR 2
-
-static ObjHeader *gc_all_objects = NULL;
-static size_t gc_bytes_since = 0;
-static size_t gc_total_bytes = 0;
-static size_t gc_threshold = INITIAL_GC_THRESHOLD;
-static int gc_suppress_depth = 0;
-
-/* Shadow stack */
-static int64_t **shadow_stack = NULL;
-static size_t shadow_stack_len = 0;
-static size_t shadow_stack_cap = 0;
-
-void weir_shadow_push(int64_t *slot) {
-    if (shadow_stack_len >= shadow_stack_cap) {
-        shadow_stack_cap = shadow_stack_cap ? shadow_stack_cap * 2 : 256;
-        shadow_stack = realloc(shadow_stack, shadow_stack_cap * sizeof(int64_t*));
-    }
-    shadow_stack[shadow_stack_len++] = slot;
-}
-
-void weir_shadow_pop(int64_t n) {
-    if ((size_t)n > shadow_stack_len) shadow_stack_len = 0;
-    else shadow_stack_len -= (size_t)n;
-}
-
-/* Forward declarations */
-static void mark_object(int64_t user_ptr);
-
-static void gc_collect(void) {
-    /* Mark phase: walk shadow stack roots */
-    for (size_t i = 0; i < shadow_stack_len; i++) {
-        int64_t val = *shadow_stack[i];
-        if (val != 0) mark_object(val);
-    }
-    /* Sweep phase */
-    ObjHeader **prev = &gc_all_objects;
-    ObjHeader *cur = gc_all_objects;
-    while (cur) {
-        ObjHeader *next = cur->next;
-        if (cur->mark & 1) {
-            cur->mark &= ~(uint64_t)1;
-            prev = &cur->next;
-            cur = next;
-        } else {
-            *prev = next;
-            size_t total = HEADER_SIZE + (size_t)cur->user_size;
-            if (gc_total_bytes >= total) gc_total_bytes -= total;
-            free(cur);
-            cur = next;
-        }
-    }
-    gc_bytes_since = 0;
-    if (gc_total_bytes > gc_threshold / 2)
-        gc_threshold = gc_total_bytes * GC_GROWTH_FACTOR;
-}
-
-static void mark_object(int64_t user_ptr) {
-    if (user_ptr == 0) return;
-    ObjHeader *h = (ObjHeader*)((char*)(intptr_t)user_ptr - HEADER_SIZE);
-    if (h->mark & 1) return;
-    h->mark |= 1;
-    const ShapeDesc *s = h->shape;
-    if (!s || s->pointer_mask == 0) return;
-    int64_t *data = (int64_t*)(intptr_t)user_ptr;
-    if (s->kind == SHAPE_FIXED) {
-        for (uint32_t i = 0; i < s->num_slots; i++) {
-            if (s->pointer_mask & (1ULL << i)) {
-                if (data[i] != 0) mark_object(data[i]);
-            }
-        }
-    } else if (s->kind == SHAPE_VECTOR) {
-        if (s->pointer_mask & 1) {
-            int64_t len = data[0];
-            for (int64_t i = 0; i < len; i++) {
-                if (data[1 + i] != 0) mark_object(data[1 + i]);
-            }
-        }
-    }
-}
-
-void weir_gc_collect(void) { gc_collect(); }
-
-int64_t weir_gc_alloc(int64_t size_bytes, int64_t shape_ptr) {
-    size_t user_size = (size_t)size_bytes;
-    if (gc_suppress_depth == 0 && gc_bytes_since + HEADER_SIZE + user_size > gc_threshold)
-        gc_collect();
-    size_t total = HEADER_SIZE + user_size;
-    ObjHeader *h = (ObjHeader*)calloc(1, total);
-    h->next = gc_all_objects;
-    h->mark = 0;
-    h->shape = (const ShapeDesc*)(intptr_t)shape_ptr;
-    h->user_size = (uint64_t)user_size;
-    gc_all_objects = h;
-    gc_bytes_since += total;
-    gc_total_bytes += total;
-    return (int64_t)(intptr_t)((char*)h + HEADER_SIZE);
-}
-
-int64_t weir_gc_vec_alloc(int64_t len, int64_t shape_ptr) {
-    int64_t total = (1 + len) * 8;
-    int64_t ptr = weir_gc_alloc(total, shape_ptr);
-    *(int64_t*)(intptr_t)ptr = len;
-    return ptr;
-}
-
-int64_t weir_vec_get(int64_t ptr, int64_t idx) {
-    return ((int64_t*)(intptr_t)ptr)[1 + idx];
-}
-int64_t weir_vec_len(int64_t ptr) {
-    return *(int64_t*)(intptr_t)ptr;
-}
-int64_t weir_vec_append(int64_t ptr, int64_t elem, int64_t shape_ptr) {
-    int64_t old_len = weir_vec_len(ptr);
-    int64_t new_len = old_len + 1;
-    int64_t new_ptr = weir_gc_vec_alloc(new_len, shape_ptr);
-    memcpy((int64_t*)(intptr_t)new_ptr + 1, (int64_t*)(intptr_t)ptr + 1, old_len * 8);
-    ((int64_t*)(intptr_t)new_ptr)[1 + old_len] = elem;
-    return new_ptr;
-}
-
-/* ── Arena allocator ── */
-
-#define ARENA_INITIAL_CAPACITY (64 * 1024)
-
-typedef struct ArenaChunk {
-    void *base;
-    size_t capacity;
-    struct ArenaChunk *next;
-} ArenaChunk;
-
-typedef struct Arena {
-    ArenaChunk *current_chunk;
-    size_t offset;
-} Arena;
-
-static ArenaChunk *arena_new_chunk(size_t capacity) {
-    ArenaChunk *c = (ArenaChunk*)malloc(sizeof(ArenaChunk));
-    c->base = calloc(1, capacity);
-    c->capacity = capacity;
-    c->next = NULL;
-    return c;
-}
-
-int64_t weir_arena_create(void) {
-    ArenaChunk *chunk = arena_new_chunk(ARENA_INITIAL_CAPACITY);
-    Arena *a = (Arena*)malloc(sizeof(Arena));
-    a->current_chunk = chunk;
-    a->offset = 0;
-    return (int64_t)(intptr_t)a;
-}
-
-int64_t weir_arena_alloc(int64_t arena_ptr, int64_t size) {
-    size_t aligned = ((size_t)size + 7) & ~(size_t)7;
-    Arena *a = (Arena*)(intptr_t)arena_ptr;
-    ArenaChunk *c = a->current_chunk;
-    if (a->offset + aligned <= c->capacity) {
-        void *ptr = (char*)c->base + a->offset;
-        a->offset += aligned;
-        return (int64_t)(intptr_t)ptr;
-    }
-    size_t new_cap = c->capacity * 2;
-    if (new_cap < aligned) new_cap = aligned;
-    ArenaChunk *nc = arena_new_chunk(new_cap);
-    nc->next = a->current_chunk;
-    a->current_chunk = nc;
-    a->offset = aligned;
-    return (int64_t)(intptr_t)nc->base;
-}
-
-int64_t weir_arena_vec_alloc(int64_t arena_ptr, int64_t len) {
-    int64_t total = (1 + len) * 8;
-    int64_t ptr = weir_arena_alloc(arena_ptr, total);
-    *(int64_t*)(intptr_t)ptr = len;
-    return ptr;
-}
-
-void weir_arena_destroy(int64_t arena_ptr) {
-    Arena *a = (Arena*)(intptr_t)arena_ptr;
-    ArenaChunk *c = a->current_chunk;
-    while (c) {
-        ArenaChunk *next = c->next;
-        free(c->base);
-        free(c);
-        c = next;
-    }
-    free(a);
-}
-
-void weir_gc_suppress(void) { gc_suppress_depth++; }
-void weir_gc_unsuppress(void) {
-    if (gc_suppress_depth > 0) gc_suppress_depth--;
-    if (gc_suppress_depth == 0 && gc_bytes_since > gc_threshold) gc_collect();
-}
-
-/* ── Atoms (lock-free AtomicI64) ── */
-#include <stdatomic.h>
-
-int64_t weir_atom_create(int64_t initial) {
-    _Atomic int64_t *atom = (_Atomic int64_t *)malloc(sizeof(_Atomic int64_t));
-    atomic_store_explicit(atom, initial, memory_order_release);
-    return (int64_t)(intptr_t)atom;
-}
-
-int64_t weir_atom_deref(int64_t atom_ptr) {
-    _Atomic int64_t *atom = (_Atomic int64_t *)(intptr_t)atom_ptr;
-    return atomic_load_explicit(atom, memory_order_acquire);
-}
-
-int64_t weir_atom_cas(int64_t atom_ptr, int64_t expected, int64_t new_val) {
-    _Atomic int64_t *atom = (_Atomic int64_t *)(intptr_t)atom_ptr;
-    int64_t exp = expected;
-    atomic_compare_exchange_strong_explicit(atom, &exp, new_val,
-        memory_order_acq_rel, memory_order_acquire);
-    return exp;
-}
-
-int main(void) { weir_main(); return 0; }
-"#;
-
-// ── Type mapping ─────────────────────────────────────────────────
-
-fn ty_to_cl_with(ty: &Ty, tagged_adts: Option<&HashMap<SmolStr, TaggedAdt>>) -> Option<Type> {
+pub(crate) fn ty_to_cl_with(ty: &Ty, tagged_adts: Option<&HashMap<SmolStr, TaggedAdt>>) -> Option<Type> {
     match ty {
         Ty::I8 | Ty::U8 | Ty::Bool => Some(types::I8),
         Ty::I16 | Ty::U16 => Some(types::I16),
@@ -486,17 +75,17 @@ fn ty_to_cl_with(ty: &Ty, tagged_adts: Option<&HashMap<SmolStr, TaggedAdt>>) -> 
     }
 }
 
-fn is_float(ty: &Ty) -> bool {
+pub(crate) fn is_float(ty: &Ty) -> bool {
     matches!(ty, Ty::F32 | Ty::F64)
 }
 
-fn is_signed(ty: &Ty) -> bool {
+pub(crate) fn is_signed(ty: &Ty) -> bool {
     matches!(ty, Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64)
 }
 
 // ── ISA construction (shared between JIT and AOT) ───────────────
 
-fn make_isa(
+pub(crate) fn make_isa(
     pic: bool,
 ) -> Result<std::sync::Arc<dyn cranelift_codegen::isa::TargetIsa>, CodegenError> {
     let mut flag_builder = settings::builder();
@@ -528,43 +117,7 @@ pub fn compile_and_run(
     let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
 
     // Register runtime print helpers as in-process function pointers
-    builder.symbol("weir_print_i64", weir_print_i64 as *const u8);
-    builder.symbol("weir_print_f64", weir_print_f64 as *const u8);
-    builder.symbol("weir_print_bool", weir_print_bool as *const u8);
-    builder.symbol("weir_print_unit", weir_print_unit as *const u8);
-    builder.symbol("weir_print_newline", weir_print_newline as *const u8);
-    builder.symbol("weir_sleep_ms", weir_sleep_ms as *const u8);
-    builder.symbol("weir_print_str", weir_print_str as *const u8);
-    builder.symbol("weir_i64_to_str", weir_i64_to_str as *const u8);
-    builder.symbol("weir_f64_to_str", weir_f64_to_str as *const u8);
-    builder.symbol("weir_bool_to_str", weir_bool_to_str as *const u8);
-    builder.symbol("weir_str_concat", weir_str_concat as *const u8);
-    builder.symbol("weir_str_eq", weir_str_eq as *const u8);
-    builder.symbol("weir_str_cmp", weir_str_cmp as *const u8);
-    builder.symbol("weir_gc_alloc", weir_gc_alloc as *const u8);
-    builder.symbol("weir_gc_vec_alloc", weir_gc_vec_alloc as *const u8);
-    builder.symbol("weir_gc_collect", weir_gc_collect as *const u8);
-    builder.symbol("weir_vec_get", weir_vec_get as *const u8);
-    builder.symbol("weir_vec_len", weir_vec_len as *const u8);
-    builder.symbol("weir_vec_append", weir_vec_append as *const u8);
-    builder.symbol("weir_shadow_push", weir_shadow_push as *const u8);
-    builder.symbol("weir_shadow_pop", weir_shadow_pop as *const u8);
-    builder.symbol("weir_arena_create", weir_arena_create as *const u8);
-    builder.symbol("weir_arena_alloc", weir_arena_alloc as *const u8);
-    builder.symbol("weir_arena_vec_alloc", weir_arena_vec_alloc as *const u8);
-    builder.symbol("weir_arena_destroy", weir_arena_destroy as *const u8);
-    builder.symbol("weir_gc_suppress", weir_gc_suppress as *const u8);
-    builder.symbol("weir_gc_unsuppress", weir_gc_unsuppress as *const u8);
-    builder.symbol("weir_atom_create", weir_atom_create as *const u8);
-    builder.symbol("weir_atom_deref", weir_atom_deref as *const u8);
-    builder.symbol("weir_atom_cas", weir_atom_cas as *const u8);
-    builder.symbol("weir_channel_create", weir_channel_create as *const u8);
-    builder.symbol("weir_channel_send", weir_channel_send as *const u8);
-    builder.symbol("weir_channel_recv", weir_channel_recv as *const u8);
-    builder.symbol("weir_thread_spawn", weir_thread_spawn as *const u8);
-    builder.symbol("weir_thread_join", weir_thread_join as *const u8);
-    builder.symbol("weir_par_map", weir_par_map as *const u8);
-    builder.symbol("weir_par_for_each", weir_par_for_each as *const u8);
+    jit_helpers::register_jit_symbols(&mut builder);
 
     let jit_module = JITModule::new(builder);
 
@@ -579,82 +132,9 @@ pub fn compile_and_run(
     compiler.run_main()
 }
 
-pub fn compile_to_object(
-    module: &weir_ast::Module,
-    type_info: &TypeCheckResult,
-) -> Result<Vec<u8>, CodegenError> {
-    let isa = make_isa(true)?;
-
-    let obj_builder = ObjectBuilder::new(
-        isa,
-        "weir_output",
-        cranelift_module::default_libcall_names(),
-    )
-    .map_err(|e| CodegenError::new(format!("ObjectBuilder: {}", e)))?;
-
-    let obj_module = ObjectModule::new(obj_builder);
-
-    let mut compiler = Compiler::new(module, type_info, obj_module);
-    compiler.declare_runtime_helpers()?;
-    // Export main as weir_main so C runtime can call it; others are local
-    compiler.declare_user_functions_aot()?;
-    compiler.compile_user_functions()?;
-
-    let product = compiler.module.finish();
-    product
-        .emit()
-        .map_err(|e| CodegenError::new(format!("emit object: {}", e)))
-}
-
-pub fn build_executable(
-    module: &weir_ast::Module,
-    type_info: &TypeCheckResult,
-    output_path: &Path,
-) -> Result<(), CodegenError> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let obj_bytes = compile_to_object(module, type_info)?;
-
-    let unique = format!(
-        "{}_{}",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    );
-    let tmp_dir = std::env::temp_dir();
-    let obj_path = tmp_dir.join(format!("weir_output_{}.o", unique));
-    let runtime_path = tmp_dir.join(format!("weir_runtime_{}.c", unique));
-
-    std::fs::write(&obj_path, &obj_bytes)
-        .map_err(|e| CodegenError::new(format!("write object file: {}", e)))?;
-    std::fs::write(&runtime_path, AOT_RUNTIME_C)
-        .map_err(|e| CodegenError::new(format!("write runtime: {}", e)))?;
-
-    let status = std::process::Command::new("cc")
-        .arg("-o")
-        .arg(output_path)
-        .arg(&obj_path)
-        .arg(&runtime_path)
-        .status()
-        .map_err(|e| CodegenError::new(format!("run cc: {}", e)))?;
-
-    // Clean up temp files (best-effort)
-    let _ = std::fs::remove_file(&obj_path);
-    let _ = std::fs::remove_file(&runtime_path);
-
-    if !status.success() {
-        return Err(CodegenError::new(format!(
-            "linker failed with exit code: {}",
-            status.code().unwrap_or(-1)
-        )));
-    }
-
-    Ok(())
-}
-
 /// Info about a constructor variant for codegen.
 #[derive(Clone, Debug)]
-struct ConstructorInfo {
+pub(crate) struct ConstructorInfo {
     #[allow(dead_code)]
     type_name: SmolStr,
     tag: i64,
@@ -668,7 +148,7 @@ struct ConstructorInfo {
 
 /// A tagged ADT type: all variants have 0 or 1 fields, represented as packed i64.
 #[derive(Clone, Debug)]
-struct TaggedAdt {
+pub(crate) struct TaggedAdt {
     /// Ordered list of variant names; tag = index in this list.
     #[allow(dead_code)]
     variants: Vec<SmolStr>,
@@ -718,13 +198,13 @@ fn collect_var_mappings(generic: &Ty, concrete: &Ty, subst: &mut HashMap<TyVarId
     }
 }
 
-struct Compiler<'a, M: Module> {
-    ast_module: &'a weir_ast::Module,
-    type_info: &'a TypeCheckResult,
-    module: M,
+pub(crate) struct Compiler<'a, M: Module> {
+    pub(crate) ast_module: &'a weir_ast::Module,
+    pub(crate) type_info: &'a TypeCheckResult,
+    pub(crate) module: M,
 
     /// Maps user function name -> (FuncId, param types, return type)
-    user_fns: HashMap<SmolStr, (FuncId, Vec<Ty>, Ty)>,
+    pub(crate) user_fns: HashMap<SmolStr, (FuncId, Vec<Ty>, Ty)>,
     /// Maps runtime helper name -> FuncId
     runtime_fns: HashMap<&'static str, FuncId>,
     /// Tagged ADT types (including simple enums): type_name -> TaggedAdt
@@ -736,7 +216,7 @@ struct Compiler<'a, M: Module> {
 }
 
 impl<'a, M: Module> Compiler<'a, M> {
-    fn new(ast_module: &'a weir_ast::Module, type_info: &'a TypeCheckResult, module: M) -> Self {
+    pub(crate) fn new(ast_module: &'a weir_ast::Module, type_info: &'a TypeCheckResult, module: M) -> Self {
         let mut tagged_adts = HashMap::new();
         let mut constructor_tags = HashMap::new();
 
@@ -797,7 +277,7 @@ impl<'a, M: Module> Compiler<'a, M> {
 
     // ── Runtime helper declarations ─────────────────────────────
 
-    fn declare_runtime_helpers(&mut self) -> Result<(), CodegenError> {
+    pub(crate) fn declare_runtime_helpers(&mut self) -> Result<(), CodegenError> {
         // weir_print_i64(i64) -> void
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(types::I64));
@@ -1208,7 +688,7 @@ impl<'a, M: Module> Compiler<'a, M> {
         ty_to_cl_with(ty, Some(&self.tagged_adts))
     }
 
-    fn declare_user_functions(&mut self, linkage: Linkage) -> Result<(), CodegenError> {
+    pub(crate) fn declare_user_functions(&mut self, linkage: Linkage) -> Result<(), CodegenError> {
         for (item, _span) in &self.ast_module.items {
             if let Item::Defn(defn) = item {
                 // Skip generic functions — they can't be compiled directly,
@@ -1289,7 +769,7 @@ impl<'a, M: Module> Compiler<'a, M> {
     }
 
     /// AOT variant: export `main` as `weir_main`, keep everything else local.
-    fn declare_user_functions_aot(&mut self) -> Result<(), CodegenError> {
+    pub(crate) fn declare_user_functions_aot(&mut self) -> Result<(), CodegenError> {
         for (item, _span) in &self.ast_module.items {
             if let Item::Defn(defn) = item {
                 // Skip generic functions — only specializations are compiled.
@@ -1439,7 +919,7 @@ impl<'a, M: Module> Compiler<'a, M> {
 
     // ── Pass 2: compile each function body ──────────────────────
 
-    fn compile_user_functions(&mut self) -> Result<(), CodegenError> {
+    pub(crate) fn compile_user_functions(&mut self) -> Result<(), CodegenError> {
         self.compile_user_functions_with(None, None)
     }
 
@@ -1477,7 +957,7 @@ impl<'a, M: Module> Compiler<'a, M> {
 
     /// Like `compile_user_functions_with`, but when `dirty_set` is `Some`, only compile
     /// functions whose name is in the dirty set. All functions must still be declared.
-    fn compile_user_functions_selective(
+    pub(crate) fn compile_user_functions_selective(
         &mut self,
         fn_table_slots: Option<&HashMap<SmolStr, usize>>,
         table_data_id: Option<DataId>,
@@ -2110,6 +1590,28 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
 
     /// Create a stack slot for a heap-pointer value, store it, and push
     /// its address onto the GC shadow stack so the GC can find it as a root.
+    ///
+    /// ## Known limitation: shadow stack vs Cranelift Variables
+    ///
+    /// This pushes the *address of a dedicated stack slot* containing a snapshot of
+    /// `val` at the time of the push. If the corresponding Cranelift Variable is later
+    /// reassigned via `set!`, the stack slot is NOT updated — it still holds the old
+    /// pointer. This means:
+    ///
+    /// 1. The old heap object stays alive (its root is still on the shadow stack) — safe.
+    /// 2. The new heap pointer lives only in a Cranelift Variable (register or spill slot),
+    ///    NOT on the shadow stack — it is invisible to the GC.
+    ///
+    /// If GC fires during a subsequent call while the new pointer is only in a register,
+    /// the new object could be prematurely collected. This requires all of: (a) a `mut`
+    /// binding of heap-pointer type, (b) `set!` to a new heap value, (c) GC triggering
+    /// during a later call in the same scope, (d) the new value not being rooted elsewhere.
+    ///
+    /// This hasn't manifested in practice because `set!` on heap-pointer types is rare
+    /// (closures and vectors are typically immutable bindings). Proper fix options:
+    /// - Update the shadow stack slot on every `set!` of a heap-pointer variable
+    /// - Use a write barrier that re-pushes the new value
+    /// - Emit a store to the original stack slot alongside `def_var` in SetBang codegen
     fn push_gc_root(&mut self, val: Value) {
         use cranelift_codegen::ir::{StackSlotData, StackSlotKind};
 
@@ -2330,6 +1832,9 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                     if let Some(v) = val {
                         if let Some((var, _)) = self.vars.get(&name) {
                             let var = *var;
+                            // NOTE: This does not update the GC shadow stack slot.
+                            // See push_gc_root() doc comment for the known limitation
+                            // when set! reassigns a heap-pointer variable.
                             self.builder.def_var(var, v);
                         } else {
                             return Err(CodegenError::new(format!(
@@ -4121,635 +3626,6 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                 self.builder.ins().iconst(cl_ty, 0)
             }
         }
-    }
-}
-
-// ── Dev Session (live reload) ────────────────────────────────────
-
-/// Registers all JIT runtime symbols on a JITBuilder.
-fn register_jit_symbols(builder: &mut JITBuilder) {
-    builder.symbol("weir_print_i64", weir_print_i64 as *const u8);
-    builder.symbol("weir_print_f64", weir_print_f64 as *const u8);
-    builder.symbol("weir_print_bool", weir_print_bool as *const u8);
-    builder.symbol("weir_print_unit", weir_print_unit as *const u8);
-    builder.symbol("weir_print_newline", weir_print_newline as *const u8);
-    builder.symbol("weir_sleep_ms", weir_sleep_ms as *const u8);
-    builder.symbol("weir_print_str", weir_print_str as *const u8);
-    builder.symbol("weir_i64_to_str", weir_i64_to_str as *const u8);
-    builder.symbol("weir_f64_to_str", weir_f64_to_str as *const u8);
-    builder.symbol("weir_bool_to_str", weir_bool_to_str as *const u8);
-    builder.symbol("weir_str_concat", weir_str_concat as *const u8);
-    builder.symbol("weir_str_eq", weir_str_eq as *const u8);
-    builder.symbol("weir_str_cmp", weir_str_cmp as *const u8);
-    builder.symbol("weir_gc_alloc", weir_gc_alloc as *const u8);
-    builder.symbol("weir_gc_vec_alloc", weir_gc_vec_alloc as *const u8);
-    builder.symbol("weir_gc_collect", weir_gc_collect as *const u8);
-    builder.symbol("weir_vec_get", weir_vec_get as *const u8);
-    builder.symbol("weir_vec_len", weir_vec_len as *const u8);
-    builder.symbol("weir_vec_append", weir_vec_append as *const u8);
-    builder.symbol("weir_shadow_push", weir_shadow_push as *const u8);
-    builder.symbol("weir_shadow_pop", weir_shadow_pop as *const u8);
-    builder.symbol("weir_arena_create", weir_arena_create as *const u8);
-    builder.symbol("weir_arena_alloc", weir_arena_alloc as *const u8);
-    builder.symbol("weir_arena_vec_alloc", weir_arena_vec_alloc as *const u8);
-    builder.symbol("weir_arena_destroy", weir_arena_destroy as *const u8);
-    builder.symbol("weir_gc_suppress", weir_gc_suppress as *const u8);
-    builder.symbol("weir_gc_unsuppress", weir_gc_unsuppress as *const u8);
-    builder.symbol("weir_atom_create", weir_atom_create as *const u8);
-    builder.symbol("weir_atom_deref", weir_atom_deref as *const u8);
-    builder.symbol("weir_atom_cas", weir_atom_cas as *const u8);
-    builder.symbol("weir_channel_create", weir_channel_create as *const u8);
-    builder.symbol("weir_channel_send", weir_channel_send as *const u8);
-    builder.symbol("weir_channel_recv", weir_channel_recv as *const u8);
-    builder.symbol("weir_thread_spawn", weir_thread_spawn as *const u8);
-    builder.symbol("weir_thread_join", weir_thread_join as *const u8);
-    builder.symbol("weir_par_map", weir_par_map as *const u8);
-    builder.symbol("weir_par_for_each", weir_par_for_each as *const u8);
-}
-
-/// What changed between two versions of the source.
-struct ChangeSet {
-    body_changed: HashSet<SmolStr>,
-    sig_changed: HashSet<SmolStr>,
-    added: HashSet<SmolStr>,
-    removed: HashSet<SmolStr>,
-    types_changed: HashSet<SmolStr>,
-}
-
-/// Result of a selective reload.
-pub struct ReloadResult {
-    pub recompiled: Vec<SmolStr>,
-    pub skipped: usize,
-    pub type_warnings: Vec<SmolStr>,
-}
-
-/// Hash the body text of each function from source using its Defn span.
-fn compute_body_hashes(ast_module: &weir_ast::Module, source: &str) -> HashMap<SmolStr, u64> {
-    use std::hash::{Hash, Hasher};
-    let mut hashes = HashMap::new();
-    for (item, _) in &ast_module.items {
-        if let Item::Defn(defn) = item {
-            let start = defn.span.start as usize;
-            let end = defn.span.end as usize;
-            if end <= source.len() {
-                let body_text = &source[start..end];
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                body_text.hash(&mut hasher);
-                hashes.insert(defn.name.clone(), hasher.finish());
-            }
-        }
-    }
-    hashes
-}
-
-/// Extract type→constructor signatures for type change detection.
-fn compute_type_sigs(
-    ast_module: &weir_ast::Module,
-    type_info: &TypeCheckResult,
-) -> HashMap<SmolStr, Vec<(SmolStr, Vec<Ty>)>> {
-    let mut sigs: HashMap<SmolStr, Vec<(SmolStr, Vec<Ty>)>> = HashMap::new();
-    for (item, _) in &ast_module.items {
-        match item {
-            Item::Deftype(dt) => {
-                let mut con_sigs = Vec::new();
-                for variant in &dt.variants {
-                    if let Some(ft) = type_info.fn_types.get(&variant.name) {
-                        con_sigs.push((variant.name.clone(), ft.param_types.clone()));
-                    } else {
-                        con_sigs.push((variant.name.clone(), vec![]));
-                    }
-                }
-                sigs.insert(dt.name.clone(), con_sigs);
-            }
-            Item::Defstruct(ds) => {
-                if let Some(ft) = type_info.fn_types.get(&ds.name) {
-                    sigs.insert(
-                        ds.name.clone(),
-                        vec![(ds.name.clone(), ft.param_types.clone())],
-                    );
-                }
-            }
-            _ => {}
-        }
-    }
-    sigs
-}
-
-pub struct DevSession {
-    ast_module: weir_ast::Module,
-    type_info: TypeCheckResult,
-    /// Stable function pointer table — indirect calls load from here.
-    /// Boxed slice with stable address; AtomicPtr for thread-safe swaps.
-    fn_table: Box<[AtomicPtr<u8>]>,
-    /// Maps function name → slot index in fn_table.
-    fn_slots: HashMap<SmolStr, usize>,
-    /// Maps function name → (param types, return type) for signature reconstruction.
-    fn_sigs: HashMap<SmolStr, (Vec<Ty>, Ty)>,
-    /// Current JIT module (holds live code pages).
-    current_module: JITModule,
-    /// Old modules kept alive to prevent code page deallocation.
-    _old_modules: Vec<JITModule>,
-    /// Body hashes from the previous source for change detection.
-    body_hashes: HashMap<SmolStr, u64>,
-    /// Type constructor signatures from previous source for type change detection.
-    type_sigs: HashMap<SmolStr, Vec<(SmolStr, Vec<Ty>)>>,
-    /// Previous expanded source for short-circuit.
-    prev_source: String,
-}
-
-type UserFnMap = HashMap<SmolStr, (FuncId, Vec<Ty>, Ty)>;
-type FnSigMap = HashMap<SmolStr, (Vec<Ty>, Ty)>;
-
-/// Helper: compile functions with indirect dispatch into a JITModule.
-/// When `dirty_set` is `Some`, only compile functions in the set (others are declared but not defined).
-/// Returns (jit_module, user_fns_map, fn_sigs_map).
-fn compile_dev_module(
-    ast_module: &weir_ast::Module,
-    type_info: &TypeCheckResult,
-    fn_table_ptr: *const AtomicPtr<u8>,
-    fn_slots: &HashMap<SmolStr, usize>,
-    dirty_set: Option<&HashSet<SmolStr>>,
-) -> Result<(JITModule, UserFnMap, FnSigMap), CodegenError> {
-    let isa = make_isa(false)?;
-    let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-    register_jit_symbols(&mut builder);
-    builder.symbol("weir_fn_table", fn_table_ptr as *const u8);
-
-    let jit_module = JITModule::new(builder);
-    let mut compiler = Compiler::new(ast_module, type_info, jit_module);
-    compiler.declare_runtime_helpers()?;
-    compiler.declare_user_functions(Linkage::Local)?;
-
-    let table_data_id = compiler
-        .module
-        .declare_data("weir_fn_table", Linkage::Import, false, false)
-        .map_err(|e| CodegenError::new(format!("declare weir_fn_table data: {}", e)))?;
-
-    let mut fn_sigs = HashMap::new();
-    for (name, (_fid, param_tys, ret_ty)) in &compiler.user_fns {
-        fn_sigs.insert(name.clone(), (param_tys.clone(), ret_ty.clone()));
-    }
-
-    compiler.compile_user_functions_selective(
-        Some(fn_slots),
-        Some(table_data_id),
-        dirty_set,
-    )?;
-
-    compiler
-        .module
-        .finalize_definitions()
-        .map_err(|e| CodegenError::new(format!("finalize: {}", e)))?;
-
-    let user_fns = compiler.user_fns.clone();
-    Ok((compiler.module, user_fns, fn_sigs))
-}
-
-impl DevSession {
-    /// Create a new dev session: parse, typecheck, compile with indirect dispatch.
-    pub fn new(source: &str) -> Result<Self, CodegenError> {
-        let (ast_module, parse_errors) = weir_parser::parse(source);
-        if !parse_errors.is_empty() {
-            return Err(CodegenError::new(format!(
-                "parse error: {}",
-                parse_errors[0].message
-            )));
-        }
-
-        let type_info = weir_typeck::check(&ast_module);
-        if !type_info.errors.is_empty() {
-            return Err(CodegenError::new(format!(
-                "type error: {}",
-                type_info.errors[0].message
-            )));
-        }
-
-        // Assign slots to all user functions
-        let mut fn_slots = HashMap::new();
-        let mut slot = 0usize;
-        for (item, _) in &ast_module.items {
-            if let Item::Defn(defn) = item {
-                fn_slots.insert(defn.name.clone(), slot);
-                slot += 1;
-            }
-        }
-
-        // Create function table (all null initially)
-        let fn_table: Box<[AtomicPtr<u8>]> = (0..slot)
-            .map(|_| AtomicPtr::new(std::ptr::null_mut()))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-
-        let (jit_module, user_fns, fn_sigs) =
-            compile_dev_module(&ast_module, &type_info, fn_table.as_ptr(), &fn_slots, None)?;
-
-        // Populate fn_table with finalized function pointers
-        for (name, &slot_idx) in &fn_slots {
-            let (func_id, _, _) = &user_fns[name];
-            let ptr = jit_module.get_finalized_function(*func_id);
-            fn_table[slot_idx].store(ptr as *mut u8, Ordering::Release);
-        }
-
-        let body_hashes = compute_body_hashes(&ast_module, source);
-        let type_sigs = compute_type_sigs(&ast_module, &type_info);
-
-        Ok(DevSession {
-            ast_module,
-            type_info,
-            fn_table,
-            fn_slots,
-            fn_sigs,
-            current_module: jit_module,
-            _old_modules: Vec::new(),
-            body_hashes,
-            type_sigs,
-            prev_source: source.to_string(),
-        })
-    }
-
-    /// Selectively recompile only dirty functions from new source and swap pointers.
-    /// Returns a `ReloadResult` with recompilation stats and type warnings.
-    /// On parse/type error, returns Err but keeps old code running.
-    pub fn reload(&mut self, new_source: &str) -> Result<ReloadResult, CodegenError> {
-        // Short-circuit: if expanded source is identical, skip everything
-        if new_source == self.prev_source {
-            return Ok(ReloadResult {
-                recompiled: vec![],
-                skipped: self.fn_slots.len(),
-                type_warnings: vec![],
-            });
-        }
-
-        let (ast_module, parse_errors) = weir_parser::parse(new_source);
-        if !parse_errors.is_empty() {
-            return Err(CodegenError::new(format!(
-                "parse error: {}",
-                parse_errors[0].message
-            )));
-        }
-
-        let type_info = weir_typeck::check(&ast_module);
-        if !type_info.errors.is_empty() {
-            return Err(CodegenError::new(format!(
-                "type error: {}",
-                type_info.errors[0].message
-            )));
-        }
-
-        // Compute change set
-        let new_body_hashes = compute_body_hashes(&ast_module, new_source);
-        let new_type_sigs = compute_type_sigs(&ast_module, &type_info);
-
-        let old_fn_names: HashSet<SmolStr> = self.fn_slots.keys().cloned().collect();
-        let new_fn_names: HashSet<SmolStr> = ast_module
-            .items
-            .iter()
-            .filter_map(|(item, _)| {
-                if let Item::Defn(defn) = item {
-                    Some(defn.name.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        let mut change_set = ChangeSet {
-            body_changed: HashSet::new(),
-            sig_changed: HashSet::new(),
-            added: HashSet::new(),
-            removed: HashSet::new(),
-            types_changed: HashSet::new(),
-        };
-
-        // Detect added/removed functions
-        for name in &new_fn_names {
-            if !old_fn_names.contains(name) {
-                change_set.added.insert(name.clone());
-            }
-        }
-        for name in &old_fn_names {
-            if !new_fn_names.contains(name) {
-                change_set.removed.insert(name.clone());
-            }
-        }
-
-        // Detect body and signature changes for existing functions
-        for name in new_fn_names.intersection(&old_fn_names) {
-            // Signature change?
-            let old_sig = self.fn_sigs.get(name);
-            let new_sig = type_info.fn_types.get(name).map(|ft| {
-                (ft.param_types.clone(), ft.return_type.clone())
-            });
-            let sig_changed = match (old_sig, &new_sig) {
-                (Some(old), Some(new)) => old != new,
-                _ => true,
-            };
-            if sig_changed {
-                change_set.sig_changed.insert(name.clone());
-                continue; // sig change subsumes body change
-            }
-
-            // Body change?
-            let old_hash = self.body_hashes.get(name);
-            let new_hash = new_body_hashes.get(name);
-            if old_hash != new_hash {
-                change_set.body_changed.insert(name.clone());
-            }
-        }
-
-        // Detect type changes
-        for (type_name, new_cons) in &new_type_sigs {
-            match self.type_sigs.get(type_name) {
-                Some(old_cons) if old_cons == new_cons => {}
-                _ => {
-                    change_set.types_changed.insert(type_name.clone());
-                }
-            }
-        }
-        // Check for removed types
-        for type_name in self.type_sigs.keys() {
-            if !new_type_sigs.contains_key(type_name) {
-                change_set.types_changed.insert(type_name.clone());
-            }
-        }
-
-        // Compute dirty set using dependency graph + change set
-        let deps = &type_info.deps;
-        let mut dirty: HashSet<SmolStr> = HashSet::new();
-
-        // Body-only changes: just the function itself
-        for name in &change_set.body_changed {
-            dirty.insert(name.clone());
-        }
-
-        // Signature changes: function + transitive callers
-        for name in &change_set.sig_changed {
-            dirty.insert(name.clone());
-            self.add_transitive_callers(name, deps, &mut dirty);
-        }
-
-        // Type changes: all functions using the type + their transitive callers
-        for type_name in &change_set.types_changed {
-            if let Some(users) = deps.type_users.get(type_name) {
-                let users_snapshot: Vec<SmolStr> = users.iter().cloned().collect();
-                for user in &users_snapshot {
-                    dirty.insert(user.clone());
-                    self.add_transitive_callers(user, deps, &mut dirty);
-                }
-            }
-        }
-
-        // Added functions
-        for name in &change_set.added {
-            dirty.insert(name.clone());
-        }
-
-        // Expand dirty set to include specializations of dirty functions
-        let mut spec_dirty: Vec<SmolStr> = Vec::new();
-        for spec in &type_info.specializations {
-            if dirty.contains(&spec.original_name) {
-                spec_dirty.push(spec.mangled_name.clone());
-            }
-        }
-        dirty.extend(spec_dirty);
-
-        // Type warnings
-        let type_warnings: Vec<SmolStr> = change_set.types_changed.iter().cloned().collect();
-
-        // If nothing is dirty, skip compilation
-        if dirty.is_empty() {
-            self.prev_source = new_source.to_string();
-            return Ok(ReloadResult {
-                recompiled: vec![],
-                skipped: self.fn_slots.len(),
-                type_warnings,
-            });
-        }
-
-        // Reassign slots for the new source
-        let mut new_fn_slots = HashMap::new();
-        let mut slot = 0usize;
-        for (item, _) in &ast_module.items {
-            if let Item::Defn(defn) = item {
-                new_fn_slots.insert(defn.name.clone(), slot);
-                slot += 1;
-            }
-        }
-
-        // If function count changed, grow the table
-        if slot > self.fn_table.len() {
-            let mut new_table: Vec<AtomicPtr<u8>> = Vec::with_capacity(slot);
-            for i in 0..slot {
-                if i < self.fn_table.len() {
-                    let old_ptr = self.fn_table[i].load(Ordering::Acquire);
-                    new_table.push(AtomicPtr::new(old_ptr));
-                } else {
-                    new_table.push(AtomicPtr::new(std::ptr::null_mut()));
-                }
-            }
-            self.fn_table = new_table.into_boxed_slice();
-        }
-
-        let (jit_module, user_fns, new_fn_sigs) = compile_dev_module(
-            &ast_module,
-            &type_info,
-            self.fn_table.as_ptr(),
-            &new_fn_slots,
-            Some(&dirty),
-        )?;
-
-        // Swap only dirty function pointers in the table
-        let mut recompiled = Vec::new();
-        for (name, &slot_idx) in &new_fn_slots {
-            if !dirty.contains(name) {
-                continue;
-            }
-            if let Some((func_id, _, _)) = user_fns.get(name) {
-                let ptr = jit_module.get_finalized_function(*func_id);
-                self.fn_table[slot_idx].store(ptr as *mut u8, Ordering::Release);
-                recompiled.push(name.clone());
-            }
-        }
-
-        let skipped = new_fn_slots.len() - recompiled.len();
-
-        // Keep old module alive
-        let old_module = std::mem::replace(&mut self.current_module, jit_module);
-        self._old_modules.push(old_module);
-
-        // Update session state
-        self.ast_module = ast_module;
-        self.type_info = type_info;
-        self.fn_slots = new_fn_slots;
-        self.fn_sigs = new_fn_sigs;
-        self.body_hashes = new_body_hashes;
-        self.type_sigs = new_type_sigs;
-        self.prev_source = new_source.to_string();
-
-        Ok(ReloadResult {
-            recompiled,
-            skipped,
-            type_warnings,
-        })
-    }
-
-    /// BFS to find all transitive callers of a function.
-    fn add_transitive_callers(
-        &self,
-        name: &SmolStr,
-        deps: &weir_typeck::DependencyGraph,
-        dirty: &mut HashSet<SmolStr>,
-    ) {
-        let mut queue = std::collections::VecDeque::new();
-        queue.push_back(name.clone());
-        while let Some(current) = queue.pop_front() {
-            if let Some(callers) = deps.callers.get(&current) {
-                for caller in callers {
-                    if dirty.insert(caller.clone()) {
-                        queue.push_back(caller.clone());
-                    }
-                }
-            }
-        }
-    }
-
-    /// Get a callable function pointer for main() (reads through the fn_table).
-    fn get_main_fn_ptr(&self) -> Result<*const u8, CodegenError> {
-        let slot = self
-            .fn_slots
-            .get("main")
-            .ok_or_else(|| CodegenError::new("no 'main' function defined"))?;
-        let ptr = self.fn_table[*slot].load(Ordering::Acquire);
-        if ptr.is_null() {
-            return Err(CodegenError::new("main function pointer is null"));
-        }
-        Ok(ptr as *const u8)
-    }
-
-    /// Run main() and capture output (for testing).
-    pub fn run_main(&self) -> Result<String, CodegenError> {
-        let ptr = self.get_main_fn_ptr()?;
-        output_reset();
-        unsafe {
-            let main_fn: fn() = std::mem::transmute(ptr);
-            main_fn();
-        }
-        Ok(output_take())
-    }
-
-    /// Run the dev loop: spawn main() on a background thread, watch for file changes.
-    /// `transform_source` is called on the raw file contents before reload (e.g. prepend prelude + expand macros).
-    pub fn run_dev_loop<F>(
-        mut self,
-        source_path: &Path,
-        transform_source: F,
-    ) -> Result<(), CodegenError>
-    where
-        F: Fn(&str) -> Result<String, String>,
-    {
-        use notify::{RecursiveMode, Watcher};
-        use std::sync::mpsc;
-        use std::time::Duration;
-
-        let main_ptr = self.get_main_fn_ptr()?;
-
-        // Cast to usize (which is Send) to transfer across thread boundary.
-        // Safety: the fn_table and _old_modules keep the code pages alive.
-        let main_ptr_int = main_ptr as usize;
-
-        // Spawn main() on a background thread.
-        // main_fn calls through the fn_table, so pointer swaps take effect automatically.
-        let main_handle = std::thread::spawn(move || unsafe {
-            let main_fn: fn() = std::mem::transmute(main_ptr_int);
-            main_fn();
-        });
-
-        eprintln!(
-            "[weir dev] running — watching {} for changes",
-            source_path.display()
-        );
-
-        // Set up file watcher
-        let (tx, rx) = mpsc::channel();
-        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if let Ok(event) = res {
-                if event.kind.is_modify() {
-                    let _ = tx.send(());
-                }
-            }
-        })
-        .map_err(|e| CodegenError::new(format!("watcher setup: {}", e)))?;
-
-        let watch_path = source_path.parent().unwrap_or(Path::new("."));
-        watcher
-            .watch(watch_path, RecursiveMode::NonRecursive)
-            .map_err(|e| CodegenError::new(format!("watch: {}", e)))?;
-
-        let source_path = source_path.to_path_buf();
-
-        loop {
-            // Check if main thread has exited
-            if main_handle.is_finished() {
-                eprintln!("[weir dev] main() exited");
-                break;
-            }
-
-            // Wait for a file change event (with timeout to check main thread)
-            match rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(()) => {
-                    // Debounce: drain any queued events
-                    std::thread::sleep(Duration::from_millis(50));
-                    while rx.try_recv().is_ok() {}
-
-                    // Read new source and apply transform (prelude + macro expansion)
-                    let raw_source = match std::fs::read_to_string(&source_path) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            eprintln!("[weir dev] error reading file: {}", e);
-                            continue;
-                        }
-                    };
-
-                    let new_source = match transform_source(&raw_source) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            eprintln!("[weir dev] transform error: {}", e);
-                            continue;
-                        }
-                    };
-
-                    match self.reload(&new_source) {
-                        Ok(result) => {
-                            for tw in &result.type_warnings {
-                                eprintln!(
-                                    "[weir dev] type '{}' was redefined — live instances have stale layout",
-                                    tw
-                                );
-                            }
-                            if result.recompiled.is_empty() {
-                                eprintln!("[weir dev] no changes detected");
-                            } else {
-                                let names: Vec<&str> =
-                                    result.recompiled.iter().map(|s| s.as_str()).collect();
-                                eprintln!(
-                                    "[weir dev] reloaded {} fn(s): {} (skipped {})",
-                                    result.recompiled.len(),
-                                    names.join(", "),
-                                    result.skipped
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("[weir dev] reload error (old code still running): {}", e);
-                        }
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        }
-
-        Ok(())
     }
 }
 

@@ -9,7 +9,8 @@ use tower_lsp::{Client, LanguageServer};
 use crate::completion;
 use crate::definition;
 use crate::diagnostics;
-use crate::document::{Document, LineIndex};
+use crate::document::Document;
+use crate::expand;
 use crate::formatting;
 use crate::hover;
 use crate::index::SymbolIndex;
@@ -18,31 +19,6 @@ use crate::semantic_tokens;
 use crate::signature_help;
 use crate::symbols;
 use crate::workspace::WorkspaceIndex;
-
-/// Parse source text using the same macro-aware logic as diagnostics.
-/// Returns the parsed module and a LineIndex that matches its spans.
-fn parse_for_cross_file(text: &str) -> (weir_ast::Module, LineIndex) {
-    let expand_result = weir_macros::expand(text);
-    let macros_expanded = expand_result.errors.is_empty() && {
-        let (orig_tokens, _) = weir_lexer::lex(text);
-        let (exp_tokens, _) = weir_lexer::lex(&expand_result.source);
-        orig_tokens.len() != exp_tokens.len()
-            || orig_tokens
-                .iter()
-                .zip(exp_tokens.iter())
-                .any(|((t1, _), (t2, _))| t1 != t2)
-    };
-
-    let (parse_source, line_index) = if macros_expanded {
-        let li = LineIndex::new(&expand_result.source);
-        (expand_result.source, li)
-    } else {
-        (text.to_string(), LineIndex::new(text))
-    };
-
-    let (module, _) = weir_parser::parse(&parse_source);
-    (module, line_index)
-}
 
 pub struct WeirLspBackend {
     pub client: Client,
@@ -461,7 +437,9 @@ impl LanguageServer for WeirLspBackend {
             }
 
             // Parse with matching line index for correct spans
-            let (module, line_index) = parse_for_cross_file(&text);
+            let expanded = expand::expand_source(&text);
+            let (module, _) = weir_parser::parse(&expanded.source);
+            let line_index = expanded.line_index;
             let idx = SymbolIndex::build(&module);
 
             for span in idx.get_all_occurrences_of(&name) {
@@ -565,7 +543,9 @@ impl LanguageServer for WeirLspBackend {
             }
 
             // Parse with matching line index for correct spans
-            let (module, line_index) = parse_for_cross_file(&text);
+            let expanded = expand::expand_source(&text);
+            let (module, _) = weir_parser::parse(&expanded.source);
+            let line_index = expanded.line_index;
             let idx = SymbolIndex::build(&module);
 
             let edits: Vec<TextEdit> = idx

@@ -84,6 +84,14 @@ The type system must track arena provenance to enforce escape prevention. This i
 - Generic functions should work over both GC and arena-allocated values — a function taking `(List Contact)` shouldn't care where the list was allocated; only the escape checker needs to know
 - A closure that captures an arena value must itself be arena-scoped
 
+### Known limitation: GC shadow stack and `set!`
+
+The JIT codegen uses a shadow stack to track GC roots. At function entry and `let` bindings, heap-pointer values are stored into dedicated stack slots whose addresses are pushed onto the shadow stack. The GC reads these slot addresses to find roots.
+
+When a `mut` binding of heap-pointer type is reassigned via `set!`, the Cranelift Variable is updated but the shadow stack slot is not. The old pointer stays rooted (safe — prevents premature collection), but the new pointer is only in a register/spill slot invisible to the GC. If GC fires during a subsequent call before function exit, the new object could be prematurely collected.
+
+This hasn't manifested in practice because `set!` on heap-pointer types (closures, vectors) is rare — most such bindings are immutable. The proper fix is to update the shadow stack slot on every `set!` of a heap-pointer variable. See `push_gc_root()` in `weir-codegen` for details.
+
 ### Open questions
 
 - ~~What GC algorithm to start with?~~ **Resolved: mark-and-sweep, stop-the-world.** Generational/incremental are future optimizations.

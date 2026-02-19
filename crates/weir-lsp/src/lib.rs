@@ -2,6 +2,7 @@ mod completion;
 mod definition;
 mod diagnostics;
 mod document;
+mod expand;
 pub mod formatting;
 mod hover;
 pub mod index;
