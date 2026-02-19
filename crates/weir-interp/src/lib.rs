@@ -337,6 +337,19 @@ impl<'a> Interpreter<'a> {
             "+", "-", "*", "/", "mod", "<", ">", "<=", ">=", "=", "!=", "not", "and", "or",
             "println", "print", "str", "len", "nth", "append", "type-of",
             "atom", "deref", "channel", "send", "recv", "par-map", "par-for-each",
+            // Math
+            "sqrt", "abs", "floor", "ceil", "min", "max",
+            "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
+            "exp", "log", "pow", "round",
+            // Type conversions
+            "to-f64", "to-i64", "to-f32", "to-i32",
+            // Random
+            "random", "random-int", "random-seed",
+            // String operations
+            "string-length", "substring", "string-ref", "string-contains",
+            "string-upcase", "string-downcase", "string-trim", "char-to-string",
+            // File I/O
+            "read-file", "write-file",
         ];
         for name in builtins {
             self.global_env.define(

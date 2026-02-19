@@ -1,0 +1,135 @@
+;; ── Ray Tracer Demo ──────────────────────────────────────────────
+;;
+;; Renders a scene with colored spheres on a gray ground plane.
+;; Outputs a PPM image file (viewable with feh, eog, etc.)
+;;
+;; Usage:
+;;   weir interp demo-raytracer.weir
+;;   weir run   demo-raytracer.weir
+
+;; ── Sphere intersection ─────────────────────────────────────────
+
+(defn intersect ((cx : f64) (cy : f64) (cz : f64) (rad : f64)
+                 (ox : f64) (oy : f64) (oz : f64)
+                 (dx : f64) (dy : f64) (dz : f64)) : f64
+  (let ((ocx (- ox cx))
+        (ocy (- oy cy))
+        (ocz (- oz cz))
+        (a (+ (+ (* dx dx) (* dy dy)) (* dz dz)))
+        (b (* 2.0 (+ (+ (* ocx dx) (* ocy dy)) (* ocz dz))))
+        (c (- (+ (+ (* ocx ocx) (* ocy ocy)) (* ocz ocz)) (* rad rad)))
+        (disc (- (* b b) (* 4.0 (* a c)))))
+    (if (< disc 0.0)
+      -1.0
+      (let ((t (/ (- (- 0.0 b) (sqrt disc)) (* 2.0 a))))
+        (if (< t 0.001) -1.0 t)))))
+
+;; ── Scene: 5 spheres ────────────────────────────────────────────
+
+(defn num-spheres () : i64 5)
+
+(defn sphere-cx ((i : i64)) : f64
+  (cond ((= i 0) 0.0) ((= i 1) -1.2) ((= i 2) 1.2) ((= i 3) 0.5) ((= i 4) 0.0) (true 0.0)))
+(defn sphere-cy ((i : i64)) : f64
+  (cond ((= i 0) 0.0) ((= i 1) 0.0) ((= i 2) 0.0) ((= i 3) -0.15) ((= i 4) -100.5) (true 0.0)))
+(defn sphere-cz ((i : i64)) : f64
+  (cond ((= i 0) -1.5) ((= i 1) -2.0) ((= i 2) -2.0) ((= i 3) -1.0) ((= i 4) -1.5) (true 0.0)))
+(defn sphere-rad ((i : i64)) : f64
+  (cond ((= i 0) 0.5) ((= i 1) 0.5) ((= i 2) 0.5) ((= i 3) 0.35) ((= i 4) 100.0) (true 0.0)))
+(defn sphere-r ((i : i64)) : f64
+  (cond ((= i 0) 0.9) ((= i 1) 0.2) ((= i 2) 0.2) ((= i 3) 0.9) ((= i 4) 0.5) (true 0.0)))
+(defn sphere-g ((i : i64)) : f64
+  (cond ((= i 0) 0.2) ((= i 1) 0.8) ((= i 2) 0.2) ((= i 3) 0.8) ((= i 4) 0.5) (true 0.0)))
+(defn sphere-b ((i : i64)) : f64
+  (cond ((= i 0) 0.2) ((= i 1) 0.2) ((= i 2) 0.9) ((= i 3) 0.1) ((= i 4) 0.5) (true 0.0)))
+
+;; ── Closest hit search ──────────────────────────────────────────
+
+(defn find-hit ((ox : f64) (oy : f64) (oz : f64)
+                (dx : f64) (dy : f64) (dz : f64)
+                (i : i64) (best-t : f64) (best-i : i64)) : i64
+  (if (= i (num-spheres))
+    best-i
+    (let ((t (intersect (sphere-cx i) (sphere-cy i) (sphere-cz i) (sphere-rad i)
+                        ox oy oz dx dy dz)))
+      (if (and (> t 0.0) (or (< best-t 0.0) (< t best-t)))
+        (find-hit ox oy oz dx dy dz (+ i 1) t i)
+        (find-hit ox oy oz dx dy dz (+ i 1) best-t best-i)))))
+
+(defn find-t ((ox : f64) (oy : f64) (oz : f64)
+              (dx : f64) (dy : f64) (dz : f64)
+              (i : i64) (best-t : f64)) : f64
+  (if (= i (num-spheres))
+    best-t
+    (let ((t (intersect (sphere-cx i) (sphere-cy i) (sphere-cz i) (sphere-rad i)
+                        ox oy oz dx dy dz)))
+      (if (and (> t 0.0) (or (< best-t 0.0) (< t best-t)))
+        (find-t ox oy oz dx dy dz (+ i 1) t)
+        (find-t ox oy oz dx dy dz (+ i 1) best-t)))))
+
+;; ── Shading ─────────────────────────────────────────────────────
+
+(defn clamp-byte ((x : f64)) : i64
+  (to-i64 (min 255.0 (max 0.0 (* x 255.0)))))
+
+(defn pixel-sky ((dy : f64)) : String
+  (let ((t (* 0.5 (+ dy 1.0)))
+        (r (+ (* (- 1.0 t) 1.0) (* t 0.5)))
+        (g (+ (* (- 1.0 t) 1.0) (* t 0.7))))
+    (str (clamp-byte r) " " (clamp-byte g) " " (clamp-byte 1.0) "\n")))
+
+(defn pixel-hit ((hit-i : i64) (hit-t : f64)
+                 (ox : f64) (oy : f64) (oz : f64)
+                 (dx : f64) (dy : f64) (dz : f64)) : String
+  (let ((px (+ ox (* dx hit-t)))
+        (py (+ oy (* dy hit-t)))
+        (pz (+ oz (* dz hit-t)))
+        (rad (sphere-rad hit-i))
+        (nx (/ (- px (sphere-cx hit-i)) rad))
+        (ny (/ (- py (sphere-cy hit-i)) rad))
+        (nz (/ (- pz (sphere-cz hit-i)) rad))
+        (ndotl (+ (+ (* nx 0.5773) (* ny 0.5773)) (* nz 0.5773)))
+        (diffuse (max 0.0 ndotl))
+        (brightness (+ 0.15 (* 0.85 diffuse))))
+    (str (clamp-byte (* (sphere-r hit-i) brightness)) " "
+         (clamp-byte (* (sphere-g hit-i) brightness)) " "
+         (clamp-byte (* (sphere-b hit-i) brightness)) "\n")))
+
+;; ── Per-pixel ───────────────────────────────────────────────────
+
+(defn compute-pixel ((x : i64) (y : i64) (w : i64) (h : i64)) : String
+  (let ((aspect (/ (to-f64 w) (to-f64 h)))
+        (u (/ (+ (to-f64 x) 0.5) (to-f64 w)))
+        (v (/ (+ (to-f64 (- h y 1)) 0.5) (to-f64 h)))
+        (ox 0.0) (oy 0.5) (oz 2.0)
+        (sx (* (- (* 2.0 u) 1.0) aspect))
+        (sy (- (* 2.0 v) 1.0))
+        (sz -1.5)
+        (dlen (sqrt (+ (+ (* sx sx) (* sy sy)) (* sz sz))))
+        (dx (/ sx dlen)) (dy (/ sy dlen)) (dz (/ sz dlen))
+        (hit-i (find-hit ox oy oz dx dy dz 0 -1.0 -1))
+        (hit-t (find-t ox oy oz dx dy dz 0 -1.0)))
+    (if (< hit-i 0)
+      (pixel-sky dy)
+      (pixel-hit hit-i hit-t ox oy oz dx dy dz))))
+
+;; ── Render loops ────────────────────────────────────────────────
+
+(defn render-col ((x : i64) (y : i64) (w : i64) (h : i64) (acc : String)) : String
+  (if (= x w) acc
+    (render-col (+ x 1) y w h (str acc (compute-pixel x y w h)))))
+
+(defn render-rows ((y : i64) (w : i64) (h : i64) (acc : String)) : String
+  (if (= y h) acc
+    (render-rows (+ y 1) w h (str acc (render-col 0 y w h "")))))
+
+;; ── Main ────────────────────────────────────────────────────────
+
+(defn main ()
+  (let (((w : i64) 160)
+        ((h : i64) 90)
+        (header (str "P3\n" w " " h "\n255\n")))
+    (println (str "Rendering " w "x" h " image..."))
+    (let ((pixels (render-rows 0 w h "")))
+      (write-file "tmp/raytracer.ppm" (str header pixels))
+      (println "Done! Wrote tmp/raytracer.ppm"))))
