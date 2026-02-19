@@ -360,6 +360,36 @@ pub extern "C" fn weir_vec_append(ptr: i64, elem: i64, shape: *const ShapeDesc) 
     new_ptr
 }
 
+// ── GC-managed strings ──────────────────────────────────────────
+
+/// Shape descriptor for strings: no pointer fields, just opaque bytes.
+static STRING_SHAPE: ShapeDesc = ShapeDesc {
+    num_slots: 0,
+    kind: SHAPE_FIXED,
+    pointer_mask: 0,
+};
+
+/// Allocate a GC-managed string of `len` bytes (plus null terminator).
+/// Memory is zeroed (null terminator included). Caller writes the content.
+#[unsafe(no_mangle)]
+pub extern "C" fn weir_gc_str_alloc(len: i64) -> i64 {
+    weir_gc_alloc(len + 1, &STRING_SHAPE)
+}
+
+/// Copy a null-terminated C string into a new GC-managed string.
+/// Safe to call with static (data-section) pointers.
+#[unsafe(no_mangle)]
+pub extern "C" fn weir_gc_str_dup(src: i64) -> i64 {
+    let c_str = unsafe { std::ffi::CStr::from_ptr(src as *const std::ffi::c_char) };
+    let bytes = c_str.to_bytes();
+    let len = bytes.len() as i64;
+    let dst = weir_gc_str_alloc(len);
+    unsafe {
+        ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len());
+    }
+    dst
+}
+
 // ── Arena allocator ─────────────────────────────────────────────
 
 const ARENA_INITIAL_CAPACITY: usize = 64 * 1024; // 64 KB
@@ -466,16 +496,15 @@ pub extern "C" fn weir_gc_suppress() {
 }
 
 /// Unsuppress the GC (called when exiting a with-arena block).
-/// Decrements the depth counter. Triggers collection when fully unsuppressed
-/// if the threshold was exceeded while suppressed.
+/// Decrements the depth counter. Does NOT eagerly trigger collection —
+/// the next allocation will check the threshold and collect if needed.
+/// This is important because the caller may still hold a GC pointer in a
+/// register that hasn't been written to a shadow-stack-protected slot yet.
 #[unsafe(no_mangle)]
 pub extern "C" fn weir_gc_unsuppress() {
     GC_HEAP.with(|heap| {
         let mut heap = heap.borrow_mut();
         heap.gc_suppress_depth = heap.gc_suppress_depth.saturating_sub(1);
-        if heap.gc_suppress_depth == 0 && heap.bytes_since_gc > heap.gc_threshold {
-            collect_inner(&mut heap);
-        }
     });
 }
 

@@ -16,6 +16,11 @@ const AOT_RUNTIME_C: &str = r#"
 
 extern void weir_main(void);
 
+/* Forward declarations for GC string allocation (defined after GC runtime) */
+static int64_t gc_string_from_buf(const char *buf, size_t len);
+int64_t weir_gc_str_alloc(int64_t len);
+int64_t weir_gc_str_dup(int64_t src);
+
 void weir_print_i64(int64_t val) { printf("%lld", (long long)val); }
 void weir_print_f64(double val) {
     if (val == (double)(long long)val) printf("%.1f", val);
@@ -27,24 +32,29 @@ void weir_print_newline(void) { printf("\n"); }
 void weir_print_str(int64_t ptr) { printf("%s", (const char*)ptr); }
 
 int64_t weir_i64_to_str(int64_t val) {
-    char buf[32]; snprintf(buf, sizeof(buf), "%lld", (long long)val);
-    char *s = strdup(buf); return (int64_t)s;
+    char buf[32]; int n = snprintf(buf, sizeof(buf), "%lld", (long long)val);
+    return gc_string_from_buf(buf, (size_t)n);
 }
 int64_t weir_f64_to_str(double val) {
-    char buf[64];
-    if (val == (double)(long long)val) snprintf(buf, sizeof(buf), "%.1f", val);
-    else snprintf(buf, sizeof(buf), "%g", val);
-    char *s = strdup(buf); return (int64_t)s;
+    char buf[64]; int n;
+    if (val == (double)(long long)val) n = snprintf(buf, sizeof(buf), "%.1f", val);
+    else n = snprintf(buf, sizeof(buf), "%g", val);
+    return gc_string_from_buf(buf, (size_t)n);
 }
 int64_t weir_bool_to_str(int8_t val) {
-    char *s = strdup(val ? "true" : "false"); return (int64_t)s;
+    const char *s = val ? "true" : "false";
+    return gc_string_from_buf(s, strlen(s));
 }
 int64_t weir_str_concat(int64_t a, int64_t b) {
-    const char *sa = (const char*)a, *sb = (const char*)b;
+    /* Read inputs into stack buffer before GC allocation (GC safety) */
+    const char *sa = (const char*)(intptr_t)a, *sb = (const char*)(intptr_t)b;
     size_t la = strlen(sa), lb = strlen(sb);
-    char *out = malloc(la + lb + 1);
-    memcpy(out, sa, la); memcpy(out + la, sb, lb + 1);
-    return (int64_t)out;
+    size_t total = la + lb;
+    char *tmp = (char*)malloc(total);
+    memcpy(tmp, sa, la); memcpy(tmp + la, sb, lb);
+    int64_t result = gc_string_from_buf(tmp, total);
+    free(tmp);
+    return result;
 }
 int64_t weir_str_eq(int64_t a, int64_t b) {
     return strcmp((const char*)a, (const char*)b) == 0 ? 1 : 0;
@@ -202,6 +212,28 @@ int64_t weir_vec_append(int64_t ptr, int64_t elem, int64_t shape_ptr) {
     return new_ptr;
 }
 
+/* ── GC-managed strings ── */
+
+static const ShapeDesc gc_string_shape = { 0, SHAPE_FIXED, 0 };
+
+int64_t weir_gc_str_alloc(int64_t len) {
+    return weir_gc_alloc(len + 1, (int64_t)(intptr_t)&gc_string_shape);
+}
+
+int64_t weir_gc_str_dup(int64_t src) {
+    const char *s = (const char*)(intptr_t)src;
+    size_t len = strlen(s);
+    int64_t ptr = weir_gc_str_alloc((int64_t)len);
+    memcpy((char*)(intptr_t)ptr, s, len);
+    return ptr;
+}
+
+static int64_t gc_string_from_buf(const char *buf, size_t len) {
+    int64_t ptr = weir_gc_str_alloc((int64_t)len);
+    memcpy((char*)(intptr_t)ptr, buf, len);
+    return ptr;
+}
+
 /* ── Arena allocator ── */
 
 #define ARENA_INITIAL_CAPACITY (64 * 1024)
@@ -273,7 +305,9 @@ void weir_arena_destroy(int64_t arena_ptr) {
 void weir_gc_suppress(void) { gc_suppress_depth++; }
 void weir_gc_unsuppress(void) {
     if (gc_suppress_depth > 0) gc_suppress_depth--;
-    if (gc_suppress_depth == 0 && gc_bytes_since > gc_threshold) gc_collect();
+    /* Do NOT eagerly collect here — the caller may still hold a GC pointer
+       in a register that hasn't been stored to a shadow-stack slot yet.
+       The next allocation will check the threshold and collect if needed. */
 }
 
 /* ── Atoms (lock-free AtomicI64) ── */
@@ -348,10 +382,12 @@ int64_t weir_substring(int64_t ptr, int64_t start, int64_t end) {
     if (en > len) en = len;
     if (st > en) st = en;
     size_t sub_len = en - st;
-    char *out = malloc(sub_len + 1);
-    memcpy(out, s + st, sub_len);
-    out[sub_len] = '\0';
-    return (int64_t)(intptr_t)out;
+    /* Copy to temp buffer before GC alloc (input might be GC-managed) */
+    char *tmp = (char*)malloc(sub_len);
+    memcpy(tmp, s + st, sub_len);
+    int64_t result = gc_string_from_buf(tmp, sub_len);
+    free(tmp);
+    return result;
 }
 
 int64_t weir_string_ref(int64_t ptr, int64_t idx) {
@@ -366,19 +402,23 @@ int64_t weir_string_contains(int64_t haystack, int64_t needle) {
 int64_t weir_string_upcase(int64_t ptr) {
     const char *s = (const char*)(intptr_t)ptr;
     size_t len = strlen(s);
-    char *out = malloc(len + 1);
-    for (size_t i = 0; i <= len; i++)
-        out[i] = (s[i] >= 'a' && s[i] <= 'z') ? s[i] - 32 : s[i];
-    return (int64_t)(intptr_t)out;
+    char *tmp = (char*)malloc(len);
+    for (size_t i = 0; i < len; i++)
+        tmp[i] = (s[i] >= 'a' && s[i] <= 'z') ? s[i] - 32 : s[i];
+    int64_t result = gc_string_from_buf(tmp, len);
+    free(tmp);
+    return result;
 }
 
 int64_t weir_string_downcase(int64_t ptr) {
     const char *s = (const char*)(intptr_t)ptr;
     size_t len = strlen(s);
-    char *out = malloc(len + 1);
-    for (size_t i = 0; i <= len; i++)
-        out[i] = (s[i] >= 'A' && s[i] <= 'Z') ? s[i] + 32 : s[i];
-    return (int64_t)(intptr_t)out;
+    char *tmp = (char*)malloc(len);
+    for (size_t i = 0; i < len; i++)
+        tmp[i] = (s[i] >= 'A' && s[i] <= 'Z') ? s[i] + 32 : s[i];
+    int64_t result = gc_string_from_buf(tmp, len);
+    free(tmp);
+    return result;
 }
 
 int64_t weir_string_trim(int64_t ptr) {
@@ -388,10 +428,11 @@ int64_t weir_string_trim(int64_t ptr) {
     while (start < len && (s[start] == ' ' || s[start] == '\t' || s[start] == '\n' || s[start] == '\r')) start++;
     while (end > start && (s[end-1] == ' ' || s[end-1] == '\t' || s[end-1] == '\n' || s[end-1] == '\r')) end--;
     size_t sub_len = end - start;
-    char *out = malloc(sub_len + 1);
-    memcpy(out, s + start, sub_len);
-    out[sub_len] = '\0';
-    return (int64_t)(intptr_t)out;
+    char *tmp = (char*)malloc(sub_len);
+    memcpy(tmp, s + start, sub_len);
+    int64_t result = gc_string_from_buf(tmp, sub_len);
+    free(tmp);
+    return result;
 }
 
 int64_t weir_char_to_string(int64_t code) {
@@ -400,22 +441,23 @@ int64_t weir_char_to_string(int64_t code) {
     else if (code < 0x800) { buf[0] = 0xC0 | (code >> 6); buf[1] = 0x80 | (code & 0x3F); }
     else if (code < 0x10000) { buf[0] = 0xE0 | (code >> 12); buf[1] = 0x80 | ((code >> 6) & 0x3F); buf[2] = 0x80 | (code & 0x3F); }
     else { buf[0] = 0xF0 | (code >> 18); buf[1] = 0x80 | ((code >> 12) & 0x3F); buf[2] = 0x80 | ((code >> 6) & 0x3F); buf[3] = 0x80 | (code & 0x3F); }
-    return (int64_t)(intptr_t)strdup(buf);
+    return gc_string_from_buf(buf, strlen(buf));
 }
 
 /* ── File I/O ── */
 int64_t weir_read_file(int64_t path_ptr) {
     const char *path = (const char*)(intptr_t)path_ptr;
     FILE *f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "read-file failed: cannot open %s\n", path); return (int64_t)(intptr_t)strdup(""); }
+    if (!f) { fprintf(stderr, "read-file failed: cannot open %s\n", path); return gc_string_from_buf("", 0); }
     fseek(f, 0, SEEK_END);
     long len = ftell(f);
     fseek(f, 0, SEEK_SET);
-    char *buf = malloc(len + 1);
+    char *buf = (char*)malloc(len);
     fread(buf, 1, len, f);
-    buf[len] = '\0';
     fclose(f);
-    return (int64_t)(intptr_t)buf;
+    int64_t result = gc_string_from_buf(buf, (size_t)len);
+    free(buf);
+    return result;
 }
 
 void weir_write_file(int64_t path_ptr, int64_t contents_ptr) {

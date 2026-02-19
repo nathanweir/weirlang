@@ -1,0 +1,76 @@
+;; Test: GC + strings interaction
+;; Exercises string allocation under GC pressure:
+;;   - string concat in tight loops (triggers GC with live string temporaries)
+;;   - structs with string fields (validates pointer_mask for Ty::Str)
+;;   - multiple live string let bindings surviving collection
+
+;; ── String concat in a loop (GC pressure) ────────────────────
+
+;; Build a string by concatenating "x" repeatedly.
+;; GC threshold is 256KB; each iteration allocs a new string,
+;; so 5000 iterations should trigger several collections.
+(defn build-string ((n : i64) (acc : String)) : String
+  (if (= n 0) acc
+    (build-string (- n 1) (str acc "x"))))
+
+;; ── Struct with string field ─────────────────────────────────
+
+(defstruct Person
+  (name : String)
+  (age  : i64))
+
+(defn greet ((p : Person)) : String
+  (str "Hello, " (.name p) "! Age: " (.age p)))
+
+;; ── Struct with string field in a loop ───────────────────────
+
+;; Create many Person structs in a loop so GC must trace string
+;; fields inside structs correctly.
+(defn make-people ((n : i64) (last-greeting : String)) : String
+  (if (= n 0) last-greeting
+    (let ((p (Person (str "person-" n) n)))
+      (make-people (- n 1) (greet p)))))
+
+;; ── Multiple live strings across GC ──────────────────────────
+
+;; Allocate several strings, then force GC by building a large
+;; string, then verify the earlier strings are still alive.
+(defn multi-live-strings () : String
+  (let ((a "alpha")
+        (b "bravo")
+        (c "charlie")
+        ;; Force GC: build a ~5000-char string
+        (big (build-string 5000 ""))
+        ;; Use the original strings after GC
+        (result (str a " " b " " c)))
+    result))
+
+;; ── Vector of strings ────────────────────────────────────────
+
+;; Build a vector of strings, force GC, then read them back.
+(defn vec-of-strings () : String
+  (let ((v ["hello" "world" "foo" "bar"])
+        ;; Force GC
+        (big (build-string 5000 ""))
+        ;; Read back
+        (a (nth v 0))
+        (b (nth v 1)))
+    (str a " " b)))
+
+(defn main ()
+  ;; Test 1: string concat in loop
+  (let ((s (build-string 100 "start:")))
+    (println (string-length s)))
+
+  ;; Test 2: struct with string field
+  (let ((p (Person "Alice" 30)))
+    (println (greet p)))
+
+  ;; Test 3: struct + string in loop (GC pressure)
+  (println (make-people 1000 "none"))
+
+  ;; Test 4: multiple live strings surviving GC
+  (println (multi-live-strings))
+
+  ;; Test 5: vector of strings surviving GC
+  (println (vec-of-strings)))

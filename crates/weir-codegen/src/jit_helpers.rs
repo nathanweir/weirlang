@@ -8,10 +8,10 @@ use cranelift_jit::JITBuilder;
 use weir_runtime::{
     weir_arena_alloc, weir_arena_create, weir_arena_destroy, weir_arena_vec_alloc,
     weir_atom_cas, weir_atom_create, weir_atom_deref, weir_channel_create, weir_channel_recv,
-    weir_channel_send, weir_gc_alloc, weir_gc_collect, weir_gc_suppress, weir_gc_unsuppress,
-    weir_gc_vec_alloc, weir_par_for_each, weir_par_map, weir_shadow_pop, weir_shadow_push,
-    weir_thread_join, weir_thread_spawn, weir_vec_append, weir_vec_get, weir_vec_len,
-    weir_vec_set,
+    weir_channel_send, weir_gc_alloc, weir_gc_collect, weir_gc_str_alloc, weir_gc_str_dup,
+    weir_gc_suppress, weir_gc_unsuppress, weir_gc_vec_alloc, weir_par_for_each, weir_par_map,
+    weir_shadow_pop, weir_shadow_push, weir_thread_join, weir_thread_spawn, weir_vec_append,
+    weir_vec_get, weir_vec_len, weir_vec_set,
 };
 
 std::thread_local! {
@@ -79,10 +79,18 @@ extern "C" fn weir_print_str(ptr: i64) {
     emit_str(s);
 }
 
+/// Helper: allocate a GC-managed string from Rust bytes.
+fn gc_string_from_bytes(bytes: &[u8]) -> i64 {
+    let ptr = weir_gc_str_alloc(bytes.len() as i64);
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
+    }
+    ptr
+}
+
 extern "C" fn weir_i64_to_str(val: i64) -> i64 {
     let s = format!("{}", val);
-    let c_string = std::ffi::CString::new(s).unwrap();
-    c_string.into_raw() as i64
+    gc_string_from_bytes(s.as_bytes())
 }
 
 extern "C" fn weir_f64_to_str(val: f64) -> i64 {
@@ -91,17 +99,16 @@ extern "C" fn weir_f64_to_str(val: f64) -> i64 {
     } else {
         format!("{}", val)
     };
-    let c_string = std::ffi::CString::new(s).unwrap();
-    c_string.into_raw() as i64
+    gc_string_from_bytes(s.as_bytes())
 }
 
 extern "C" fn weir_bool_to_str(val: i8) -> i64 {
     let s = if val != 0 { "true" } else { "false" };
-    let c_string = std::ffi::CString::new(s).unwrap();
-    c_string.into_raw() as i64
+    gc_string_from_bytes(s.as_bytes())
 }
 
 extern "C" fn weir_str_concat(a: i64, b: i64) -> i64 {
+    // Read inputs into Rust-owned memory BEFORE allocating (GC safety)
     let a_str = unsafe { std::ffi::CStr::from_ptr(a as *const _) }
         .to_str()
         .unwrap_or("");
@@ -109,7 +116,7 @@ extern "C" fn weir_str_concat(a: i64, b: i64) -> i64 {
         .to_str()
         .unwrap_or("");
     let combined = format!("{}{}", a_str, b_str);
-    std::ffi::CString::new(combined).unwrap().into_raw() as i64
+    gc_string_from_bytes(combined.as_bytes())
 }
 
 extern "C" fn weir_str_eq(a: i64, b: i64) -> i8 {
@@ -186,7 +193,8 @@ extern "C" fn weir_substring(ptr: i64, start: i64, end: i64) -> i64 {
     } else {
         &s[start..end]
     };
-    std::ffi::CString::new(sub).unwrap().into_raw() as i64
+    let bytes = sub.as_bytes().to_vec(); // copy before GC alloc
+    gc_string_from_bytes(&bytes)
 }
 
 extern "C" fn weir_string_ref(ptr: i64, idx: i64) -> i64 {
@@ -210,25 +218,27 @@ extern "C" fn weir_string_contains(haystack: i64, needle: i64) -> i8 {
 
 extern "C" fn weir_string_upcase(ptr: i64) -> i64 {
     let c_str = unsafe { std::ffi::CStr::from_ptr(ptr as *const std::ffi::c_char) };
-    let s = c_str.to_str().unwrap_or("");
-    std::ffi::CString::new(s.to_uppercase()).unwrap().into_raw() as i64
+    let s = c_str.to_str().unwrap_or("").to_uppercase();
+    gc_string_from_bytes(s.as_bytes())
 }
 
 extern "C" fn weir_string_downcase(ptr: i64) -> i64 {
     let c_str = unsafe { std::ffi::CStr::from_ptr(ptr as *const std::ffi::c_char) };
-    let s = c_str.to_str().unwrap_or("");
-    std::ffi::CString::new(s.to_lowercase()).unwrap().into_raw() as i64
+    let s = c_str.to_str().unwrap_or("").to_lowercase();
+    gc_string_from_bytes(s.as_bytes())
 }
 
 extern "C" fn weir_string_trim(ptr: i64) -> i64 {
     let c_str = unsafe { std::ffi::CStr::from_ptr(ptr as *const std::ffi::c_char) };
     let s = c_str.to_str().unwrap_or("");
-    std::ffi::CString::new(s.trim()).unwrap().into_raw() as i64
+    let trimmed = s.trim().as_bytes().to_vec(); // copy before GC alloc
+    gc_string_from_bytes(&trimmed)
 }
 
 extern "C" fn weir_char_to_string(code: i64) -> i64 {
     let c = char::from_u32(code as u32).unwrap_or('\u{FFFD}');
-    std::ffi::CString::new(c.to_string()).unwrap().into_raw() as i64
+    let s = c.to_string();
+    gc_string_from_bytes(s.as_bytes())
 }
 
 // ── Time ─────────────────────────────────────────────────────────
@@ -289,13 +299,14 @@ extern "C" fn weir_read_key() -> i64 {
 extern "C" fn weir_read_file(path_ptr: i64) -> i64 {
     let c_str = unsafe { std::ffi::CStr::from_ptr(path_ptr as *const std::ffi::c_char) };
     let path = c_str.to_str().unwrap_or("");
-    match std::fs::read_to_string(path) {
-        Ok(contents) => std::ffi::CString::new(contents).unwrap().into_raw() as i64,
+    let contents = match std::fs::read_to_string(path) {
+        Ok(c) => c,
         Err(e) => {
             eprintln!("read-file failed: {}", e);
-            std::ffi::CString::new("").unwrap().into_raw() as i64
+            String::new()
         }
-    }
+    };
+    gc_string_from_bytes(contents.as_bytes())
 }
 
 extern "C" fn weir_write_file(path_ptr: i64, contents_ptr: i64) {
@@ -325,6 +336,8 @@ pub(crate) fn register_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol("weir_str_cmp", weir_str_cmp as *const u8);
     builder.symbol("weir_gc_alloc", weir_gc_alloc as *const u8);
     builder.symbol("weir_gc_vec_alloc", weir_gc_vec_alloc as *const u8);
+    builder.symbol("weir_gc_str_alloc", weir_gc_str_alloc as *const u8);
+    builder.symbol("weir_gc_str_dup", weir_gc_str_dup as *const u8);
     builder.symbol("weir_gc_collect", weir_gc_collect as *const u8);
     builder.symbol("weir_vec_get", weir_vec_get as *const u8);
     builder.symbol("weir_vec_len", weir_vec_len as *const u8);

@@ -332,6 +332,7 @@ impl<'a, M: Module> Compiler<'a, M> {
             // GC
             ("gc_alloc",     "weir_gc_alloc",     &[types::I64, types::I64],   Some(types::I64)),
             ("gc_vec_alloc", "weir_gc_vec_alloc", &[types::I64, types::I64],   Some(types::I64)),
+            ("gc_str_dup",   "weir_gc_str_dup",   &[types::I64],               Some(types::I64)),
             ("gc_collect",   "weir_gc_collect",   &[],                         None),
             ("gc_suppress",  "weir_gc_suppress",  &[],                         None),
             ("gc_unsuppress","weir_gc_unsuppress", &[],                        None),
@@ -1445,9 +1446,7 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
     /// Returns true if a value of this type is a GC heap pointer.
     fn is_heap_pointer(&self, ty: &Ty) -> bool {
         match ty {
-            Ty::Vector(_) | Ty::Fn(_, _) => true,
-            // Note: Ty::Str is NOT a GC heap pointer. Strings are malloc'd
-            // C strings (CString::into_raw), not GC-managed objects with ObjHeader.
+            Ty::Str | Ty::Vector(_) | Ty::Fn(_, _) => true,
             Ty::Con(name, _) => {
                 // Structs are always GC heap pointers
                 if self.struct_names.contains(name) {
@@ -1481,6 +1480,7 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
 
         let mut data_desc = DataDescription::new();
         data_desc.define(bytes.into_boxed_slice());
+        data_desc.set_align(8); // ShapeDesc contains u64, must be 8-byte aligned
         let data_id = self
             .module
             .declare_anonymous_data(false, false)
@@ -2022,7 +2022,8 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                 Ok(Some(val))
             }
             Literal::String(s) => {
-                // Embed string as null-terminated data in a Cranelift data section
+                // Embed string as null-terminated static data, then copy into a
+                // GC-managed allocation so the GC can track it uniformly.
                 let mut bytes = s.as_bytes().to_vec();
                 bytes.push(0); // null terminator
                 let mut data_desc = DataDescription::new();
@@ -2035,8 +2036,13 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                     .define_data(data_id, &data_desc)
                     .map_err(|e| CodegenError::new(format!("define string data: {}", e)))?;
                 let gv = self.module.declare_data_in_func(data_id, self.builder.func);
-                let ptr = self.builder.ins().global_value(types::I64, gv);
-                Ok(Some(ptr))
+                let static_ptr = self.builder.ins().global_value(types::I64, gv);
+                // Copy static string into GC-managed memory
+                let dup_id = self.runtime_fns["gc_str_dup"];
+                let dup_ref = self.module.declare_func_in_func(dup_id, self.builder.func);
+                let call = self.builder.ins().call(dup_ref, &[static_ptr]);
+                let gc_ptr = self.builder.inst_results(call)[0];
+                Ok(Some(gc_ptr))
             }
         }
     }
@@ -3566,6 +3572,16 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
         if args.is_empty() {
             return Err(CodegenError::new("str expects at least 1 argument"));
         }
+
+        // Suppress GC during multi-arg str concatenation to protect intermediate
+        // string temporaries that are not yet on the shadow stack.
+        let need_suppress = args.len() > 1;
+        if need_suppress {
+            let suppress_id = self.runtime_fns["gc_suppress"];
+            let suppress_ref = self.module.declare_func_in_func(suppress_id, self.builder.func);
+            self.builder.ins().call(suppress_ref, &[]);
+        }
+
         // Convert first arg to string
         let mut acc = self.compile_to_str(&args[0])?;
         // Convert and concatenate remaining args
@@ -3578,6 +3594,13 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
             let call = self.builder.ins().call(func_ref, &[acc, s]);
             acc = self.builder.inst_results(call)[0];
         }
+
+        if need_suppress {
+            let unsuppress_id = self.runtime_fns["gc_unsuppress"];
+            let unsuppress_ref = self.module.declare_func_in_func(unsuppress_id, self.builder.func);
+            self.builder.ins().call(unsuppress_ref, &[]);
+        }
+
         Ok(Some(acc))
     }
 
@@ -5377,6 +5400,70 @@ mod tests {
             compiled, interpreted,
             "strings: compiler and interpreter disagree"
         );
+    }
+
+    #[test]
+    fn fixture_gc_strings() {
+        let compiled = run_fixture_compiled("gc-strings");
+        let interpreted = run_fixture_interpreted("gc-strings");
+        assert_eq!(
+            compiled, interpreted,
+            "gc-strings: compiler and interpreter disagree"
+        );
+    }
+
+    #[test]
+    fn test_string_concat_loop_gc_pressure() {
+        // String concatenation in a tight loop forces GC collections
+        // while live string temporaries are on the shadow stack.
+        let source = format!(
+            "{}\n{}",
+            PRELUDE_SOURCE,
+            "(defn build ((n : i64) (acc : String)) : String
+               (if (= n 0) acc (build (- n 1) (str acc \"x\"))))
+             (defn main () (println (string-length (build 10000 \"\"))))"
+        );
+        let out = compile_run(&source);
+        assert_eq!(out, "10000\n");
+    }
+
+    #[test]
+    fn test_struct_with_string_field_gc() {
+        // Struct containing a string field; GC must trace the pointer slot.
+        let source = format!(
+            "{}\n{}",
+            PRELUDE_SOURCE,
+            "(defstruct Wrapper (s : String) (n : i64))
+             (defn build ((n : i64) (acc : String)) : String
+               (if (= n 0) acc (build (- n 1) (str acc \"x\"))))
+             (defn main ()
+               (let ((w (Wrapper \"hello\" 42))
+                     (big (build 10000 \"\")))
+                 (println (str (.s w) \" \" (.n w)))))"
+        );
+        let out = compile_run(&source);
+        assert_eq!(out, "hello 42\n");
+    }
+
+    #[test]
+    fn test_multiple_live_strings_across_gc() {
+        // Multiple string let bindings must survive a GC triggered by
+        // heavy allocation between the bindings and their use.
+        let source = format!(
+            "{}\n{}",
+            PRELUDE_SOURCE,
+            "(defn build ((n : i64) (acc : String)) : String
+               (if (= n 0) acc (build (- n 1) (str acc \"x\"))))
+             (defn main ()
+               (let ((a \"alpha\")
+                     (b \"bravo\")
+                     (c \"charlie\")
+                     (big (build 10000 \"\"))
+                     (result (str a \" \" b \" \" c)))
+                 (println result)))"
+        );
+        let out = compile_run(&source);
+        assert_eq!(out, "alpha bravo charlie\n");
     }
 
     // ── Codegen error tests ────────────────────────────────────
