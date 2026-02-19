@@ -69,7 +69,6 @@ The type system prevents data races at compile time via a `Shareable` typeclass 
 |---|---|---|
 | Immutable values | Always | No mutation = no data races |
 | Mutable bindings (`mut`) | No | Could be reassigned concurrently |
-| Mutable references (`ref`) | No | Could mutate shared data concurrently |
 | `(Atom a)` | Yes, if `a` is `Shareable` | CAS provides safe concurrent access |
 | `(Channel a)` | Yes, if `a` is `Shareable` | Channels are designed for cross-thread use |
 | Arena-scoped values | Never | Can't even escape their scope, let alone cross threads |

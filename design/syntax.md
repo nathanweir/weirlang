@@ -12,7 +12,7 @@
 | Typeclass constraints | Prefix with `=>`: `(=> (Eq 'a) ...)` |
 | Pattern matching | Each case wrapped in parens |
 | Record field access | Coalton-style `.field` accessor functions |
-| Mutability | `mut` for reassignable bindings, `ref` for mutable references |
+| Mutability | `mut` for reassignable bindings, functional struct update for modified copies |
 | Collection literals | `[]` for arrays/vectors, `{}` for maps |
 | Functions | Multi-argument (not curried) |
 | String formatting | `format` macro (compile-time checked) + `str` function |
@@ -161,12 +161,9 @@ Coalton-style: `.field` is a first-class accessor function.
 
 ## Mutability syntax
 
-Two distinct concepts, two distinct keywords:
+Weir is immutable by default. Mutation requires explicit opt-in via `mut`. There are no mutable references — functions cannot modify the caller's data. Instead, use functional struct update to create modified copies.
 
-- **`mut`** — the local binding is reassignable. Value semantics. The caller's data is never affected.
-- **`ref`** — a mutable reference. The function can modify the caller's data in place.
-
-`set!` for mutation (Scheme convention — `!` suffix signals mutation).
+`set!` for reassignment (Scheme convention — `!` suffix signals mutation).
 
 ### `mut` — reassignable bindings
 
@@ -187,34 +184,28 @@ Two distinct concepts, two distinct keywords:
   x)
 ```
 
-### `ref` — mutable references
+### Functional struct update
 
-For functions that need to modify the caller's data in place. The caller must pass a `mut` binding.
-
-```lisp
-;; Function takes a mutable reference
-(defn damage ((ref e : Enemy) (amount : i32)) : Unit
-  (set! (.health e) (- (.health e) amount)))
-
-;; Caller must have a mut binding
-(let ((mut e (spawn-enemy :pos (vec2 0 0) :health 100 :state Idle)))
-  (damage e 10)    ;; e.health is now 90
-  (.health e))     ;; => 90
-```
-
-Field mutation via `set!` is only valid through a `ref` parameter. Without `ref`, struct fields are read-only:
+To produce a modified copy of a struct, use the `update` form. The original is unchanged — no aliasing, no side effects visible to the caller.
 
 ```lisp
-;; Immutable binding — can read fields, not mutate them
-(let ((e (spawn-enemy ...)))
-  (.health e)                          ;; OK — read
-  (set! (.health e) 50))              ;; COMPILE ERROR — e is not a mutable reference
+;; Create a modified copy with one field changed
+(defn damage ((e : Enemy) (amount : i32)) : Enemy
+  (update e :health (- (.health e) amount)))
 
-;; mut binding without ref — can reassign the whole binding, not individual fields
-(let ((mut e (spawn-enemy ...)))
-  (set! e (spawn-enemy ...))           ;; OK — reassign entire binding
-  (set! (.health e) 50))              ;; COMPILE ERROR — use ref in a function to mutate fields
+;; The original is unaffected
+(let ((e (spawn-enemy :pos (vec2 0 0) :health 100 :state Idle))
+      (e2 (damage e 10)))
+  (.health e)    ;; => 100 (unchanged)
+  (.health e2))  ;; => 90
+
+;; Multiple fields
+(update enemy
+  :health (- (.health enemy) damage)
+  :state (if (< (.health enemy) 0) Dead (.state enemy)))
 ```
+
+With arenas, functional update is near-zero-cost for hot paths (bump allocation is a pointer increment). The compiler can potentially optimize single-use updates into in-place mutation as a future optimization.
 
 ### Summary
 
@@ -222,7 +213,7 @@ Field mutation via `set!` is only valid through a `ref` parameter. Without `ref`
 |---|---|---|---|
 | (none) | Immutable binding | No | No |
 | `mut` | Reassignable binding | No | No |
-| `ref` (in params) | Mutable reference | Yes, via `set!` | Yes |
+| `update` | Functional struct update | Creates new copy | No |
 
 For the parser, a binding is one of:
 - `(name value)` — immutable, type inferred
@@ -233,7 +224,6 @@ For the parser, a binding is one of:
 A function parameter is one of:
 - `(name : type)` — immutable
 - `(mut name : type)` — reassignable local copy
-- `(ref name : type)` — mutable reference to caller's data
 
 ## Collection literals
 
@@ -834,7 +824,6 @@ Safe Rust code (the vast majority of the runtime/stdlib) does not require `unsaf
 ## Open questions
 
 
-- Functional update syntax for structs (creating modified copies without `ref`)
 - Named arguments + threading macro interaction (where does threaded value go?)
 
 - `pub` modifier syntax (wrapper vs inline modifier — revisit with more examples)

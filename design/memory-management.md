@@ -53,44 +53,18 @@ This is **not** Rust-style lifetime checking. Key differences:
 
 #### Why it works in practice
 
-Despite the theoretical incompleteness, several properties of Weir's current design make interprocedural escape difficult:
+Despite the theoretical incompleteness, several **permanent** properties of Weir's design make interprocedural escape impossible through normal code:
 
-- **No mutable references.** Function arguments are passed by value (copying the pointer). The callee cannot modify the caller's bindings.
+- **No mutable references.** Function arguments are passed by value (copying the pointer). The callee cannot modify the caller's bindings. This is a deliberate design choice, not a temporary limitation — see `future-work.md` for the full evaluation.
 - **No global mutable state.** There are no top-level mutable variables to stash arena pointers in.
 - **Closures capture by value.** A closure copies captured values into its environment at creation time. `set!` inside a closure modifies the copy, not the original.
 - **Conservative call tagging.** Any function call returning a heap type inside an arena block gets arena provenance, preventing the return value from escaping — even if the function actually allocated from the GC.
 
 These properties mean the only way to persist an arena pointer past the block boundary is through `set!` to an outer variable (caught) or returning it (caught). Without mutable references or global state, there is no indirect mutation path.
 
-#### Future risk
-
-If Weir adds mutable references, global state, or FFI that allows storing arbitrary pointers, the escape analysis will need to be strengthened — either with lifetime annotations on function parameters or with runtime safety checks (tagging arena pointers).
+FFI (`extern "C"`) can trivially escape arena pointers since foreign functions are opaque to the compiler. This is expected and acceptable — FFI is inherently `unsafe`.
 
 If data needs to outlive the arena, it should be GC-allocated instead — that's a design signal that the data isn't transient.
-
-#### Known escape vector: `ref` parameters
-
-Once `ref` parameters (mutable references) are implemented, the lexical escape analysis will have a concrete exploit. A function receiving a `ref` to an outer variable can smuggle an arena pointer out of the block, because the `set!` happens inside the callee — outside the `with-arena` block lexically:
-
-```lisp
-(defn stash ((ref target : (Vector i64)) (v : (Vector i64))) : Unit
-  (set! target v))   ;; lexically NOT inside with-arena — uncaught
-
-(defn main () : Unit
-  (let ((mut holder [0]))
-    (with-arena a
-      (let ((v [42 43 44]))
-        (stash holder v)   ;; smuggles arena pointer into holder via ref
-        0))
-    (println (nth holder 0))))   ;; use-after-free: arena is destroyed
-```
-
-**TODO (post-`ref` implementation):** Build and run this example to demonstrate the limitation explicitly. Then evaluate mitigation options:
-1. Forbid passing arena-provenance values to `ref` parameters (simplest, may be too restrictive)
-2. Add provenance annotations to `ref` parameters (mini-lifetime system)
-3. Runtime tagging of arena pointers with a check on `ref` write-back
-
-Similarly, FFI (`extern "C"`) can trivially escape arena pointers since foreign functions are opaque to the compiler. This is expected and acceptable — FFI is inherently `unsafe`.
 
 ### GC design considerations
 
@@ -116,4 +90,4 @@ The type system must track arena provenance to enforce escape prevention. This i
 - Should there be named arenas (multiple concurrent arenas with different lifetimes)? Arenas have names for diagnostics but names are not semantically meaningful yet.
 - Should arena size be configurable per-block, or globally set? Currently fixed at 64 KB initial chunk, doubling on growth.
 - ~~Can arenas be nested?~~ **Resolved: yes.** Inner arena values cannot escape to the outer arena. Each arena manages its own memory independently.
-- Should the escape analysis be strengthened before adding mutable references or FFI? The current lexical analysis is sufficient for the language's current feature set but would need lifetime annotations or runtime checks to remain safe with mutable references.
+- ~~Should the escape analysis be strengthened before adding mutable references?~~ **Resolved: not needed.** Mutable references (`ref`) were evaluated and dropped from the design. Without `ref`, the lexical escape analysis is sound. See `future-work.md` for the full evaluation.

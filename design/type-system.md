@@ -206,6 +206,6 @@ The exact syntax is TBD, but will likely blend elements:
 - How do functional dependencies work syntactically in S-expressions?
 - What's the kind system? (Need at least `*` and `* -> *` for HKTs)
 - Should there be a `Num` typeclass hierarchy or simpler numeric types?
-- Mutation model decided: `mut` for reassignable bindings, `ref` for mutable references. See syntax.md for details.
+- Mutation model decided: `mut` for reassignable bindings, functional struct update for modified copies. No mutable references — see syntax.md for details and future-work.md for the `ref` evaluation.
 - Error handling decided: `Result` type + `?` propagation + `From` typeclass for error conversion. See syntax.md.
 - Numeric types decided: full set (i8–i64, u8–u64, f32, f64); defaults i32/f64. Numeric typeclass hierarchy TBD.

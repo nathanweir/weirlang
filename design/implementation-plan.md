@@ -306,7 +306,6 @@ Items deferred from earlier phases that don't depend on the runtime (Phase 9) or
   - 603 tests pass (33 new: parser, typechecker, codegen oracle, AOT)
 - [x] **Result + ? operator**: error propagation in codegen — *done in Phase 8b*
 - [x] Verify: cascade works for all change types, concurrency primitives work through dev-session indirect dispatch (3 new dev-session tests for concurrency constructs)
-- [ ] **Arena escape hardening** — *deferred: `ref` parameters are not yet planned or implemented. When they are, revisit the use-after-free vector described in `design/memory-management.md` ("Known escape vector: `ref` parameters"). Mitigation options: forbid arena values in `ref` params, provenance annotations, or runtime tagging.*
 
 ## Milestone summary
 

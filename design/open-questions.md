@@ -11,6 +11,7 @@ Remaining design questions organized by topic. See individual design documents f
 - [macro-system.md](macro-system.md) — Macros and their interaction with types/reloading
 - [concurrency.md](concurrency.md) — Layered concurrency model with compile-time safety
 - [syntax.md](syntax.md) — Syntax decisions, type annotation style, collection literals
+- [future-work.md](future-work.md) — Deferred features with analysis and reconsideration criteria
 - [implementation-plan.md](implementation-plan.md) — Phased implementation roadmap
 
 ## Decision summary
@@ -42,7 +43,7 @@ Remaining design questions organized by topic. See individual design documents f
 | Struct construction | Type name is constructor; positional and named args |
 | Control flow | `if` (else required when used as expression), `cond` (else required), `when`/`unless` |
 | Unit type | `Unit` — the "no meaningful value" type |
-| Mutation | `mut` for reassignable bindings, `ref` for mutable references |
+| Mutation | `mut` for reassignable bindings, functional struct update for modified copies (no mutable references) |
 | Error handling | `Result` type + `?` propagation + `From` for error conversion |
 | Lambdas | `(fn (params) body)`, capture by reference |
 | FFI | C FFI via `extern "C"` + `unsafe`; safe Rust wrappers for stdlib |
@@ -87,7 +88,6 @@ Remaining design questions organized by topic. See individual design documents f
 
 ### Syntax
 
-- Functional update syntax for structs (creating modified copies without `ref`)
 - Named arguments + threading macro interaction
 
 - `pub` modifier syntax (revisit with more examples)
