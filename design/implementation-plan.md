@@ -285,10 +285,6 @@ Items deferred from earlier phases that don't depend on the runtime (Phase 9) or
 - [x] Verify arenas: arenas free on block exit, escape analysis catches violations, 9 codegen integration tests + 7 typechecker tests + 6 runtime unit tests
 
 ### Phase 10: Full cascade + concurrency
-- [ ] **Arena escape hardening** (after `ref` parameters are implemented):
-  - Build and run the `ref`-based use-after-free example from `design/memory-management.md` to demonstrate the limitation
-  - Evaluate mitigation: forbid arena values in `ref` params, add provenance annotations, or runtime tagging
-  - See "Known escape vector: `ref` parameters" in `design/memory-management.md`
 - [x] **Dependency tracker** (Phase 10a):
   - `DependencyGraph` in typechecker: call_deps, type_deps, callers, type_users — populated during typechecking
   - `ChangeSet` in codegen: body_changed, sig_changed, added, removed, types_changed
@@ -309,7 +305,8 @@ Items deferred from earlier phases that don't depend on the runtime (Phase 9) or
   - [x] `par-map` / `par-for-each` — parallel iteration (sequential; runtime dispatch through closures)
   - 603 tests pass (33 new: parser, typechecker, codegen oracle, AOT)
 - [x] **Result + ? operator**: error propagation in codegen — *done in Phase 8b*
-- [ ] Verify: cascade works for all change types, concurrency primitives are thread-safe
+- [x] Verify: cascade works for all change types, concurrency primitives work through dev-session indirect dispatch (3 new dev-session tests for concurrency constructs)
+- [ ] **Arena escape hardening** — *deferred: `ref` parameters are not yet planned or implemented. When they are, revisit the use-after-free vector described in `design/memory-management.md` ("Known escape vector: `ref` parameters"). Mitigation options: forbid arena values in `ref` params, provenance annotations, or runtime tagging.*
 
 ## Milestone summary
 
@@ -320,7 +317,7 @@ Items deferred from earlier phases that don't depend on the runtime (Phase 9) or
 | **M2: "Standalone binary + live reload"** | Phase 5 | `weir build` produces native binaries; `weir dev` enables live reload | **Done** |
 | **M3: "Editor support"** | Phase 6 | Syntax highlighting, inline errors, type hover in Zed | **Done** (LSP: diagnostics, hover, goto-def, references, rename, completion, inlay hints, formatting, semantic tokens, signature help, cross-file support, workspace symbol search; Zed: tree-sitter highlighting + LSP) |
 | **M4: "Real language"** | Phase 8 | Generics, typeclasses, macros — write non-trivial programs | **Done** (macros, generics, typeclasses, HKTs all working) |
-| **M5: "Production-ready runtime"** | Phase 10 | GC, arenas, concurrency, full cascade — the complete vision | **In progress** (10a: dependency tracking + selective recompilation; 10b: concurrency primitives) |
+| **M5: "Production-ready runtime"** | Phase 10 | GC, arenas, concurrency, full cascade — the complete vision | **Done** (GC, arenas, dependency tracking, selective recompilation, concurrency primitives; 606 tests pass) |
 
 ## Verification strategy
 

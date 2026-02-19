@@ -6868,4 +6868,110 @@ mod tests {
                  (println (nth doubled 2))))",
         );
     }
+
+    // ── Dev session concurrency tests ────────────────────────────────
+
+    #[test]
+    fn test_dev_session_atom_reload() {
+        let source_v1 = "(defn get-delta () : i64 1)
+             (defn main () : Unit
+               (let ((a (atom 0))
+                     (inc (fn ((x : i64)) : i64 (+ x (get-delta)))))
+                 (swap! a inc)
+                 (println (deref a))))";
+        let mut session = DevSession::new(source_v1).expect("DevSession::new failed");
+        let out1 = session.run_main().expect("run_main v1 failed");
+        assert_eq!(out1, "1\n");
+
+        // Change get-delta body — atom builtins should still work
+        // through indirect dispatch after reload
+        let source_v2 = "(defn get-delta () : i64 10)
+             (defn main () : Unit
+               (let ((a (atom 0))
+                     (inc (fn ((x : i64)) : i64 (+ x (get-delta)))))
+                 (swap! a inc)
+                 (println (deref a))))";
+        let result = session.reload(source_v2).expect("reload failed");
+        assert!(
+            result.recompiled.iter().any(|n| n == "get-delta"),
+            "get-delta should be recompiled: {:?}",
+            result.recompiled
+        );
+
+        let out2 = session.run_main().expect("run_main v2 failed");
+        assert_eq!(out2, "10\n");
+    }
+
+    #[test]
+    fn test_dev_session_with_tasks_reload() {
+        let source_v1 = "(defn work () : Unit (println 1))
+             (defn main () : Unit
+               (with-tasks
+                 (spawn (work))))";
+        let mut session = DevSession::new(source_v1).expect("DevSession::new failed");
+        let out1 = session.run_main().expect("run_main v1 failed");
+        assert_eq!(out1, "1\n");
+
+        // Change the function called inside spawn — cascade should recompile it
+        let source_v2 = "(defn work () : Unit (println 2))
+             (defn main () : Unit
+               (with-tasks
+                 (spawn (work))))";
+        let result = session.reload(source_v2).expect("reload failed");
+        assert!(
+            result.recompiled.iter().any(|n| n == "work"),
+            "work should be recompiled: {:?}",
+            result.recompiled
+        );
+
+        let out2 = session.run_main().expect("run_main v2 failed");
+        assert_eq!(out2, "2\n");
+    }
+
+    #[test]
+    fn test_dev_session_concurrency_matches_jit() {
+        // Verify dev-mode indirect dispatch matches direct-call JIT for concurrency programs
+        let programs = &[
+            // atom create + deref
+            "(defn main () : Unit
+               (let ((a (atom 42)))
+                 (println (deref a))))",
+            // atom swap!
+            "(defn main () : Unit
+               (let ((a (atom 0))
+                     (inc (fn ((x : i64)) : i64 (+ x 1))))
+                 (swap! a inc)
+                 (swap! a inc)
+                 (swap! a inc)
+                 (println (deref a))))",
+            // with-tasks + spawn
+            "(defn main () : Unit
+               (with-tasks
+                 (spawn (println 1))
+                 (spawn (println 2))))",
+            // par-for-each
+            "(defn main () : Unit
+               (par-for-each (fn ((x : i64)) : Unit (println x)) [10 20 30]))",
+            // par-map
+            "(defn main () : Unit
+               (let ((doubled (par-map (fn ((x : i64)) : i64 (* x 2)) [1 2 3])))
+                 (println (nth doubled 0))
+                 (println (nth doubled 1))
+                 (println (nth doubled 2))))",
+        ];
+
+        for (i, source) in programs.iter().enumerate() {
+            let jit_output = compile_run(source);
+            let session = DevSession::new(source)
+                .unwrap_or_else(|e| panic!("DevSession::new failed for program {}: {}", i, e));
+            let dev_output = session
+                .run_main()
+                .unwrap_or_else(|e| panic!("run_main failed for program {}: {}", i, e));
+            assert_eq!(
+                jit_output, dev_output,
+                "program {}: JIT and dev-mode disagree",
+                i
+            );
+        }
+    }
 }
