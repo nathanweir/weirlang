@@ -10,7 +10,7 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use smol_str::SmolStr;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
 use std::sync::atomic::{AtomicPtr, Ordering};
@@ -147,6 +147,48 @@ extern "C" fn weir_str_eq(a: i64, b: i64) -> i8 {
     if a_str == b_str { 1 } else { 0 }
 }
 
+extern "C" fn weir_alloc(size_bytes: i64) -> i64 {
+    let layout = std::alloc::Layout::from_size_align(size_bytes as usize, 8).unwrap();
+    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+    ptr as i64
+}
+
+extern "C" fn weir_vec_alloc(len: i64) -> i64 {
+    let total_bytes = (1 + len) * 8;
+    let ptr = weir_alloc(total_bytes);
+    // Store length at offset 0
+    unsafe {
+        *(ptr as *mut i64) = len;
+    }
+    ptr
+}
+
+extern "C" fn weir_vec_get(ptr: i64, idx: i64) -> i64 {
+    unsafe {
+        let base = ptr as *const i64;
+        *base.offset(1 + idx as isize)
+    }
+}
+
+extern "C" fn weir_vec_len(ptr: i64) -> i64 {
+    unsafe { *(ptr as *const i64) }
+}
+
+extern "C" fn weir_vec_append(ptr: i64, elem: i64) -> i64 {
+    let old_len = weir_vec_len(ptr);
+    let new_len = old_len + 1;
+    let new_ptr = weir_vec_alloc(new_len);
+    // Copy old elements
+    unsafe {
+        let src = (ptr as *const i64).offset(1);
+        let dst = (new_ptr as *mut i64).offset(1);
+        std::ptr::copy_nonoverlapping(src, dst, old_len as usize);
+        // Write new element
+        *dst.offset(old_len as isize) = elem;
+    }
+    new_ptr
+}
+
 // ── C runtime for AOT binaries ──────────────────────────────────
 
 const AOT_RUNTIME_C: &str = r#"
@@ -191,6 +233,31 @@ int64_t weir_str_eq(int64_t a, int64_t b) {
     return strcmp((const char*)a, (const char*)b) == 0 ? 1 : 0;
 }
 
+int64_t weir_alloc(int64_t size_bytes) {
+    void *p = calloc(1, (size_t)size_bytes);
+    return (int64_t)p;
+}
+int64_t weir_vec_alloc(int64_t len) {
+    int64_t total = (1 + len) * 8;
+    int64_t ptr = weir_alloc(total);
+    *(int64_t*)ptr = len;
+    return ptr;
+}
+int64_t weir_vec_get(int64_t ptr, int64_t idx) {
+    return ((int64_t*)ptr)[1 + idx];
+}
+int64_t weir_vec_len(int64_t ptr) {
+    return *(int64_t*)ptr;
+}
+int64_t weir_vec_append(int64_t ptr, int64_t elem) {
+    int64_t old_len = weir_vec_len(ptr);
+    int64_t new_len = old_len + 1;
+    int64_t new_ptr = weir_vec_alloc(new_len);
+    memcpy((int64_t*)new_ptr + 1, (int64_t*)ptr + 1, old_len * 8);
+    ((int64_t*)new_ptr)[1 + old_len] = elem;
+    return new_ptr;
+}
+
 int main(void) { weir_main(); return 0; }
 "#;
 
@@ -205,6 +272,8 @@ fn ty_to_cl_with(ty: &Ty, tagged_adts: Option<&HashMap<SmolStr, TaggedAdt>>) -> 
         Ty::F32 => Some(types::F32),
         Ty::F64 => Some(types::F64),
         Ty::Str => Some(types::I64), // pointer to null-terminated C string
+        Ty::Vector(_) => Some(types::I64), // pointer to heap [len, elem_0, ...]
+        Ty::Fn(_, _) => Some(types::I64), // pointer to heap closure object
         Ty::Unit => None, // void — no value
         Ty::Con(name, _) => {
             if let Some(adts) = tagged_adts {
@@ -272,6 +341,11 @@ pub fn compile_and_run(
     builder.symbol("weir_bool_to_str", weir_bool_to_str as *const u8);
     builder.symbol("weir_str_concat", weir_str_concat as *const u8);
     builder.symbol("weir_str_eq", weir_str_eq as *const u8);
+    builder.symbol("weir_alloc", weir_alloc as *const u8);
+    builder.symbol("weir_vec_alloc", weir_vec_alloc as *const u8);
+    builder.symbol("weir_vec_get", weir_vec_get as *const u8);
+    builder.symbol("weir_vec_len", weir_vec_len as *const u8);
+    builder.symbol("weir_vec_append", weir_vec_append as *const u8);
 
     let jit_module = JITModule::new(builder);
 
@@ -384,6 +458,17 @@ struct TaggedAdt {
     field_counts: Vec<usize>,
 }
 
+/// Info about a lambda that needs to be compiled after the enclosing function.
+struct LambdaInfo {
+    func_id: FuncId,
+    name: SmolStr,
+    param_tys: Vec<Ty>,
+    ret_ty: Ty,
+    params: Vec<Param>,
+    body: Vec<ExprId>,
+    captures: Vec<(SmolStr, Ty)>,
+}
+
 struct Compiler<'a, M: Module> {
     ast_module: &'a weir_ast::Module,
     type_info: &'a TypeCheckResult,
@@ -397,6 +482,8 @@ struct Compiler<'a, M: Module> {
     tagged_adts: HashMap<SmolStr, TaggedAdt>,
     /// Constructor name -> ConstructorInfo
     constructor_tags: HashMap<SmolStr, ConstructorInfo>,
+    /// Counter for generating unique lambda names
+    lambda_counter: usize,
 }
 
 impl<'a, M: Module> Compiler<'a, M> {
@@ -455,6 +542,7 @@ impl<'a, M: Module> Compiler<'a, M> {
             runtime_fns: HashMap::new(),
             tagged_adts,
             constructor_tags,
+            lambda_counter: 0,
         }
     }
 
@@ -585,6 +673,63 @@ impl<'a, M: Module> Compiler<'a, M> {
             .declare_function("weir_str_eq", Linkage::Import, &sig)
             .map_err(|e| CodegenError::new(format!("declare weir_str_eq: {}", e)))?;
         self.runtime_fns.insert("str_eq", id);
+
+        // weir_alloc(i64) -> i64
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.call_conv = CallConv::SystemV;
+        let id = self
+            .module
+            .declare_function("weir_alloc", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::new(format!("declare weir_alloc: {}", e)))?;
+        self.runtime_fns.insert("alloc", id);
+
+        // weir_vec_alloc(i64) -> i64
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.call_conv = CallConv::SystemV;
+        let id = self
+            .module
+            .declare_function("weir_vec_alloc", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::new(format!("declare weir_vec_alloc: {}", e)))?;
+        self.runtime_fns.insert("vec_alloc", id);
+
+        // weir_vec_get(i64, i64) -> i64
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.call_conv = CallConv::SystemV;
+        let id = self
+            .module
+            .declare_function("weir_vec_get", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::new(format!("declare weir_vec_get: {}", e)))?;
+        self.runtime_fns.insert("vec_get", id);
+
+        // weir_vec_len(i64) -> i64
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.call_conv = CallConv::SystemV;
+        let id = self
+            .module
+            .declare_function("weir_vec_len", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::new(format!("declare weir_vec_len: {}", e)))?;
+        self.runtime_fns.insert("vec_len", id);
+
+        // weir_vec_append(i64, i64) -> i64
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.call_conv = CallConv::SystemV;
+        let id = self
+            .module
+            .declare_function("weir_vec_append", Linkage::Import, &sig)
+            .map_err(|e| CodegenError::new(format!("declare weir_vec_append: {}", e)))?;
+        self.runtime_fns.insert("vec_append", id);
 
         Ok(())
     }
@@ -783,6 +928,10 @@ impl<'a, M: Module> Compiler<'a, M> {
                 let con_expr = &self.ast_module.type_exprs[*constructor];
                 match &con_expr.kind {
                     TypeExprKind::Named(name) => {
+                        if name == "Vector" && args.len() == 1 {
+                            let elem_ty = self.resolve_type_expr_to_ty(args[0])?;
+                            return Ok(Ty::Vector(Box::new(elem_ty)));
+                        }
                         let name_smol = SmolStr::new(name.as_str());
                         if self.tagged_adts.contains_key(&name_smol) {
                             // Resolve args (for type checking), but the runtime rep is just i64
@@ -802,6 +951,17 @@ impl<'a, M: Module> Compiler<'a, M> {
                         "complex type expressions not yet supported in codegen",
                     )),
                 }
+            }
+            TypeExprKind::Fn {
+                params,
+                return_type,
+            } => {
+                let mut param_tys = Vec::new();
+                for &p in params {
+                    param_tys.push(self.resolve_type_expr_to_ty(p)?);
+                }
+                let ret_ty = self.resolve_type_expr_to_ty(*return_type)?;
+                Ok(Ty::Fn(param_tys, Box::new(ret_ty)))
             }
             _ => Err(CodegenError::new(
                 "complex type expressions not yet supported in codegen",
@@ -935,7 +1095,7 @@ impl<'a, M: Module> Compiler<'a, M> {
         builder.switch_to_block(entry_block);
         builder.seal_block(entry_block);
 
-        {
+        let pending_lambdas = {
             let mut fn_ctx = FnCompileCtx {
                 builder: &mut builder,
                 ast_module: self.ast_module,
@@ -948,6 +1108,8 @@ impl<'a, M: Module> Compiler<'a, M> {
                 table_data_id,
                 tagged_adts: &self.tagged_adts,
                 constructor_tags: &self.constructor_tags,
+                pending_lambdas: Vec::new(),
+                lambda_counter: &mut self.lambda_counter,
             };
 
             // Bind parameters to variables
@@ -983,7 +1145,10 @@ impl<'a, M: Module> Compiler<'a, M> {
             } else {
                 fn_ctx.builder.ins().return_(&[]);
             }
-        } // fn_ctx dropped here, releasing borrows
+
+            // Extract pending lambdas before fn_ctx is dropped
+            std::mem::take(&mut fn_ctx.pending_lambdas)
+        };
 
         builder.finalize();
 
@@ -992,7 +1157,127 @@ impl<'a, M: Module> Compiler<'a, M> {
             .define_function(func_id, &mut ctx)
             .map_err(|e| CodegenError::new(format!("define fn '{}': {}", defn.name, e)))?;
 
+        // Compile any pending lambdas (and their nested lambdas)
+        let mut lambdas = pending_lambdas;
+        while !lambdas.is_empty() {
+            let batch = std::mem::take(&mut lambdas);
+            for info in batch {
+                let nested = self.compile_lambda(&info, fn_table_slots, table_data_id)?;
+                lambdas.extend(nested);
+            }
+        }
+
         Ok(())
+    }
+
+    /// Compile a lambda body (like compile_function_named but for closures).
+    fn compile_lambda(
+        &mut self,
+        info: &LambdaInfo,
+        fn_table_slots: Option<&HashMap<SmolStr, usize>>,
+        table_data_id: Option<DataId>,
+    ) -> Result<Vec<LambdaInfo>, CodegenError> {
+        let adts = &self.tagged_adts;
+
+        // Build signature: (env_ptr: i64, param_0, param_1, ...) -> ret
+        let mut sig = self.module.make_signature();
+        sig.call_conv = CallConv::SystemV;
+        sig.params.push(AbiParam::new(types::I64)); // env_ptr
+        for pty in &info.param_tys {
+            if let Some(cl_ty) = ty_to_cl_with(pty, Some(adts)) {
+                sig.params.push(AbiParam::new(cl_ty));
+            }
+        }
+        if let Some(cl_ty) = ty_to_cl_with(&info.ret_ty, Some(adts)) {
+            sig.returns.push(AbiParam::new(cl_ty));
+        }
+
+        let mut func =
+            Function::with_name_signature(cranelift_codegen::ir::UserFuncName::default(), sig);
+
+        let mut fb_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut func, &mut fb_ctx);
+
+        let entry_block = builder.create_block();
+        builder.append_block_params_for_function_params(entry_block);
+        builder.switch_to_block(entry_block);
+        builder.seal_block(entry_block);
+
+        let pending_lambdas = {
+            let mut fn_ctx = FnCompileCtx {
+                builder: &mut builder,
+                ast_module: self.ast_module,
+                type_info: self.type_info,
+                user_fns: &self.user_fns,
+                runtime_fns: &self.runtime_fns,
+                module: &mut self.module,
+                vars: HashMap::new(),
+                fn_table_slots,
+                table_data_id,
+                tagged_adts: &self.tagged_adts,
+                constructor_tags: &self.constructor_tags,
+                pending_lambdas: Vec::new(),
+                lambda_counter: &mut self.lambda_counter,
+            };
+
+            let block_params: Vec<Value> = fn_ctx.builder.block_params(entry_block).to_vec();
+
+            // block_params[0] is env_ptr
+            let env_ptr = block_params[0];
+
+            // Load captures from env_ptr at known offsets
+            for (i, (cap_name, cap_ty)) in info.captures.iter().enumerate() {
+                let offset = ((2 + i) * 8) as i32;
+                let raw = fn_ctx.builder.ins().load(types::I64, MemFlags::trusted(), env_ptr, offset);
+                let narrowed = fn_ctx.narrow_from_i64(raw, cap_ty);
+                let cl_ty = fn_ctx.ty_cl(cap_ty).unwrap_or(types::I64);
+                let var = fn_ctx.declare_variable(cl_ty);
+                fn_ctx.builder.def_var(var, narrowed);
+                fn_ctx.vars.insert(cap_name.clone(), (var, cap_ty.clone()));
+            }
+
+            // Bind user parameters (offset by 1 for env_ptr)
+            let mut param_idx = 1;
+            for (i, param) in info.params.iter().enumerate() {
+                if let Some(cl_ty) = fn_ctx.ty_cl(&info.param_tys[i]) {
+                    let var = fn_ctx.declare_variable(cl_ty);
+                    fn_ctx.builder.def_var(var, block_params[param_idx]);
+                    fn_ctx.vars.insert(param.name.clone(), (var, info.param_tys[i].clone()));
+                    param_idx += 1;
+                }
+            }
+
+            // Compile body
+            let body_val = fn_ctx.compile_body(&info.body, &info.ret_ty)?;
+
+            // Return
+            if fn_ctx.ty_cl(&info.ret_ty).is_some() {
+                if let Some(val) = body_val {
+                    fn_ctx.builder.ins().return_(&[val]);
+                } else {
+                    let cl_ty = fn_ctx.ty_cl(&info.ret_ty).unwrap();
+                    let zero = if cl_ty.is_float() {
+                        fn_ctx.builder.ins().f64const(0.0)
+                    } else {
+                        fn_ctx.builder.ins().iconst(cl_ty, 0)
+                    };
+                    fn_ctx.builder.ins().return_(&[zero]);
+                }
+            } else {
+                fn_ctx.builder.ins().return_(&[]);
+            }
+
+            std::mem::take(&mut fn_ctx.pending_lambdas)
+        };
+
+        builder.finalize();
+
+        let mut ctx = Context::for_function(func);
+        self.module
+            .define_function(info.func_id, &mut ctx)
+            .map_err(|e| CodegenError::new(format!("define lambda '{}': {}", info.name, e)))?;
+
+        Ok(pending_lambdas)
     }
 }
 
@@ -1018,6 +1303,130 @@ impl Compiler<'_, JITModule> {
     }
 }
 
+// ── Capture analysis ─────────────────────────────────────────────
+
+/// Walk a lambda body's AST and find all variable references that need to be captured.
+/// Returns deduplicated list of (name, Variable, Ty) for captured vars.
+fn find_captures(
+    ast_module: &weir_ast::Module,
+    lambda_params: &[Param],
+    body: &[ExprId],
+    enclosing_vars: &HashMap<SmolStr, (Variable, Ty)>,
+) -> Vec<(SmolStr, Variable, Ty)> {
+    let param_names: HashSet<&str> = lambda_params.iter().map(|p| p.name.as_str()).collect();
+    let mut captured: Vec<(SmolStr, Variable, Ty)> = Vec::new();
+    let mut seen: HashSet<SmolStr> = HashSet::new();
+
+    fn walk_expr(
+        expr_id: ExprId,
+        ast_module: &weir_ast::Module,
+        param_names: &HashSet<&str>,
+        local_names: &HashSet<SmolStr>,
+        enclosing_vars: &HashMap<SmolStr, (Variable, Ty)>,
+        captured: &mut Vec<(SmolStr, Variable, Ty)>,
+        seen: &mut HashSet<SmolStr>,
+    ) {
+        let expr = &ast_module.exprs[expr_id];
+        match &expr.kind {
+            ExprKind::Var(name) => {
+                if !param_names.contains(name.as_str())
+                    && !local_names.contains(name)
+                    && !seen.contains(name)
+                {
+                    if let Some((var, ty)) = enclosing_vars.get(name) {
+                        seen.insert(name.clone());
+                        captured.push((name.clone(), *var, ty.clone()));
+                    }
+                }
+            }
+            ExprKind::Call { func, args } => {
+                walk_expr(*func, ast_module, param_names, local_names, enclosing_vars, captured, seen);
+                for arg in args {
+                    walk_expr(arg.value, ast_module, param_names, local_names, enclosing_vars, captured, seen);
+                }
+            }
+            ExprKind::Let { bindings, body } => {
+                let mut inner_locals = local_names.clone();
+                for b in bindings {
+                    walk_expr(b.value, ast_module, param_names, &inner_locals, enclosing_vars, captured, seen);
+                    inner_locals.insert(b.name.clone());
+                }
+                for &e in body {
+                    walk_expr(e, ast_module, param_names, &inner_locals, enclosing_vars, captured, seen);
+                }
+            }
+            ExprKind::If { condition, then_branch, else_branch } => {
+                walk_expr(*condition, ast_module, param_names, local_names, enclosing_vars, captured, seen);
+                walk_expr(*then_branch, ast_module, param_names, local_names, enclosing_vars, captured, seen);
+                if let Some(e) = else_branch {
+                    walk_expr(*e, ast_module, param_names, local_names, enclosing_vars, captured, seen);
+                }
+            }
+            ExprKind::Do { body } => {
+                for &e in body {
+                    walk_expr(e, ast_module, param_names, local_names, enclosing_vars, captured, seen);
+                }
+            }
+            ExprKind::Lambda { params: inner_params, body, .. } => {
+                // Nested lambda: its params shadow, but it can also capture from enclosing
+                let mut inner_param_names = param_names.clone();
+                for p in inner_params {
+                    inner_param_names.insert(p.name.as_str());
+                }
+                for &e in body {
+                    walk_expr(e, ast_module, &inner_param_names, local_names, enclosing_vars, captured, seen);
+                }
+            }
+            ExprKind::Lit(_) => {}
+            ExprKind::Cond { clauses, else_clause } => {
+                for (test, body) in clauses {
+                    walk_expr(*test, ast_module, param_names, local_names, enclosing_vars, captured, seen);
+                    walk_expr(*body, ast_module, param_names, local_names, enclosing_vars, captured, seen);
+                }
+                if let Some(e) = else_clause {
+                    walk_expr(*e, ast_module, param_names, local_names, enclosing_vars, captured, seen);
+                }
+            }
+            ExprKind::When { condition, body } | ExprKind::Unless { condition, body } => {
+                walk_expr(*condition, ast_module, param_names, local_names, enclosing_vars, captured, seen);
+                for &e in body {
+                    walk_expr(e, ast_module, param_names, local_names, enclosing_vars, captured, seen);
+                }
+            }
+            ExprKind::SetBang { place, value } => {
+                walk_expr(*place, ast_module, param_names, local_names, enclosing_vars, captured, seen);
+                walk_expr(*value, ast_module, param_names, local_names, enclosing_vars, captured, seen);
+            }
+            ExprKind::Match { scrutinee, arms } => {
+                walk_expr(*scrutinee, ast_module, param_names, local_names, enclosing_vars, captured, seen);
+                for arm in arms {
+                    for &e in &arm.body {
+                        walk_expr(e, ast_module, param_names, local_names, enclosing_vars, captured, seen);
+                    }
+                }
+            }
+            ExprKind::Ann { expr, .. } => {
+                walk_expr(*expr, ast_module, param_names, local_names, enclosing_vars, captured, seen);
+            }
+            ExprKind::Try(inner) => {
+                walk_expr(*inner, ast_module, param_names, local_names, enclosing_vars, captured, seen);
+            }
+            ExprKind::VectorLit(elems) => {
+                for &e in elems {
+                    walk_expr(e, ast_module, param_names, local_names, enclosing_vars, captured, seen);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let local_names = HashSet::new();
+    for &expr_id in body {
+        walk_expr(expr_id, ast_module, &param_names, &local_names, enclosing_vars, &mut captured, &mut seen);
+    }
+    captured
+}
+
 // ── Per-function compilation context ─────────────────────────────
 
 struct FnCompileCtx<'a, 'b, M: Module> {
@@ -1036,6 +1445,10 @@ struct FnCompileCtx<'a, 'b, M: Module> {
     tagged_adts: &'a HashMap<SmolStr, TaggedAdt>,
     /// Constructor name -> ConstructorInfo
     constructor_tags: &'a HashMap<SmolStr, ConstructorInfo>,
+    /// Lambdas collected during expression compilation, compiled after the enclosing function.
+    pending_lambdas: Vec<LambdaInfo>,
+    /// Counter for generating unique lambda names (shared with Compiler).
+    lambda_counter: &'a mut usize,
 }
 
 impl<M: Module> FnCompileCtx<'_, '_, M> {
@@ -1181,6 +1594,122 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
             ExprKind::Ann { expr, .. } => self.compile_expr(*expr, &resolved_ty),
 
             ExprKind::Try(inner) => self.compile_try(*inner, &resolved_ty),
+
+            ExprKind::Lambda {
+                params: lambda_params,
+                body,
+                ..
+            } => {
+                // Extract type info
+                let (param_tys, ret_ty) = match &resolved_ty {
+                    Ty::Fn(p, r) => (p.clone(), r.as_ref().clone()),
+                    _ => {
+                        return Err(CodegenError::new(format!(
+                            "lambda has non-function type: {}",
+                            resolved_ty
+                        )));
+                    }
+                };
+
+                // Capture analysis
+                let captures = find_captures(
+                    self.ast_module,
+                    lambda_params,
+                    body,
+                    &self.vars,
+                );
+
+                let num_captures = captures.len();
+
+                // Generate unique lambda name
+                let lambda_idx = *self.lambda_counter;
+                *self.lambda_counter += 1;
+                let lambda_name = SmolStr::new(format!("__lambda_{}", lambda_idx));
+
+                // Build lambda signature: (env_ptr: i64, param_0, ...) -> ret
+                let adts = self.tagged_adts;
+                let mut sig = self.module.make_signature();
+                sig.call_conv = CallConv::SystemV;
+                sig.params.push(AbiParam::new(types::I64)); // env_ptr
+                for pty in &param_tys {
+                    if let Some(cl_ty) = ty_to_cl_with(pty, Some(adts)) {
+                        sig.params.push(AbiParam::new(cl_ty));
+                    }
+                }
+                if let Some(cl_ty) = ty_to_cl_with(&ret_ty, Some(adts)) {
+                    sig.returns.push(AbiParam::new(cl_ty));
+                }
+
+                // Declare the lambda function in the module
+                let func_id = self
+                    .module
+                    .declare_function(&lambda_name, Linkage::Local, &sig)
+                    .map_err(|e| CodegenError::new(format!("declare lambda '{}': {}", lambda_name, e)))?;
+
+                // Build capture info for deferred compilation
+                let capture_info: Vec<(SmolStr, Ty)> = captures
+                    .iter()
+                    .map(|(name, _, ty)| (name.clone(), ty.clone()))
+                    .collect();
+
+                self.pending_lambdas.push(LambdaInfo {
+                    func_id,
+                    name: lambda_name,
+                    param_tys: param_tys.clone(),
+                    ret_ty,
+                    params: lambda_params.clone(),
+                    body: body.clone(),
+                    captures: capture_info,
+                });
+
+                // Allocate closure: [fn_ptr, num_captures, cap_0, cap_1, ...]
+                let alloc_size = ((2 + num_captures) * 8) as i64;
+                let alloc_size_val = self.builder.ins().iconst(types::I64, alloc_size);
+                let alloc_id = self.runtime_fns["alloc"];
+                let alloc_ref = self.module.declare_func_in_func(alloc_id, self.builder.func);
+                let call = self.builder.ins().call(alloc_ref, &[alloc_size_val]);
+                let closure_ptr = self.builder.inst_results(call)[0];
+
+                // Store fn_ptr at offset 0
+                let func_ref_for_addr = self.module.declare_func_in_func(func_id, self.builder.func);
+                let fn_addr = self.builder.ins().func_addr(types::I64, func_ref_for_addr);
+                self.builder.ins().store(MemFlags::trusted(), fn_addr, closure_ptr, 0);
+
+                // Store num_captures at offset 8
+                let num_cap_val = self.builder.ins().iconst(types::I64, num_captures as i64);
+                self.builder.ins().store(MemFlags::trusted(), num_cap_val, closure_ptr, 8);
+
+                // Store each capture
+                for (i, (_, var, ty)) in captures.iter().enumerate() {
+                    let val = self.builder.use_var(*var);
+                    let widened = self.widen_to_i64(val, ty);
+                    let offset = ((2 + i) * 8) as i32;
+                    self.builder.ins().store(MemFlags::trusted(), widened, closure_ptr, offset);
+                }
+
+                Ok(Some(closure_ptr))
+            }
+
+            ExprKind::VectorLit(elems) => {
+                let elem_ty = if let Ty::Vector(et) = &resolved_ty {
+                    et.as_ref().clone()
+                } else {
+                    Ty::I64
+                };
+                let len = elems.len() as i64;
+                let len_val = self.builder.ins().iconst(types::I64, len);
+                let alloc_id = self.runtime_fns["vec_alloc"];
+                let alloc_ref = self.module.declare_func_in_func(alloc_id, self.builder.func);
+                let call = self.builder.ins().call(alloc_ref, &[len_val]);
+                let ptr = self.builder.inst_results(call)[0];
+                for (i, &elem_id) in elems.iter().enumerate() {
+                    let val = self.compile_expr(elem_id, &elem_ty)?.unwrap();
+                    let widened = self.widen_to_i64(val, &elem_ty);
+                    let offset = ((1 + i) * 8) as i32;
+                    self.builder.ins().store(MemFlags::trusted(), widened, ptr, offset);
+                }
+                Ok(Some(ptr))
+            }
 
             _ => Err(CodegenError::new(format!(
                 "unsupported expression kind in codegen: {:?}",
@@ -1336,6 +1865,61 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                 "str" => {
                     return self.compile_str_builtin(args);
                 }
+                "len" => {
+                    if args.len() != 1 {
+                        return Err(CodegenError::new("len expects exactly 1 argument"));
+                    }
+                    let arg_ty = self.expr_ty(args[0].value);
+                    if matches!(arg_ty, Ty::Vector(_)) {
+                        let vec_ptr = self.compile_expr(args[0].value, &arg_ty)?.unwrap();
+                        let len = self.builder.ins().load(types::I64, MemFlags::trusted(), vec_ptr, 0);
+                        return Ok(Some(len));
+                    }
+                }
+                "nth" => {
+                    if args.len() != 2 {
+                        return Err(CodegenError::new("nth expects exactly 2 arguments"));
+                    }
+                    let vec_ty = self.expr_ty(args[0].value);
+                    if let Ty::Vector(elem_ty) = &vec_ty {
+                        let elem_ty = elem_ty.as_ref().clone();
+                        let vec_ptr = self.compile_expr(args[0].value, &vec_ty)?.unwrap();
+                        let idx_ty = self.expr_ty(args[1].value);
+                        let idx = self.compile_expr(args[1].value, &idx_ty)?.unwrap();
+                        // Extend index to i64 if needed
+                        let idx_i64 = match &idx_ty {
+                            Ty::I8 | Ty::I16 | Ty::I32 => self.builder.ins().sextend(types::I64, idx),
+                            Ty::U8 | Ty::U16 | Ty::U32 => self.builder.ins().uextend(types::I64, idx),
+                            _ => idx,
+                        };
+                        // ptr + (1 + idx) * 8
+                        let one = self.builder.ins().iconst(types::I64, 1);
+                        let offset_slots = self.builder.ins().iadd(idx_i64, one);
+                        let eight = self.builder.ins().iconst(types::I64, 8);
+                        let byte_offset = self.builder.ins().imul(offset_slots, eight);
+                        let addr = self.builder.ins().iadd(vec_ptr, byte_offset);
+                        let raw = self.builder.ins().load(types::I64, MemFlags::trusted(), addr, 0);
+                        let val = self.narrow_from_i64(raw, &elem_ty);
+                        return Ok(Some(val));
+                    }
+                }
+                "append" => {
+                    if args.len() != 2 {
+                        return Err(CodegenError::new("append expects exactly 2 arguments"));
+                    }
+                    let vec_ty = self.expr_ty(args[0].value);
+                    if let Ty::Vector(elem_ty) = &vec_ty {
+                        let elem_ty = elem_ty.as_ref().clone();
+                        let vec_ptr = self.compile_expr(args[0].value, &vec_ty)?.unwrap();
+                        let elem_val = self.compile_expr(args[1].value, &elem_ty)?.unwrap();
+                        let widened = self.widen_to_i64(elem_val, &elem_ty);
+                        let func_id = self.runtime_fns["vec_append"];
+                        let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                        let call = self.builder.ins().call(func_ref, &[vec_ptr, widened]);
+                        let new_ptr = self.builder.inst_results(call)[0];
+                        return Ok(Some(new_ptr));
+                    }
+                }
                 _ => {}
             }
 
@@ -1451,6 +2035,19 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                 } else {
                     Ok(None)
                 }
+            } else if let Some((_var, var_ty)) = self.vars.get(name).cloned() {
+                // Variable holds a closure — do indirect call
+                if let Ty::Fn(param_tys, ret_ty) = &var_ty {
+                    let name = name.clone();
+                    let param_tys = param_tys.clone();
+                    let ret_ty = ret_ty.as_ref().clone();
+                    let closure_ptr = self.builder.use_var(self.vars[&name].0);
+                    return self.compile_closure_call(closure_ptr, &param_tys, &ret_ty, args);
+                }
+                Err(CodegenError::new(format!(
+                    "variable '{}' is not callable (type: {})",
+                    name, var_ty
+                )))
             } else {
                 Err(CodegenError::new(format!(
                     "unknown function '{}' in codegen",
@@ -1458,9 +2055,66 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                 )))
             }
         } else {
-            Err(CodegenError::new(
-                "non-variable function calls not supported in codegen",
-            ))
+            // Non-variable function expression (e.g., inline lambda call)
+            let func_ty = self.expr_ty(func_id);
+            if let Ty::Fn(param_tys, ret_ty) = &func_ty {
+                let param_tys = param_tys.clone();
+                let ret_ty = ret_ty.as_ref().clone();
+                let closure_ptr = self.compile_expr(func_id, &func_ty)?.unwrap();
+                self.compile_closure_call(closure_ptr, &param_tys, &ret_ty, args)
+            } else {
+                Err(CodegenError::new(
+                    "non-variable function calls not supported in codegen",
+                ))
+            }
+        }
+    }
+
+    // ── Closure calls ─────────────────────────────────────────
+
+    fn compile_closure_call(
+        &mut self,
+        closure_ptr: Value,
+        param_tys: &[Ty],
+        ret_ty: &Ty,
+        args: &[Arg],
+    ) -> Result<Option<Value>, CodegenError> {
+        // Load fn_ptr from closure offset 0
+        let fn_ptr = self.builder.ins().load(types::I64, MemFlags::trusted(), closure_ptr, 0);
+
+        // Build callee signature: (env_ptr: i64, param_0, param_1, ...) -> ret
+        let mut sig = cranelift_codegen::ir::Signature::new(CallConv::SystemV);
+        sig.params.push(AbiParam::new(types::I64)); // env_ptr
+        for pty in param_tys {
+            if let Some(cl_ty) = self.ty_cl(pty) {
+                sig.params.push(AbiParam::new(cl_ty));
+            }
+        }
+        if let Some(cl_ty) = self.ty_cl(ret_ty) {
+            sig.returns.push(AbiParam::new(cl_ty));
+        }
+
+        // Compile arguments
+        let mut call_args = vec![closure_ptr]; // first arg is env_ptr (the closure itself)
+        for (i, arg) in args.iter().enumerate() {
+            let pty = if i < param_tys.len() {
+                &param_tys[i]
+            } else {
+                return Err(CodegenError::new("too many arguments for closure call"));
+            };
+            if let Some(val) = self.compile_expr(arg.value, pty)? {
+                call_args.push(val);
+            }
+        }
+
+        let sig_ref = self.builder.import_signature(sig);
+        let call_inst = self.builder.ins().call_indirect(sig_ref, fn_ptr, &call_args);
+
+        if self.ty_cl(ret_ty).is_some() {
+            let results = self.builder.inst_results(call_inst);
+            Ok(Some(results[0]))
+        } else {
+            Ok(None)
         }
     }
 
@@ -2236,6 +2890,41 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
         }
     }
 
+    // ── Type widening/narrowing for heap storage ───────────────
+
+    /// Widen a value to i64 for heap storage (vectors, closure captures).
+    fn widen_to_i64(&mut self, val: Value, ty: &Ty) -> Value {
+        match ty {
+            Ty::I8 | Ty::I16 | Ty::I32 => self.builder.ins().sextend(types::I64, val),
+            Ty::U8 | Ty::U16 | Ty::U32 | Ty::Bool => self.builder.ins().uextend(types::I64, val),
+            Ty::F64 => self.builder.ins().bitcast(types::I64, MemFlags::new(), val),
+            Ty::F32 => {
+                let promoted = self.builder.ins().fpromote(types::F64, val);
+                self.builder.ins().bitcast(types::I64, MemFlags::new(), promoted)
+            }
+            // I64, U64, Str, Vector, Fn, Con — already i64
+            _ => val,
+        }
+    }
+
+    /// Narrow a value from i64 back to its original type.
+    fn narrow_from_i64(&mut self, val: Value, ty: &Ty) -> Value {
+        match ty {
+            Ty::I8 | Ty::I16 | Ty::I32 | Ty::U8 | Ty::U16 | Ty::U32 => {
+                let cl_ty = self.ty_cl(ty).unwrap();
+                self.builder.ins().ireduce(cl_ty, val)
+            }
+            Ty::Bool => self.builder.ins().ireduce(types::I8, val),
+            Ty::F64 => self.builder.ins().bitcast(types::F64, MemFlags::new(), val),
+            Ty::F32 => {
+                let f64_val = self.builder.ins().bitcast(types::F64, MemFlags::new(), val);
+                self.builder.ins().fdemote(types::F32, f64_val)
+            }
+            // I64, U64, Str, Vector, Fn, Con — already i64
+            _ => val,
+        }
+    }
+
     // ── Helpers ─────────────────────────────────────────────────
 
     fn zero_value(&mut self, ty: &Ty) -> Value {
@@ -2266,6 +2955,11 @@ fn register_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol("weir_bool_to_str", weir_bool_to_str as *const u8);
     builder.symbol("weir_str_concat", weir_str_concat as *const u8);
     builder.symbol("weir_str_eq", weir_str_eq as *const u8);
+    builder.symbol("weir_alloc", weir_alloc as *const u8);
+    builder.symbol("weir_vec_alloc", weir_vec_alloc as *const u8);
+    builder.symbol("weir_vec_get", weir_vec_get as *const u8);
+    builder.symbol("weir_vec_len", weir_vec_len as *const u8);
+    builder.symbol("weir_vec_append", weir_vec_append as *const u8);
 }
 
 pub struct DevSession {
@@ -3693,5 +4387,150 @@ mod tests {
         // Session should still be functional with old code
         let output = session.run_main().expect("old code should still run");
         assert_eq!(output.trim(), "1");
+    }
+
+    // ── Vector tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_vector_literal_len() {
+        let out = compile_run(
+            "(defn main () (println (len [1 2 3])))",
+        );
+        assert_eq!(out, "3\n");
+    }
+
+    #[test]
+    fn test_vector_nth() {
+        let out = compile_run(
+            "(defn main ()
+               (let ((v [10 20 30]))
+                 (println (nth v 0))
+                 (println (nth v 1))
+                 (println (nth v 2))))",
+        );
+        assert_eq!(out, "10\n20\n30\n");
+    }
+
+    #[test]
+    fn test_vector_append() {
+        let out = compile_run(
+            "(defn main ()
+               (let ((v [1 2 3]))
+                 (let ((v2 (append v 4)))
+                   (println (len v2))
+                   (println (nth v2 3)))))",
+        );
+        assert_eq!(out, "4\n4\n");
+    }
+
+    #[test]
+    fn test_vector_in_function() {
+        let out = compile_run(
+            "(defn sum-vec ((v : (Vector i64))) : i64
+               (+ (nth v 0) (nth v 1) (nth v 2)))
+             (defn main ()
+               (println (sum-vec [10 20 30])))",
+        );
+        assert_eq!(out, "60\n");
+    }
+
+    #[test]
+    fn oracle_vectors() {
+        oracle_test(
+            "(defn main ()
+               (let ((v [10 20 30]))
+                 (println (len v))
+                 (println (nth v 0))
+                 (println (nth v 1))
+                 (println (nth v 2))
+                 (let ((v2 (append v 40)))
+                   (println (len v2))
+                   (println (nth v2 3)))))",
+        );
+    }
+
+    #[test]
+    fn fixture_vectors() {
+        let compiled = run_fixture_compiled("vectors");
+        let interpreted = run_fixture_interpreted("vectors");
+        assert_eq!(
+            compiled, interpreted,
+            "vectors: compiler and interpreter disagree"
+        );
+    }
+
+    // ── Closure tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_lambda_simple() {
+        let out = compile_run(
+            "(defn main ()
+               (let ((f (fn ((x : i32)) : i32 (* x 2))))
+                 (println (f 21))))",
+        );
+        assert_eq!(out, "42\n");
+    }
+
+    #[test]
+    fn test_closure_capture() {
+        let out = compile_run(
+            "(defn make-adder ((n : i64)) : (Fn [i64] i64)
+               (fn ((x : i64)) : i64 (+ x n)))
+             (defn main ()
+               (let ((add5 (make-adder 5))
+                     (add10 (make-adder 10)))
+                 (println (add5 1))
+                 (println (add10 1))))",
+        );
+        assert_eq!(out, "6\n11\n");
+    }
+
+    #[test]
+    fn test_higher_order() {
+        let out = compile_run(
+            "(defn apply-twice ((f : (Fn [i64] i64)) (x : i64)) : i64
+               (f (f x)))
+             (defn main ()
+               (let ((double (fn ((x : i64)) : i64 (* x 2))))
+                 (println (apply-twice double 3))))",
+        );
+        assert_eq!(out, "12\n");
+    }
+
+    #[test]
+    fn test_inline_lambda_arg() {
+        let out = compile_run(
+            "(defn apply-twice ((f : (Fn [i64] i64)) (x : i64)) : i64
+               (f (f x)))
+             (defn main ()
+               (println (apply-twice (fn ((x : i64)) : i64 (+ x 10)) 0)))",
+        );
+        assert_eq!(out, "20\n");
+    }
+
+    #[test]
+    fn oracle_closures() {
+        oracle_test(
+            "(defn make-adder ((n : i64)) : (Fn [i64] i64)
+               (fn ((x : i64)) : i64 (+ x n)))
+             (defn apply-twice ((f : (Fn [i64] i64)) (x : i64)) : i64
+               (f (f x)))
+             (defn main ()
+               (let ((add5 (make-adder 5)))
+                 (println (add5 1))
+                 (println (apply-twice add5 0))
+                 (println (apply-twice (fn ((x : i64)) : i64 (* x 2)) 3))))",
+        );
+    }
+
+    #[test]
+    #[ignore] // Requires typechecker to generate specializations for fully untyped generic params
+    fn fixture_closures() {
+        let compiled = run_fixture_compiled("closures");
+        let interpreted = run_fixture_interpreted("closures");
+        assert_eq!(
+            compiled, interpreted,
+            "closures: compiler and interpreter disagree"
+        );
     }
 }

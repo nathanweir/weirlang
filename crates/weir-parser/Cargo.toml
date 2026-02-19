@@ -3,6 +3,9 @@ name = "weir-parser"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+doctest = false
+
 [dependencies]
 weir-lexer.workspace = true
 weir-ast.workspace = true

@@ -3,6 +3,9 @@ name = "weir-typeck"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+doctest = false
+
 [dependencies]
 weir-ast.workspace = true
 smol_str.workspace = true

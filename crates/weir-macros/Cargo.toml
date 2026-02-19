@@ -3,6 +3,9 @@ name = "weir-macros"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+doctest = false
+
 [dependencies]
 weir-lexer.workspace = true
 smol_str.workspace = true

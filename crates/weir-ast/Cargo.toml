@@ -3,6 +3,9 @@ name = "weir-ast"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+doctest = false
+
 [dependencies]
 la-arena.workspace = true
 smol_str.workspace = true
