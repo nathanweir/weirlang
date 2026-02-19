@@ -1,0 +1,95 @@
+;; Arena allocation: opt-in bump allocation for performance-critical paths.
+;;
+;; Inside a `with-arena` block, all heap allocations (vectors, closures)
+;; use fast bump allocation instead of the GC heap. When the block exits,
+;; everything is freed at once — no per-object overhead.
+;;
+;; The compiler enforces at compile time that arena-allocated values
+;; cannot escape their block.
+
+;; ── Basic arena usage ─────────────────────────────────────────────
+;; Vectors created inside the arena are bump-allocated and freed on exit.
+;; Non-heap values (like integers) can be returned from the block.
+
+(defn sum-vec ((v : (Vector i64)) (i : i64) (acc : i64)) : i64
+  (if (= i (len v))
+    acc
+    (sum-vec v (+ i 1) (+ acc (nth v i)))))
+
+(defn arena-sum () : i64
+  (with-arena scratch
+    (let ((v [10 20 30 40 50]))
+      (sum-vec v 0 0))))
+;; v is freed instantly here — no GC involved
+
+;; ── Closures in arenas ────────────────────────────────────────────
+;; Closures (and their captured environments) are also arena-allocated.
+
+(defn arena-closure-demo () : i64
+  (with-arena scratch
+    (let ((scale 10)
+          (transform (fn ((x : i64)) : i64 (* x scale))))
+      (+ (transform 3) (transform 7)))))
+;; both the closure and captured `scale` are freed on block exit
+
+;; ── Mixing GC and arena values ────────────────────────────────────
+;; GC-allocated values from outside the arena can be freely read inside.
+
+(defn arena-reads-gc () : i64
+  (let ((gc-data [100 200 300]))       ;; GC-allocated
+    (with-arena scratch
+      (let ((indices [2 0 1]))          ;; arena-allocated
+        (+ (nth gc-data (nth indices 0))
+           (nth gc-data (nth indices 1))
+           (nth gc-data (nth indices 2)))))))
+;; indices freed; gc-data lives on normally
+
+;; ── Nested arenas ─────────────────────────────────────────────────
+;; Arenas can nest. Each level frees independently.
+
+(defn nested-arenas () : i64
+  (with-arena outer
+    (let ((v [1 2 3]))
+      (let ((inner-sum (with-arena inner
+                         (let ((w [10 20 30]))
+                           (sum-vec w 0 0)))))
+        ;; w is freed (inner arena gone), v still alive (outer arena)
+        (+ inner-sum (nth v 2))))))
+
+;; ── Append inside arenas ──────────────────────────────────────────
+;; The append builtin also uses arena allocation inside a block.
+
+(defn arena-append-demo () : i64
+  (with-arena scratch
+    (let ((base [1 2 3])
+          (extended (append base 4)))
+      (+ (len extended) (nth extended 3)))))
+
+;; ── Repeated arena blocks ─────────────────────────────────────────
+;; A common pattern: use arenas in a loop. Each iteration gets a fresh
+;; arena that's freed before the next.
+
+(defn process-frame ((frame : i64)) : i64
+  (with-arena frame-arena
+    (let ((work [frame (* frame 2) (* frame 3)]))
+      (sum-vec work 0 0))))
+
+(defn simulate ((n : i64) (acc : i64)) : i64
+  (if (<= n 0)
+    acc
+    (simulate (- n 1) (+ acc (process-frame n)))))
+
+;; ── Main ──────────────────────────────────────────────────────────
+
+(defn main () : Unit
+  (println "Arena allocation demo")
+  (println "")
+
+  (println (str "  sum of arena vector:      " (arena-sum)))
+  (println (str "  closure in arena:         " (arena-closure-demo)))
+  (println (str "  GC data read from arena:  " (arena-reads-gc)))
+  (println (str "  nested arenas:            " (nested-arenas)))
+  (println (str "  append in arena:          " (arena-append-demo)))
+  (println (str "  simulate 10 frames:       " (simulate 10 0)))
+  (println "")
+  (println "All arena memory freed automatically at block boundaries."))

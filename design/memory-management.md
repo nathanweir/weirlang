@@ -34,18 +34,63 @@
 | Live reloading | GC handles stale instances naturally (drop references, they get collected). Arenas are transient and unaffected by reloads |
 | Guard rails | Safe by default (GC), explicit opt-in for performance (arenas), compiler prevents misuse |
 
-### Arena escape prevention: compile-time
+### Arena escape prevention: compile-time (lexical)
 
-Arena-allocated values cannot escape their `with-arena` block. The compiler enforces this statically via escape analysis:
+Arena-allocated values cannot escape their `with-arena` block. The compiler enforces this via **lexical escape analysis** — a purely syntactic check, not a full lifetime system:
 
-- **Cannot** be returned from the `with-arena` block
-- **Cannot** be stored in GC-heap data structures
-- **Cannot** be captured by closures that outlive the block
-- **Can** be passed to functions called within the block, used in computations, etc.
+- **Cannot** return an arena-allocated value from the `with-arena` block
+- **Cannot** assign an arena value to an outer mutable variable via `set!`
+- **Conservative**: any function call returning a heap type inside an arena is treated as arena-provenance (may produce false positives for functions that return pre-existing GC values)
+- **Can** pass arena values to functions called within the block, read from them, use in computations
 
-This is much simpler than full Rust-style lifetime checking because the "lifetime" is always tied to a lexical scope. No lifetime annotations, no lifetime elision rules. The compiler tracks: "did this value originate from an arena? If so, it can't escape."
+#### What this is NOT
 
-If data needs to outlive the arena, it should be GC-allocated instead — that's a design signal that the data isn't transient. Any use case where you'd "want" arena data to escape is an anti-feature.
+This is **not** Rust-style lifetime checking. Key differences:
+
+- **No interprocedural analysis.** The compiler does not track what happens to arena values passed as function arguments. If a function receives an arena-allocated vector, the compiler cannot verify the function doesn't stash it somewhere.
+- **No lifetime annotations.** Function signatures carry no provenance information.
+- **Lexical only.** The analysis checks syntactic position (is this `set!` inside a `with-arena` block?) rather than data flow.
+
+#### Why it works in practice
+
+Despite the theoretical incompleteness, several properties of Weir's current design make interprocedural escape difficult:
+
+- **No mutable references.** Function arguments are passed by value (copying the pointer). The callee cannot modify the caller's bindings.
+- **No global mutable state.** There are no top-level mutable variables to stash arena pointers in.
+- **Closures capture by value.** A closure copies captured values into its environment at creation time. `set!` inside a closure modifies the copy, not the original.
+- **Conservative call tagging.** Any function call returning a heap type inside an arena block gets arena provenance, preventing the return value from escaping — even if the function actually allocated from the GC.
+
+These properties mean the only way to persist an arena pointer past the block boundary is through `set!` to an outer variable (caught) or returning it (caught). Without mutable references or global state, there is no indirect mutation path.
+
+#### Future risk
+
+If Weir adds mutable references, global state, or FFI that allows storing arbitrary pointers, the escape analysis will need to be strengthened — either with lifetime annotations on function parameters or with runtime safety checks (tagging arena pointers).
+
+If data needs to outlive the arena, it should be GC-allocated instead — that's a design signal that the data isn't transient.
+
+#### Known escape vector: `ref` parameters
+
+Once `ref` parameters (mutable references) are implemented, the lexical escape analysis will have a concrete exploit. A function receiving a `ref` to an outer variable can smuggle an arena pointer out of the block, because the `set!` happens inside the callee — outside the `with-arena` block lexically:
+
+```lisp
+(defn stash ((ref target : (Vector i64)) (v : (Vector i64))) : Unit
+  (set! target v))   ;; lexically NOT inside with-arena — uncaught
+
+(defn main () : Unit
+  (let ((mut holder [0]))
+    (with-arena a
+      (let ((v [42 43 44]))
+        (stash holder v)   ;; smuggles arena pointer into holder via ref
+        0))
+    (println (nth holder 0))))   ;; use-after-free: arena is destroyed
+```
+
+**TODO (post-`ref` implementation):** Build and run this example to demonstrate the limitation explicitly. Then evaluate mitigation options:
+1. Forbid passing arena-provenance values to `ref` parameters (simplest, may be too restrictive)
+2. Add provenance annotations to `ref` parameters (mini-lifetime system)
+3. Runtime tagging of arena pointers with a check on `ref` write-back
+
+Similarly, FFI (`extern "C"`) can trivially escape arena pointers since foreign functions are opaque to the compiler. This is expected and acceptable — FFI is inherently `unsafe`.
 
 ### GC design considerations
 
@@ -67,7 +112,8 @@ The type system must track arena provenance to enforce escape prevention. This i
 
 ### Open questions
 
-- What GC algorithm to start with? (Mark-and-sweep is simplest; generational is better for games but more complex)
-- Should there be named arenas (multiple concurrent arenas with different lifetimes)?
-- Should arena size be configurable per-block, or globally set?
-- Can arenas be nested? (Probably yes — inner arena values can reference outer arena values but not vice versa)
+- ~~What GC algorithm to start with?~~ **Resolved: mark-and-sweep, stop-the-world.** Generational/incremental are future optimizations.
+- Should there be named arenas (multiple concurrent arenas with different lifetimes)? Arenas have names for diagnostics but names are not semantically meaningful yet.
+- Should arena size be configurable per-block, or globally set? Currently fixed at 64 KB initial chunk, doubling on growth.
+- ~~Can arenas be nested?~~ **Resolved: yes.** Inner arena values cannot escape to the outer arena. Each arena manages its own memory independently.
+- Should the escape analysis be strengthened before adding mutable references or FFI? The current lexical analysis is sufficient for the language's current feature set but would need lifetime annotations or runtime checks to remain safe with mutable references.

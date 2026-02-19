@@ -285,6 +285,10 @@ Items deferred from earlier phases that don't depend on the runtime (Phase 9) or
 - [x] Verify arenas: arenas free on block exit, escape analysis catches violations, 9 codegen integration tests + 7 typechecker tests + 6 runtime unit tests
 
 ### Phase 10: Full cascade + concurrency
+- [ ] **Arena escape hardening** (after `ref` parameters are implemented):
+  - Build and run the `ref`-based use-after-free example from `design/memory-management.md` to demonstrate the limitation
+  - Evaluate mitigation: forbid arena values in `ref` params, add provenance annotations, or runtime tagging
+  - See "Known escape vector: `ref` parameters" in `design/memory-management.md`
 - [ ] **Dependency tracker**:
   - Track expansion, type, and call dependencies
   - Full cascade: macro change → re-expand → re-typecheck → recompile

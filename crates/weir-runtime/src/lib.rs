@@ -97,8 +97,8 @@ struct GcHeap {
     gc_threshold: usize,
     /// Shadow stack: pointers to stack slots that hold GC heap pointers.
     shadow_stack: Vec<*mut i64>,
-    /// When true, GC allocation skips threshold check (arena is active).
-    gc_suppressed: bool,
+    /// Depth counter for GC suppression (> 0 means suppressed, supports nesting).
+    gc_suppress_depth: u32,
 }
 
 impl GcHeap {
@@ -109,7 +109,7 @@ impl GcHeap {
             total_bytes: 0,
             gc_threshold: INITIAL_GC_THRESHOLD,
             shadow_stack: Vec::with_capacity(256),
-            gc_suppressed: false,
+            gc_suppress_depth: 0,
         }
     }
 }
@@ -134,7 +134,7 @@ pub extern "C" fn weir_gc_alloc(size_bytes: i64, shape: *const ShapeDesc) -> i64
         let user_size = size_bytes as usize;
 
         // Check if we should collect before allocating (skip when GC is suppressed for arena)
-        if !heap.gc_suppressed
+        if heap.gc_suppress_depth == 0
             && heap.bytes_since_gc + HEADER_SIZE + user_size > heap.gc_threshold
         {
             collect_inner(&mut heap);
@@ -443,21 +443,23 @@ pub extern "C" fn weir_arena_destroy(arena_ptr: i64) {
 }
 
 /// Suppress the GC (called when entering a with-arena block).
+/// Uses a depth counter to support nested arenas.
 #[unsafe(no_mangle)]
 pub extern "C" fn weir_gc_suppress() {
     GC_HEAP.with(|heap| {
-        heap.borrow_mut().gc_suppressed = true;
+        heap.borrow_mut().gc_suppress_depth += 1;
     });
 }
 
 /// Unsuppress the GC (called when exiting a with-arena block).
-/// May trigger a collection if the threshold was exceeded while suppressed.
+/// Decrements the depth counter. Triggers collection when fully unsuppressed
+/// if the threshold was exceeded while suppressed.
 #[unsafe(no_mangle)]
 pub extern "C" fn weir_gc_unsuppress() {
     GC_HEAP.with(|heap| {
         let mut heap = heap.borrow_mut();
-        heap.gc_suppressed = false;
-        if heap.bytes_since_gc > heap.gc_threshold {
+        heap.gc_suppress_depth = heap.gc_suppress_depth.saturating_sub(1);
+        if heap.gc_suppress_depth == 0 && heap.bytes_since_gc > heap.gc_threshold {
             collect_inner(&mut heap);
         }
     });
@@ -486,7 +488,7 @@ pub fn gc_reset() {
         heap.total_bytes = 0;
         heap.gc_threshold = INITIAL_GC_THRESHOLD;
         heap.shadow_stack.clear();
-        heap.gc_suppressed = false;
+        heap.gc_suppress_depth = 0;
     });
 }
 

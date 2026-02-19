@@ -240,7 +240,7 @@ static ObjHeader *gc_all_objects = NULL;
 static size_t gc_bytes_since = 0;
 static size_t gc_total_bytes = 0;
 static size_t gc_threshold = INITIAL_GC_THRESHOLD;
-static int gc_suppressed = 0;
+static int gc_suppress_depth = 0;
 
 /* Shadow stack */
 static int64_t **shadow_stack = NULL;
@@ -319,7 +319,7 @@ void weir_gc_collect(void) { gc_collect(); }
 
 int64_t weir_gc_alloc(int64_t size_bytes, int64_t shape_ptr) {
     size_t user_size = (size_t)size_bytes;
-    if (!gc_suppressed && gc_bytes_since + HEADER_SIZE + user_size > gc_threshold)
+    if (gc_suppress_depth == 0 && gc_bytes_since + HEADER_SIZE + user_size > gc_threshold)
         gc_collect();
     size_t total = HEADER_SIZE + user_size;
     ObjHeader *h = (ObjHeader*)calloc(1, total);
@@ -423,10 +423,10 @@ void weir_arena_destroy(int64_t arena_ptr) {
     free(a);
 }
 
-void weir_gc_suppress(void) { gc_suppressed = 1; }
+void weir_gc_suppress(void) { gc_suppress_depth++; }
 void weir_gc_unsuppress(void) {
-    gc_suppressed = 0;
-    if (gc_bytes_since > gc_threshold) gc_collect();
+    if (gc_suppress_depth > 0) gc_suppress_depth--;
+    if (gc_suppress_depth == 0 && gc_bytes_since > gc_threshold) gc_collect();
 }
 
 int main(void) { weir_main(); return 0; }
@@ -1446,7 +1446,7 @@ impl<'a, M: Module> Compiler<'a, M> {
                 lambda_counter: &mut self.lambda_counter,
                 type_subst: type_subst.clone(),
                 shadow_depth: 0,
-                arena_var: None,
+                arena_stack: Vec::new(),
             };
 
             // Bind parameters to variables
@@ -1565,7 +1565,7 @@ impl<'a, M: Module> Compiler<'a, M> {
                 lambda_counter: &mut self.lambda_counter,
                 type_subst: info.type_subst.clone(),
                 shadow_depth: 0,
-                arena_var: None,
+                arena_stack: Vec::new(),
             };
 
             let block_params: Vec<Value> = fn_ctx.builder.block_params(entry_block).to_vec();
@@ -1816,8 +1816,9 @@ struct FnCompileCtx<'a, 'b, M: Module> {
     type_subst: HashMap<TyVarId, Ty>,
     /// Number of entries currently pushed onto the GC shadow stack by this function.
     shadow_depth: usize,
-    /// If inside a with-arena block, the Cranelift variable holding the arena pointer.
-    arena_var: Option<Variable>,
+    /// Stack of active arena variables (outermost to innermost).
+    /// Used for cleanup on early return (? operator) and allocation redirection.
+    arena_stack: Vec<Variable>,
 }
 
 impl<M: Module> FnCompileCtx<'_, '_, M> {
@@ -2059,15 +2060,14 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                 let suppress_ref = self.module.declare_func_in_func(suppress_id, self.builder.func);
                 self.builder.ins().call(suppress_ref, &[]);
 
-                // 3. Set arena_var so allocations redirect
-                let prev_arena = self.arena_var;
-                self.arena_var = Some(arena_var);
+                // 3. Push arena onto stack so allocations redirect
+                self.arena_stack.push(arena_var);
 
                 // 4. Compile body
                 let result = self.compile_body(body, &resolved_ty);
 
-                // 5. Restore arena_var
-                self.arena_var = prev_arena;
+                // 5. Pop arena from stack
+                self.arena_stack.pop();
 
                 // 6. Unsuppress GC
                 let unsuppress_id = self.runtime_fns["gc_unsuppress"];
@@ -2196,7 +2196,7 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
 
                 let alloc_size = ((2 + num_captures) * 8) as i64;
                 let alloc_size_val = self.builder.ins().iconst(types::I64, alloc_size);
-                let closure_ptr = if let Some(arena_v) = self.arena_var {
+                let closure_ptr = if let Some(&arena_v) = self.arena_stack.last() {
                     let arena_val = self.builder.use_var(arena_v);
                     let alloc_id = self.runtime_fns["arena_alloc"];
                     let alloc_ref = self.module.declare_func_in_func(alloc_id, self.builder.func);
@@ -2245,7 +2245,7 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
 
                 let len = elems.len() as i64;
                 let len_val = self.builder.ins().iconst(types::I64, len);
-                let ptr = if let Some(arena_v) = self.arena_var {
+                let ptr = if let Some(&arena_v) = self.arena_stack.last() {
                     let arena_val = self.builder.use_var(arena_v);
                     let alloc_id = self.runtime_fns["arena_vec_alloc"];
                     let alloc_ref = self.module.declare_func_in_func(alloc_id, self.builder.func);
@@ -2475,7 +2475,7 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                             SHAPE_VECTOR,
                             if elems_are_ptrs { 1 } else { 0 },
                         );
-                        if let Some(arena_v) = self.arena_var {
+                        if let Some(&arena_v) = self.arena_stack.last() {
                             // Arena path: arena_vec_alloc + manual copy
                             let old_len_id = self.runtime_fns["vec_len"];
                             let old_len_ref = self.module.declare_func_in_func(old_len_id, self.builder.func);
@@ -3514,9 +3514,23 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
             .ins()
             .brif(is_ok, ok_block, &[], err_block, &[]);
 
-        // Err block: pop shadow stack and early return the packed Result (it's already an Err)
+        // Err block: clean up arenas + shadow stack, then early return
         self.builder.switch_to_block(err_block);
         self.builder.seal_block(err_block);
+
+        // Clean up any active arenas (innermost first)
+        for &arena_v in self.arena_stack.iter().rev() {
+            // Unsuppress GC (decrements depth counter)
+            let unsuppress_id = self.runtime_fns["gc_unsuppress"];
+            let unsuppress_ref = self.module.declare_func_in_func(unsuppress_id, self.builder.func);
+            self.builder.ins().call(unsuppress_ref, &[]);
+            // Destroy arena
+            let arena_ptr = self.builder.use_var(arena_v);
+            let destroy_id = self.runtime_fns["arena_destroy"];
+            let destroy_ref = self.module.declare_func_in_func(destroy_id, self.builder.func);
+            self.builder.ins().call(destroy_ref, &[arena_ptr]);
+        }
+
         // Pop ALL shadow stack entries for this function before early return
         if self.shadow_depth > 0 {
             let count_val = self.builder.ins().iconst(types::I64, self.shadow_depth as i64);
@@ -5719,6 +5733,61 @@ mod tests {
 "#;
         let output = compile_run(source);
         assert_eq!(output, "11\n");
+    }
+
+    #[test]
+    fn arena_try_early_return_cleanup() {
+        // ? inside arena triggers early return. Arena must still be cleaned up
+        // (unsuppress GC + destroy arena). Verify by doing GC-allocating work after.
+        let source = r#"
+(deftype (Result 'ok 'err) (Ok 'ok) (Err 'err))
+
+(defn risky ((fail : Bool)) : (Result i32 i32)
+  (if fail (Err 0) (Ok 42)))
+
+(defn use-arena ((fail : Bool)) : (Result i32 i32)
+  (let ((result (with-arena a
+                  (let ((v [1 2 3 4 5])
+                        (x (risky fail) ?))
+                    (+ x (nth v 0))))))
+    (Ok result)))
+
+(defn unwrap-or ((r : (Result i32 i32)) (default : i32)) : i32
+  (match r ((Ok val) val) ((Err _) default)))
+
+(defn main () : Unit
+  (println (unwrap-or (use-arena true) 99))
+  (println (unwrap-or (use-arena false) 99))
+  (let ((v [10 20 30]))
+    (println (nth v 1))))
+"#;
+        let output = compile_run(source);
+        assert_eq!(output, "99\n43\n20\n");
+    }
+
+    #[test]
+    fn arena_try_oracle() {
+        let source = r#"
+(deftype (Result 'ok 'err) (Ok 'ok) (Err 'err))
+
+(defn risky ((fail : Bool)) : (Result i32 i32)
+  (if fail (Err 0) (Ok 100)))
+
+(defn use-arena ((fail : Bool)) : (Result i32 i32)
+  (let ((result (with-arena a
+                  (let ((v [1 2 3])
+                        (x (risky fail) ?))
+                    (+ x (nth v 0))))))
+    (Ok result)))
+
+(defn unwrap-or ((r : (Result i32 i32)) (default : i32)) : i32
+  (match r ((Ok val) val) ((Err _) default)))
+
+(defn main () : Unit
+  (println (unwrap-or (use-arena true) 99))
+  (println (unwrap-or (use-arena false) 99)))
+"#;
+        oracle_test(source);
     }
 
     #[test]
