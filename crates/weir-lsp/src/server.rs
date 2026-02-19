@@ -48,21 +48,32 @@ impl WeirLspBackend {
                 .collect::<std::collections::HashSet<_>>()
         };
 
-        // 2. Run analysis with external names — MutexGuard confined to this block
-        let result = {
-            let mut docs = self.documents.lock().unwrap();
-            let doc = match docs.get_mut(&uri) {
+        // 2. Copy document state out of the lock so analysis doesn't hold it
+        let (text, line_index, version) = {
+            let docs = self.documents.lock().unwrap();
+            let doc = match docs.get(&uri) {
                 Some(d) => d,
                 None => return,
             };
-            let (analysis, diagnostics) =
-                diagnostics::analyze(&doc.text, &doc.line_index, &external_names);
-            let version = doc.version;
-            doc.analysis = Some(analysis);
-            Some((diagnostics, version))
+            (doc.text.clone(), doc.line_index.clone(), doc.version)
         };
 
-        // 3. Publish diagnostics
+        // 3. Run analysis without holding the documents mutex
+        let (analysis, diagnostics) =
+            diagnostics::analyze(&text, &line_index, &external_names);
+
+        // 4. Store results back under the lock
+        let result = {
+            let mut docs = self.documents.lock().unwrap();
+            if let Some(doc) = docs.get_mut(&uri) {
+                doc.analysis = Some(analysis);
+                Some((diagnostics, version))
+            } else {
+                None
+            }
+        };
+
+        // 5. Publish diagnostics
         if let Some((diagnostics, version)) = result {
             self.client
                 .publish_diagnostics(uri, diagnostics, Some(version))

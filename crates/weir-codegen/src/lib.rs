@@ -278,406 +278,75 @@ impl<'a, M: Module> Compiler<'a, M> {
     // ── Runtime helper declarations ─────────────────────────────
 
     pub(crate) fn declare_runtime_helpers(&mut self) -> Result<(), CodegenError> {
-        // weir_print_i64(i64) -> void
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_print_i64", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_print_i64: {}", e)))?;
-        self.runtime_fns.insert("print_i64", id);
+        // (key, symbol, params, return_type)
+        // None return = void, Some(ty) = returns that type
+        let helpers: &[(&str, &str, &[Type], Option<Type>)] = &[
+            // Printing
+            ("print_i64",    "weir_print_i64",    &[types::I64], None),
+            ("print_f64",    "weir_print_f64",    &[types::F64], None),
+            ("print_bool",   "weir_print_bool",   &[types::I8],  None),
+            ("print_unit",   "weir_print_unit",   &[],           None),
+            ("print_newline","weir_print_newline", &[],           None),
+            ("print_str",    "weir_print_str",    &[types::I64], None),
+            // Conversions
+            ("i64_to_str",   "weir_i64_to_str",   &[types::I64],               Some(types::I64)),
+            ("f64_to_str",   "weir_f64_to_str",   &[types::F64],               Some(types::I64)),
+            ("bool_to_str",  "weir_bool_to_str",  &[types::I8],                Some(types::I64)),
+            // Strings
+            ("str_concat",   "weir_str_concat",   &[types::I64, types::I64],   Some(types::I64)),
+            ("str_eq",       "weir_str_eq",       &[types::I64, types::I64],   Some(types::I8)),
+            ("str_cmp",      "weir_str_cmp",      &[types::I64, types::I64],   Some(types::I64)),
+            // GC
+            ("gc_alloc",     "weir_gc_alloc",     &[types::I64, types::I64],   Some(types::I64)),
+            ("gc_vec_alloc", "weir_gc_vec_alloc", &[types::I64, types::I64],   Some(types::I64)),
+            ("gc_collect",   "weir_gc_collect",   &[],                         None),
+            ("gc_suppress",  "weir_gc_suppress",  &[],                         None),
+            ("gc_unsuppress","weir_gc_unsuppress", &[],                        None),
+            // Vectors
+            ("vec_get",      "weir_vec_get",      &[types::I64, types::I64],                  Some(types::I64)),
+            ("vec_len",      "weir_vec_len",      &[types::I64],                              Some(types::I64)),
+            ("vec_append",   "weir_vec_append",   &[types::I64, types::I64, types::I64],      Some(types::I64)),
+            // Shadow stack
+            ("shadow_push",  "weir_shadow_push",  &[types::I64], None),
+            ("shadow_pop",   "weir_shadow_pop",   &[types::I64], None),
+            // Arenas
+            ("arena_create",    "weir_arena_create",    &[],                       Some(types::I64)),
+            ("arena_alloc",     "weir_arena_alloc",     &[types::I64, types::I64], Some(types::I64)),
+            ("arena_vec_alloc", "weir_arena_vec_alloc", &[types::I64, types::I64], Some(types::I64)),
+            ("arena_destroy",   "weir_arena_destroy",   &[types::I64],             None),
+            // Atoms
+            ("atom_create",  "weir_atom_create",  &[types::I64],                              Some(types::I64)),
+            ("atom_deref",   "weir_atom_deref",   &[types::I64],                              Some(types::I64)),
+            ("atom_cas",     "weir_atom_cas",     &[types::I64, types::I64, types::I64],      Some(types::I64)),
+            // Channels
+            ("channel_create","weir_channel_create", &[],                       Some(types::I64)),
+            ("channel_send", "weir_channel_send", &[types::I64, types::I64],   None),
+            ("channel_recv", "weir_channel_recv", &[types::I64],               Some(types::I64)),
+            // Threads
+            ("thread_spawn", "weir_thread_spawn", &[types::I64], Some(types::I64)),
+            ("thread_join",  "weir_thread_join",  &[types::I64], Some(types::I64)),
+            // Parallelism
+            ("par_map",      "weir_par_map",      &[types::I64, types::I64, types::I64], Some(types::I64)),
+            ("par_for_each", "weir_par_for_each", &[types::I64, types::I64],              None),
+            // Misc
+            ("sleep_ms",     "weir_sleep_ms",     &[types::I64], None),
+        ];
 
-        // weir_print_f64(f64) -> void
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::F64));
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_print_f64", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_print_f64: {}", e)))?;
-        self.runtime_fns.insert("print_f64", id);
-
-        // weir_print_bool(i8) -> void
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I8));
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_print_bool", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_print_bool: {}", e)))?;
-        self.runtime_fns.insert("print_bool", id);
-
-        // weir_print_unit() -> void
-        let mut sig = self.module.make_signature();
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_print_unit", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_print_unit: {}", e)))?;
-        self.runtime_fns.insert("print_unit", id);
-
-        // weir_print_newline() -> void
-        let mut sig = self.module.make_signature();
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_print_newline", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_print_newline: {}", e)))?;
-        self.runtime_fns.insert("print_newline", id);
-
-        // weir_sleep_ms(i64) -> void
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_sleep_ms", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_sleep_ms: {}", e)))?;
-        self.runtime_fns.insert("sleep_ms", id);
-
-        // weir_print_str(i64) -> void
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_print_str", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_print_str: {}", e)))?;
-        self.runtime_fns.insert("print_str", id);
-
-        // weir_i64_to_str(i64) -> i64
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
-        sig.returns.push(AbiParam::new(types::I64));
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_i64_to_str", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_i64_to_str: {}", e)))?;
-        self.runtime_fns.insert("i64_to_str", id);
-
-        // weir_f64_to_str(f64) -> i64
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::F64));
-        sig.returns.push(AbiParam::new(types::I64));
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_f64_to_str", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_f64_to_str: {}", e)))?;
-        self.runtime_fns.insert("f64_to_str", id);
-
-        // weir_bool_to_str(i8) -> i64
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I8));
-        sig.returns.push(AbiParam::new(types::I64));
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_bool_to_str", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_bool_to_str: {}", e)))?;
-        self.runtime_fns.insert("bool_to_str", id);
-
-        // weir_str_concat(i64, i64) -> i64
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
-        sig.params.push(AbiParam::new(types::I64));
-        sig.returns.push(AbiParam::new(types::I64));
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_str_concat", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_str_concat: {}", e)))?;
-        self.runtime_fns.insert("str_concat", id);
-
-        // weir_str_eq(i64, i64) -> i8
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
-        sig.params.push(AbiParam::new(types::I64));
-        sig.returns.push(AbiParam::new(types::I8));
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_str_eq", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_str_eq: {}", e)))?;
-        self.runtime_fns.insert("str_eq", id);
-
-        // weir_str_cmp(i64, i64) -> i64
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
-        sig.params.push(AbiParam::new(types::I64));
-        sig.returns.push(AbiParam::new(types::I64));
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_str_cmp", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_str_cmp: {}", e)))?;
-        self.runtime_fns.insert("str_cmp", id);
-
-        // weir_gc_alloc(i64, i64) -> i64  [size_bytes, shape_ptr]
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
-        sig.params.push(AbiParam::new(types::I64));
-        sig.returns.push(AbiParam::new(types::I64));
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_gc_alloc", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_gc_alloc: {}", e)))?;
-        self.runtime_fns.insert("gc_alloc", id);
-
-        // weir_gc_vec_alloc(i64, i64) -> i64  [len, shape_ptr]
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
-        sig.params.push(AbiParam::new(types::I64));
-        sig.returns.push(AbiParam::new(types::I64));
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_gc_vec_alloc", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_gc_vec_alloc: {}", e)))?;
-        self.runtime_fns.insert("gc_vec_alloc", id);
-
-        // weir_gc_collect() -> void
-        let mut sig = self.module.make_signature();
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_gc_collect", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_gc_collect: {}", e)))?;
-        self.runtime_fns.insert("gc_collect", id);
-
-        // weir_vec_get(i64, i64) -> i64
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
-        sig.params.push(AbiParam::new(types::I64));
-        sig.returns.push(AbiParam::new(types::I64));
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_vec_get", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_vec_get: {}", e)))?;
-        self.runtime_fns.insert("vec_get", id);
-
-        // weir_vec_len(i64) -> i64
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
-        sig.returns.push(AbiParam::new(types::I64));
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_vec_len", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_vec_len: {}", e)))?;
-        self.runtime_fns.insert("vec_len", id);
-
-        // weir_vec_append(i64, i64, i64) -> i64  [vec_ptr, elem, shape_ptr]
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
-        sig.params.push(AbiParam::new(types::I64));
-        sig.params.push(AbiParam::new(types::I64));
-        sig.returns.push(AbiParam::new(types::I64));
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_vec_append", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_vec_append: {}", e)))?;
-        self.runtime_fns.insert("vec_append", id);
-
-        // weir_shadow_push(i64) -> void  [slot_ptr]
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_shadow_push", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_shadow_push: {}", e)))?;
-        self.runtime_fns.insert("shadow_push", id);
-
-        // weir_shadow_pop(i64) -> void  [count]
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_shadow_pop", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_shadow_pop: {}", e)))?;
-        self.runtime_fns.insert("shadow_pop", id);
-
-        // weir_arena_create() -> i64
-        let mut sig = self.module.make_signature();
-        sig.returns.push(AbiParam::new(types::I64));
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_arena_create", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_arena_create: {}", e)))?;
-        self.runtime_fns.insert("arena_create", id);
-
-        // weir_arena_alloc(i64, i64) -> i64  [arena, size]
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
-        sig.params.push(AbiParam::new(types::I64));
-        sig.returns.push(AbiParam::new(types::I64));
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_arena_alloc", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_arena_alloc: {}", e)))?;
-        self.runtime_fns.insert("arena_alloc", id);
-
-        // weir_arena_vec_alloc(i64, i64) -> i64  [arena, len]
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
-        sig.params.push(AbiParam::new(types::I64));
-        sig.returns.push(AbiParam::new(types::I64));
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_arena_vec_alloc", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_arena_vec_alloc: {}", e)))?;
-        self.runtime_fns.insert("arena_vec_alloc", id);
-
-        // weir_arena_destroy(i64) -> void  [arena]
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_arena_destroy", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_arena_destroy: {}", e)))?;
-        self.runtime_fns.insert("arena_destroy", id);
-
-        // weir_gc_suppress() -> void
-        let mut sig = self.module.make_signature();
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_gc_suppress", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_gc_suppress: {}", e)))?;
-        self.runtime_fns.insert("gc_suppress", id);
-
-        // weir_gc_unsuppress() -> void
-        let mut sig = self.module.make_signature();
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_gc_unsuppress", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_gc_unsuppress: {}", e)))?;
-        self.runtime_fns.insert("gc_unsuppress", id);
-
-        // weir_atom_create(i64) -> i64
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
-        sig.returns.push(AbiParam::new(types::I64));
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_atom_create", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_atom_create: {}", e)))?;
-        self.runtime_fns.insert("atom_create", id);
-
-        // weir_atom_deref(i64) -> i64
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
-        sig.returns.push(AbiParam::new(types::I64));
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_atom_deref", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_atom_deref: {}", e)))?;
-        self.runtime_fns.insert("atom_deref", id);
-
-        // weir_atom_cas(i64, i64, i64) -> i64
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
-        sig.params.push(AbiParam::new(types::I64));
-        sig.params.push(AbiParam::new(types::I64));
-        sig.returns.push(AbiParam::new(types::I64));
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_atom_cas", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_atom_cas: {}", e)))?;
-        self.runtime_fns.insert("atom_cas", id);
-
-        // weir_channel_create() -> i64
-        let mut sig = self.module.make_signature();
-        sig.returns.push(AbiParam::new(types::I64));
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_channel_create", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_channel_create: {}", e)))?;
-        self.runtime_fns.insert("channel_create", id);
-
-        // weir_channel_send(i64, i64) -> void
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
-        sig.params.push(AbiParam::new(types::I64));
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_channel_send", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_channel_send: {}", e)))?;
-        self.runtime_fns.insert("channel_send", id);
-
-        // weir_channel_recv(i64) -> i64
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
-        sig.returns.push(AbiParam::new(types::I64));
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_channel_recv", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_channel_recv: {}", e)))?;
-        self.runtime_fns.insert("channel_recv", id);
-
-        // weir_thread_spawn(i64) -> i64
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
-        sig.returns.push(AbiParam::new(types::I64));
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_thread_spawn", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_thread_spawn: {}", e)))?;
-        self.runtime_fns.insert("thread_spawn", id);
-
-        // weir_thread_join(i64) -> i64
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
-        sig.returns.push(AbiParam::new(types::I64));
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_thread_join", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_thread_join: {}", e)))?;
-        self.runtime_fns.insert("thread_join", id);
-
-        // weir_par_map(closure: i64, vec: i64, shape: i64) -> i64
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
-        sig.params.push(AbiParam::new(types::I64));
-        sig.params.push(AbiParam::new(types::I64));
-        sig.returns.push(AbiParam::new(types::I64));
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_par_map", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_par_map: {}", e)))?;
-        self.runtime_fns.insert("par_map", id);
-
-        // weir_par_for_each(closure: i64, vec: i64) -> void
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
-        sig.params.push(AbiParam::new(types::I64));
-        sig.call_conv = CallConv::SystemV;
-        let id = self
-            .module
-            .declare_function("weir_par_for_each", Linkage::Import, &sig)
-            .map_err(|e| CodegenError::new(format!("declare weir_par_for_each: {}", e)))?;
-        self.runtime_fns.insert("par_for_each", id);
+        for &(key, symbol, params, ret) in helpers {
+            let mut sig = self.module.make_signature();
+            sig.call_conv = CallConv::SystemV;
+            for &p in params {
+                sig.params.push(AbiParam::new(p));
+            }
+            if let Some(r) = ret {
+                sig.returns.push(AbiParam::new(r));
+            }
+            let id = self
+                .module
+                .declare_function(symbol, Linkage::Import, &sig)
+                .map_err(|e| CodegenError::new(format!("declare {}: {}", symbol, e)))?;
+            self.runtime_fns.insert(key, id);
+        }
 
         Ok(())
     }

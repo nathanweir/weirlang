@@ -86,6 +86,7 @@ Tracks what's implemented in `crates/weir-lsp/`, known limitations, and candidat
 
 ## Known Limitations
 
+- **Workspace indexing races with document analysis**: `update_workspace_symbols` spawns asynchronously while `analyze_and_publish` reads the workspace index for external names. During rapid edits, the workspace index may be stale when the type checker runs, producing spurious "undefined variable" errors for cross-file symbols. These resolve on the next edit/save cycle.
 - **Cross-file operations re-parse files on each request** (no persistent cache of parsed workspace files)
 - **Completion**: no snippet support, static builtins list, no doc tooltips on completion items
 - **Hover**: source preview truncated without surrounding context

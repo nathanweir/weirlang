@@ -10,69 +10,69 @@ The architecture is sound. The frontend pipeline (lexer -> parser -> macro expan
 
 ## Critical
 
-### 1. `weir-codegen/src/lib.rs` is a ~7,000-line god file
+### 1. `weir-codegen/src/lib.rs` is a ~7,000-line god file — FIXED
 
-JIT helpers, AOT runtime, compiler, dev session, and capture analysis all in one file. Suggested split: `runtime_helpers.rs`, `compiler.rs`, `dev_session.rs`, `aot.rs`. The `declare_runtime_helpers` method alone (~400 lines of repetitive signature/declaration pairs) could be replaced with a table-driven approach.
+Split into `lib.rs` (5,853 lines), `jit_helpers.rs`, `aot.rs`, `dev_session.rs`. The `declare_runtime_helpers` method was also replaced with a table-driven approach (see item 10).
 
-### 2. `macros_changed_source` duplicated 3 times in `weir-lsp`
+### 2. `macros_changed_source` duplicated 3 times in `weir-lsp` — FIXED
 
-Same token-stream comparison logic in `diagnostics.rs`, `workspace.rs`, and `server.rs`. If the logic drifts in one copy, different LSP features (hover vs go-to-def) will see different span origins.
+Extracted shared `expand.rs` module with `macros_changed_source()` and `expand_source()`. All three call sites now use the shared implementation.
 
-### 3. GC shadow stack correctness edge
+### 3. GC shadow stack correctness edge — DOCUMENTED
 
-If Cranelift optimizes away a stack slot while a GC-managed pointer lives only in a register, that pointer becomes untracked during a mid-function GC. A known hard problem in JIT+GC design — hasn't manifested in tests yet, but should be documented and stress-tested.
+Added detailed doc comment to `push_gc_root()`, cross-reference comment in SetBang codegen, and "Known limitation" section in `design/memory-management.md`.
 
 ---
 
 ## Important
 
-### 4. `weir-typeck/src/lib.rs` is 4,470 lines
+### 4. `weir-typeck/src/lib.rs` is 4,470 lines — FIXED
 
-Types, unification, constraint resolution, HKT handling, and arena provenance tracking all in one impl. Suggested split: `types.rs`, `unify.rs`, `check.rs`, `constraints.rs`.
+Split into 7 files: `lib.rs` (155 lines), `checker.rs` (2,722), `tests.rs` (1,299), `defs.rs` (122), `types.rs` (110), `result.rs` (70), `error.rs` (18).
 
-### 5. `seen_specs` uses `Vec` with O(n) scan
+### 5. `seen_specs` uses `Vec` with O(n) scan — FIXED
 
-Instead of `HashSet` for deduplicating generic specializations (`weir-typeck/src/lib.rs:270-309`).
+Changed to `HashSet<SmolStr>` for O(1) deduplication.
 
-### 6. `collect_definitions` clones the entire items vector
+### 6. `collect_definitions` clones the entire items vector — NO CHANGE NEEDED
 
-6 times per type-check — fixable by iterating indices (`weir-typeck/src/lib.rs:1033-1038`).
+Clone is necessary: `TypeChecker` holds `&'a Module` (immutable borrow), so `std::mem::take` is impossible. Index-based iteration has the same borrow conflict. The clone correctly sidesteps the borrow checker constraint.
 
-### 7. LSP holds documents mutex across full analysis
+### 7. LSP holds documents mutex across full analysis — FIXED
 
-Blocks all other requests during type-checking (`weir-lsp/src/server.rs:76-87`). Fix: copy text out, release lock, analyze, re-acquire.
+`analyze_and_publish` now copies text/line_index/version out of the lock, releases it, runs analysis, then re-acquires to store results.
 
-### 8. `ExternC` reuses `Defn` struct
+### 8. `ExternC` reuses `Defn` struct — DEFERRED
 
-Implies extern declarations can have bodies (`weir-ast/src/lib.rs:184-189`). A separate `ExternDecl` type would be cleaner.
+Involves AST restructuring. Low practical impact since extern declarations are parsed without bodies.
 
-### 9. Struct destructure parser has acknowledged ambiguity
+### 9. Struct destructure parser has acknowledged ambiguity — DEFERRED
 
-Capitalization heuristic documented in a comment but not enforced in code (`weir-parser/src/lib.rs:1202-1213`).
+Capitalization heuristic works in practice. Fixing requires either parser backtracking or introducing distinct syntax.
 
 ---
 
 ## Minor
 
-### 10. `declare_runtime_helpers` boilerplate
+### 10. `declare_runtime_helpers` boilerplate — FIXED
 
-~400 lines that could be ~50 with a table-driven approach.
+Replaced ~400 lines of repetitive signature/declaration pairs with a 38-entry table + 10-line loop.
 
-### 11. `resolve_named_type` accepts both `"Bool"` and `"bool"`
+### 11. `resolve_named_type` accepts both `"Bool"` and `"bool"` — FIXED
 
-Without canonicalizing — error messages always say `Bool`.
+Removed the `"bool"` alternative. Only canonical `"Bool"` is accepted.
 
-### 12. `Float(f64)` in patterns
+### 12. `Float(f64)` in patterns — DEFERRED
 
-Semantically dangerous (float equality), should be disallowed or documented.
+Requires design decision about whether to disallow float patterns or add a warning. Low practical impact.
 
-### 13. Mangled specialization names could collide
+### 13. Mangled specialization names could collide — NO CHANGE NEEDED
 
-For complex types containing commas/parens in their display name.
+Analysis showed commas never appear in `Ty::Display` output (constructors use spaces, functions use brackets), so the comma-joined mangling scheme is collision-free. Added a safety comment documenting why.
 
-### 14. Workspace indexing races with document analysis
+### 14. Workspace indexing races with document analysis — DOCUMENTED
 
-Should be documented in `lsp-status.md`.
+Added to `design/lsp-status.md` Known Limitations section.
 
 ---
 
