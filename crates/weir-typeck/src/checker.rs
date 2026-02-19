@@ -2513,6 +2513,46 @@ impl<'a> TypeChecker<'a> {
                 | "recv"
                 | "par-map"
                 | "par-for-each"
+                // Math — Cranelift native
+                | "sqrt"
+                | "abs"
+                | "floor"
+                | "ceil"
+                | "min"
+                | "max"
+                // Math — runtime (libm)
+                | "sin"
+                | "cos"
+                | "tan"
+                | "asin"
+                | "acos"
+                | "atan"
+                | "atan2"
+                | "exp"
+                | "log"
+                | "pow"
+                | "round"
+                // Type conversions
+                | "to-f64"
+                | "to-i64"
+                | "to-f32"
+                | "to-i32"
+                // Random
+                | "random"
+                | "random-int"
+                | "random-seed"
+                // String operations
+                | "string-length"
+                | "substring"
+                | "string-ref"
+                | "string-contains"
+                | "string-upcase"
+                | "string-downcase"
+                | "string-trim"
+                | "char-to-string"
+                // File I/O
+                | "read-file"
+                | "write-file"
         )
     }
 
@@ -2699,6 +2739,176 @@ impl<'a> TypeChecker<'a> {
                 self.unify(&arg_tys[1], &vec_t, span);
                 Ty::Unit
             }
+
+            // ── Math: f64 unary (sqrt, floor, ceil, sin, cos, tan, asin, acos, atan, exp, log, round) ──
+            "sqrt" | "floor" | "ceil" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan"
+            | "exp" | "log" | "round" => {
+                if arg_tys.len() != 1 {
+                    self.error(format!("{} requires exactly 1 argument", name), span);
+                    return Ty::Error;
+                }
+                self.unify(&arg_tys[0], &Ty::F64, span);
+                Ty::F64
+            }
+
+            // ── Math: f64 binary (pow, atan2) ──
+            "pow" | "atan2" => {
+                if arg_tys.len() != 2 {
+                    self.error(format!("{} requires exactly 2 arguments", name), span);
+                    return Ty::Error;
+                }
+                self.unify(&arg_tys[0], &Ty::F64, span);
+                self.unify(&arg_tys[1], &Ty::F64, span);
+                Ty::F64
+            }
+
+            // ── Math: Num unary (abs) — preserves type ──
+            "abs" => {
+                if arg_tys.len() != 1 {
+                    self.error("abs requires exactly 1 argument", span);
+                    return Ty::Error;
+                }
+                arg_tys[0].clone()
+            }
+
+            // ── Math: Num binary (min, max) — unify both, preserve type ──
+            "min" | "max" => {
+                if arg_tys.len() != 2 {
+                    self.error(format!("{} requires exactly 2 arguments", name), span);
+                    return Ty::Error;
+                }
+                self.unify(&arg_tys[0], &arg_tys[1], span);
+                arg_tys[0].clone()
+            }
+
+            // ── Type conversions ──
+            "to-f64" => {
+                if arg_tys.len() != 1 {
+                    self.error("to-f64 requires exactly 1 argument", span);
+                    return Ty::Error;
+                }
+                Ty::F64
+            }
+            "to-i64" => {
+                if arg_tys.len() != 1 {
+                    self.error("to-i64 requires exactly 1 argument", span);
+                    return Ty::Error;
+                }
+                Ty::I64
+            }
+            "to-f32" => {
+                if arg_tys.len() != 1 {
+                    self.error("to-f32 requires exactly 1 argument", span);
+                    return Ty::Error;
+                }
+                Ty::F32
+            }
+            "to-i32" => {
+                if arg_tys.len() != 1 {
+                    self.error("to-i32 requires exactly 1 argument", span);
+                    return Ty::Error;
+                }
+                Ty::I32
+            }
+
+            // ── Random ──
+            "random" => {
+                if !arg_tys.is_empty() {
+                    self.error("random takes no arguments", span);
+                    return Ty::Error;
+                }
+                Ty::F64
+            }
+            "random-int" => {
+                if arg_tys.len() != 1 {
+                    self.error("random-int requires exactly 1 argument", span);
+                    return Ty::Error;
+                }
+                self.unify(&arg_tys[0], &Ty::I64, span);
+                Ty::I64
+            }
+            "random-seed" => {
+                if arg_tys.len() != 1 {
+                    self.error("random-seed requires exactly 1 argument", span);
+                    return Ty::Error;
+                }
+                self.unify(&arg_tys[0], &Ty::I64, span);
+                Ty::Unit
+            }
+
+            // ── String operations ──
+            "string-length" => {
+                if arg_tys.len() != 1 {
+                    self.error("string-length requires exactly 1 argument", span);
+                    return Ty::Error;
+                }
+                self.unify(&arg_tys[0], &Ty::Str, span);
+                Ty::I64
+            }
+            "substring" => {
+                if arg_tys.len() != 3 {
+                    self.error("substring requires exactly 3 arguments (string, start, end)", span);
+                    return Ty::Error;
+                }
+                self.unify(&arg_tys[0], &Ty::Str, span);
+                self.unify(&arg_tys[1], &Ty::I64, span);
+                self.unify(&arg_tys[2], &Ty::I64, span);
+                Ty::Str
+            }
+            "string-ref" => {
+                if arg_tys.len() != 2 {
+                    self.error("string-ref requires exactly 2 arguments (string, index)", span);
+                    return Ty::Error;
+                }
+                self.unify(&arg_tys[0], &Ty::Str, span);
+                self.unify(&arg_tys[1], &Ty::I64, span);
+                Ty::I64
+            }
+            "string-contains" => {
+                if arg_tys.len() != 2 {
+                    self.error("string-contains requires exactly 2 arguments", span);
+                    return Ty::Error;
+                }
+                self.unify(&arg_tys[0], &Ty::Str, span);
+                self.unify(&arg_tys[1], &Ty::Str, span);
+                Ty::Bool
+            }
+            "string-upcase" | "string-downcase" | "string-trim" => {
+                if arg_tys.len() != 1 {
+                    self.error(format!("{} requires exactly 1 argument", name), span);
+                    return Ty::Error;
+                }
+                self.unify(&arg_tys[0], &Ty::Str, span);
+                Ty::Str
+            }
+            "char-to-string" => {
+                if arg_tys.len() != 1 {
+                    self.error("char-to-string requires exactly 1 argument", span);
+                    return Ty::Error;
+                }
+                self.unify(&arg_tys[0], &Ty::I64, span);
+                Ty::Str
+            }
+
+            // ── File I/O ──
+            "read-file" => {
+                if arg_tys.len() != 1 {
+                    self.error("read-file requires exactly 1 argument (path)", span);
+                    return Ty::Error;
+                }
+                self.unify(&arg_tys[0], &Ty::Str, span);
+                Ty::Str
+            }
+            "write-file" => {
+                if arg_tys.len() != 2 {
+                    self.error("write-file requires exactly 2 arguments (path, contents)", span);
+                    return Ty::Error;
+                }
+                self.unify(&arg_tys[0], &Ty::Str, span);
+                self.unify(&arg_tys[1], &Ty::Str, span);
+                Ty::Unit
+            }
+
             _ => {
                 self.error(format!("unknown builtin '{}'", name), span);
                 Ty::Error

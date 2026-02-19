@@ -261,6 +261,46 @@ const BUILTINS: &[(&str, &str)] = &[
     ("append", "(Fn [Collection a] Collection)"),
     ("type-of", "(Fn [a] String)"),
     ("sleep", "(Fn [i64] Unit)"),
+    // Math — Cranelift native
+    ("sqrt", "(Fn [f64] f64)"),
+    ("abs", "(Fn [Num] Num)"),
+    ("floor", "(Fn [f64] f64)"),
+    ("ceil", "(Fn [f64] f64)"),
+    ("min", "(Fn [Num Num] Num)"),
+    ("max", "(Fn [Num Num] Num)"),
+    // Math — runtime (libm)
+    ("sin", "(Fn [f64] f64)"),
+    ("cos", "(Fn [f64] f64)"),
+    ("tan", "(Fn [f64] f64)"),
+    ("asin", "(Fn [f64] f64)"),
+    ("acos", "(Fn [f64] f64)"),
+    ("atan", "(Fn [f64] f64)"),
+    ("atan2", "(Fn [f64 f64] f64)"),
+    ("exp", "(Fn [f64] f64)"),
+    ("log", "(Fn [f64] f64)"),
+    ("pow", "(Fn [f64 f64] f64)"),
+    ("round", "(Fn [f64] f64)"),
+    // Type conversions
+    ("to-f64", "(Fn [Num] f64)"),
+    ("to-i64", "(Fn [Num] i64)"),
+    ("to-f32", "(Fn [Num] f32)"),
+    ("to-i32", "(Fn [Num] i32)"),
+    // Random
+    ("random", "(Fn [] f64)"),
+    ("random-int", "(Fn [i64] i64)"),
+    ("random-seed", "(Fn [i64] Unit)"),
+    // String operations
+    ("string-length", "(Fn [String] i64)"),
+    ("substring", "(Fn [String i64 i64] String)"),
+    ("string-ref", "(Fn [String i64] i64)"),
+    ("string-contains", "(Fn [String String] Bool)"),
+    ("string-upcase", "(Fn [String] String)"),
+    ("string-downcase", "(Fn [String] String)"),
+    ("string-trim", "(Fn [String] String)"),
+    ("char-to-string", "(Fn [i64] String)"),
+    // File I/O
+    ("read-file", "(Fn [String] String)"),
+    ("write-file", "(Fn [String String] Unit)"),
 ];
 
 const PRIMITIVE_TYPES: &[&str] = &[

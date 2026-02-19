@@ -291,6 +291,135 @@ int64_t weir_atom_cas(int64_t atom_ptr, int64_t expected, int64_t new_val) {
     return exp;
 }
 
+/* ── Math (libm wrappers) ── */
+#include <math.h>
+
+double weir_sin(double x) { return sin(x); }
+double weir_cos(double x) { return cos(x); }
+double weir_tan(double x) { return tan(x); }
+double weir_asin(double x) { return asin(x); }
+double weir_acos(double x) { return acos(x); }
+double weir_atan(double x) { return atan(x); }
+double weir_atan2(double y, double x) { return atan2(y, x); }
+double weir_exp(double x) { return exp(x); }
+double weir_log(double x) { return log(x); }
+double weir_pow(double x, double y) { return pow(x, y); }
+double weir_round(double x) { return round(x); }
+
+/* ── Random (xorshift64) ── */
+static uint64_t rng_state = 0x123456789abcdef0ULL;
+
+double weir_random(void) {
+    uint64_t s = rng_state;
+    s ^= s << 13;
+    s ^= s >> 7;
+    s ^= s << 17;
+    rng_state = s;
+    return (double)(s >> 11) / (double)(1ULL << 53);
+}
+
+int64_t weir_random_int(int64_t n) {
+    double r = weir_random();
+    int64_t v = (int64_t)(r * (double)n);
+    return v < n ? v : n - 1;
+}
+
+void weir_random_seed(int64_t seed) {
+    rng_state = seed == 0 ? 1 : (uint64_t)seed;
+}
+
+/* ── String operations ── */
+int64_t weir_string_length(int64_t ptr) {
+    return (int64_t)strlen((const char*)(intptr_t)ptr);
+}
+
+int64_t weir_substring(int64_t ptr, int64_t start, int64_t end) {
+    const char *s = (const char*)(intptr_t)ptr;
+    size_t len = strlen(s);
+    size_t st = (size_t)start;
+    size_t en = (size_t)end;
+    if (en > len) en = len;
+    if (st > en) st = en;
+    size_t sub_len = en - st;
+    char *out = malloc(sub_len + 1);
+    memcpy(out, s + st, sub_len);
+    out[sub_len] = '\0';
+    return (int64_t)(intptr_t)out;
+}
+
+int64_t weir_string_ref(int64_t ptr, int64_t idx) {
+    const char *s = (const char*)(intptr_t)ptr;
+    return (int64_t)(unsigned char)s[idx];
+}
+
+int64_t weir_string_contains(int64_t haystack, int64_t needle) {
+    return strstr((const char*)(intptr_t)haystack, (const char*)(intptr_t)needle) != NULL ? 1 : 0;
+}
+
+int64_t weir_string_upcase(int64_t ptr) {
+    const char *s = (const char*)(intptr_t)ptr;
+    size_t len = strlen(s);
+    char *out = malloc(len + 1);
+    for (size_t i = 0; i <= len; i++)
+        out[i] = (s[i] >= 'a' && s[i] <= 'z') ? s[i] - 32 : s[i];
+    return (int64_t)(intptr_t)out;
+}
+
+int64_t weir_string_downcase(int64_t ptr) {
+    const char *s = (const char*)(intptr_t)ptr;
+    size_t len = strlen(s);
+    char *out = malloc(len + 1);
+    for (size_t i = 0; i <= len; i++)
+        out[i] = (s[i] >= 'A' && s[i] <= 'Z') ? s[i] + 32 : s[i];
+    return (int64_t)(intptr_t)out;
+}
+
+int64_t weir_string_trim(int64_t ptr) {
+    const char *s = (const char*)(intptr_t)ptr;
+    size_t len = strlen(s);
+    size_t start = 0, end = len;
+    while (start < len && (s[start] == ' ' || s[start] == '\t' || s[start] == '\n' || s[start] == '\r')) start++;
+    while (end > start && (s[end-1] == ' ' || s[end-1] == '\t' || s[end-1] == '\n' || s[end-1] == '\r')) end--;
+    size_t sub_len = end - start;
+    char *out = malloc(sub_len + 1);
+    memcpy(out, s + start, sub_len);
+    out[sub_len] = '\0';
+    return (int64_t)(intptr_t)out;
+}
+
+int64_t weir_char_to_string(int64_t code) {
+    char buf[5] = {0};
+    if (code < 0x80) { buf[0] = (char)code; }
+    else if (code < 0x800) { buf[0] = 0xC0 | (code >> 6); buf[1] = 0x80 | (code & 0x3F); }
+    else if (code < 0x10000) { buf[0] = 0xE0 | (code >> 12); buf[1] = 0x80 | ((code >> 6) & 0x3F); buf[2] = 0x80 | (code & 0x3F); }
+    else { buf[0] = 0xF0 | (code >> 18); buf[1] = 0x80 | ((code >> 12) & 0x3F); buf[2] = 0x80 | ((code >> 6) & 0x3F); buf[3] = 0x80 | (code & 0x3F); }
+    return (int64_t)(intptr_t)strdup(buf);
+}
+
+/* ── File I/O ── */
+int64_t weir_read_file(int64_t path_ptr) {
+    const char *path = (const char*)(intptr_t)path_ptr;
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "read-file failed: cannot open %s\n", path); return (int64_t)(intptr_t)strdup(""); }
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *buf = malloc(len + 1);
+    fread(buf, 1, len, f);
+    buf[len] = '\0';
+    fclose(f);
+    return (int64_t)(intptr_t)buf;
+}
+
+void weir_write_file(int64_t path_ptr, int64_t contents_ptr) {
+    const char *path = (const char*)(intptr_t)path_ptr;
+    const char *contents = (const char*)(intptr_t)contents_ptr;
+    FILE *f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "write-file failed: cannot open %s\n", path); return; }
+    fwrite(contents, 1, strlen(contents), f);
+    fclose(f);
+}
+
 int main(void) { weir_main(); return 0; }
 "#;
 
@@ -350,6 +479,7 @@ pub fn build_executable(
         .arg(output_path)
         .arg(&obj_path)
         .arg(&runtime_path)
+        .arg("-lm")
         .status()
         .map_err(|e| CodegenError::new(format!("run cc: {}", e)))?;
 

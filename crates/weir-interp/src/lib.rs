@@ -1376,6 +1376,277 @@ impl<'a> Interpreter<'a> {
                 }
             }
 
+            // ── Math: f64 unary ──
+            "sqrt" => self.f64_unary(args, f64::sqrt, span),
+            "floor" => self.f64_unary(args, f64::floor, span),
+            "ceil" => self.f64_unary(args, f64::ceil, span),
+            "sin" => self.f64_unary(args, f64::sin, span),
+            "cos" => self.f64_unary(args, f64::cos, span),
+            "tan" => self.f64_unary(args, f64::tan, span),
+            "asin" => self.f64_unary(args, f64::asin, span),
+            "acos" => self.f64_unary(args, f64::acos, span),
+            "atan" => self.f64_unary(args, f64::atan, span),
+            "exp" => self.f64_unary(args, f64::exp, span),
+            "log" => self.f64_unary(args, f64::ln, span),
+            "round" => self.f64_unary(args, f64::round, span),
+
+            // ── Math: f64 binary ──
+            "pow" => self.f64_binary(args, f64::powf, span),
+            "atan2" => self.f64_binary(args, f64::atan2, span),
+
+            // ── Math: Num unary (abs) ──
+            "abs" => {
+                if args.len() != 1 {
+                    return Err(InterpError::with_span("abs requires 1 argument", span));
+                }
+                match &args[0] {
+                    Value::Int(n) => Ok(Value::Int(n.abs())),
+                    Value::Float(n) => Ok(Value::Float(n.abs())),
+                    _ => Err(InterpError::with_span("abs expects a numeric argument", span)),
+                }
+            }
+
+            // ── Math: Num binary (min, max) ──
+            "min" => {
+                if args.len() != 2 {
+                    return Err(InterpError::with_span("min requires 2 arguments", span));
+                }
+                match (&args[0], &args[1]) {
+                    (Value::Int(a), Value::Int(b)) => Ok(Value::Int(*a.min(b))),
+                    (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a.min(*b))),
+                    (Value::Int(a), Value::Float(b)) => Ok(Value::Float((*a as f64).min(*b))),
+                    (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a.min(*b as f64))),
+                    _ => Err(InterpError::with_span("min expects numeric arguments", span)),
+                }
+            }
+            "max" => {
+                if args.len() != 2 {
+                    return Err(InterpError::with_span("max requires 2 arguments", span));
+                }
+                match (&args[0], &args[1]) {
+                    (Value::Int(a), Value::Int(b)) => Ok(Value::Int(*a.max(b))),
+                    (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a.max(*b))),
+                    (Value::Int(a), Value::Float(b)) => Ok(Value::Float((*a as f64).max(*b))),
+                    (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a.max(*b as f64))),
+                    _ => Err(InterpError::with_span("max expects numeric arguments", span)),
+                }
+            }
+
+            // ── Type conversions ──
+            "to-f64" => {
+                if args.len() != 1 {
+                    return Err(InterpError::with_span("to-f64 requires 1 argument", span));
+                }
+                match &args[0] {
+                    Value::Int(n) => Ok(Value::Float(*n as f64)),
+                    Value::Float(n) => Ok(Value::Float(*n)),
+                    _ => Err(InterpError::with_span("to-f64 expects a numeric argument", span)),
+                }
+            }
+            "to-i64" => {
+                if args.len() != 1 {
+                    return Err(InterpError::with_span("to-i64 requires 1 argument", span));
+                }
+                match &args[0] {
+                    Value::Int(n) => Ok(Value::Int(*n)),
+                    Value::Float(n) => Ok(Value::Int(*n as i64)),
+                    _ => Err(InterpError::with_span("to-i64 expects a numeric argument", span)),
+                }
+            }
+            "to-f32" => {
+                if args.len() != 1 {
+                    return Err(InterpError::with_span("to-f32 requires 1 argument", span));
+                }
+                match &args[0] {
+                    Value::Int(n) => Ok(Value::Float(*n as f64)),
+                    Value::Float(n) => Ok(Value::Float(*n)),
+                    _ => Err(InterpError::with_span("to-f32 expects a numeric argument", span)),
+                }
+            }
+            "to-i32" => {
+                if args.len() != 1 {
+                    return Err(InterpError::with_span("to-i32 requires 1 argument", span));
+                }
+                match &args[0] {
+                    Value::Int(n) => Ok(Value::Int(*n)),
+                    Value::Float(n) => Ok(Value::Int(*n as i64)),
+                    _ => Err(InterpError::with_span("to-i32 expects a numeric argument", span)),
+                }
+            }
+
+            // ── Random ──
+            "random" => {
+                if !args.is_empty() {
+                    return Err(InterpError::with_span("random takes no arguments", span));
+                }
+                Ok(Value::Float(random_f64()))
+            }
+            "random-int" => {
+                if args.len() != 1 {
+                    return Err(InterpError::with_span("random-int requires 1 argument", span));
+                }
+                match &args[0] {
+                    Value::Int(n) => {
+                        if *n <= 0 {
+                            return Err(InterpError::with_span("random-int requires a positive bound", span));
+                        }
+                        let r = ((random_f64() * (*n as f64)) as i64).min(*n - 1);
+                        Ok(Value::Int(r))
+                    }
+                    _ => Err(InterpError::with_span("random-int expects an integer argument", span)),
+                }
+            }
+            "random-seed" => {
+                if args.len() != 1 {
+                    return Err(InterpError::with_span("random-seed requires 1 argument", span));
+                }
+                match &args[0] {
+                    Value::Int(n) => {
+                        random_seed(*n as u64);
+                        Ok(Value::Unit)
+                    }
+                    _ => Err(InterpError::with_span("random-seed expects an integer argument", span)),
+                }
+            }
+
+            // ── String operations ──
+            "string-length" => {
+                if args.len() != 1 {
+                    return Err(InterpError::with_span("string-length requires 1 argument", span));
+                }
+                match &args[0] {
+                    Value::String(s) => Ok(Value::Int(s.len() as i64)),
+                    _ => Err(InterpError::with_span("string-length expects a string", span)),
+                }
+            }
+            "substring" => {
+                if args.len() != 3 {
+                    return Err(InterpError::with_span("substring requires 3 arguments", span));
+                }
+                match (&args[0], &args[1], &args[2]) {
+                    (Value::String(s), Value::Int(start), Value::Int(end)) => {
+                        let start = *start as usize;
+                        let end = (*end as usize).min(s.len());
+                        if start > end || start > s.len() {
+                            Ok(Value::String(String::new()))
+                        } else {
+                            Ok(Value::String(s[start..end].to_string()))
+                        }
+                    }
+                    _ => Err(InterpError::with_span("substring expects (string, int, int)", span)),
+                }
+            }
+            "string-ref" => {
+                if args.len() != 2 {
+                    return Err(InterpError::with_span("string-ref requires 2 arguments", span));
+                }
+                match (&args[0], &args[1]) {
+                    (Value::String(s), Value::Int(idx)) => {
+                        let idx = *idx as usize;
+                        if idx < s.len() {
+                            Ok(Value::Int(s.as_bytes()[idx] as i64))
+                        } else {
+                            Err(InterpError::with_span(
+                                format!("string-ref index {} out of bounds (len {})", idx, s.len()),
+                                span,
+                            ))
+                        }
+                    }
+                    _ => Err(InterpError::with_span("string-ref expects (string, int)", span)),
+                }
+            }
+            "string-contains" => {
+                if args.len() != 2 {
+                    return Err(InterpError::with_span("string-contains requires 2 arguments", span));
+                }
+                match (&args[0], &args[1]) {
+                    (Value::String(haystack), Value::String(needle)) => {
+                        Ok(Value::Bool(haystack.contains(needle.as_str())))
+                    }
+                    _ => Err(InterpError::with_span("string-contains expects (string, string)", span)),
+                }
+            }
+            "string-upcase" => {
+                if args.len() != 1 {
+                    return Err(InterpError::with_span("string-upcase requires 1 argument", span));
+                }
+                match &args[0] {
+                    Value::String(s) => Ok(Value::String(s.to_uppercase())),
+                    _ => Err(InterpError::with_span("string-upcase expects a string", span)),
+                }
+            }
+            "string-downcase" => {
+                if args.len() != 1 {
+                    return Err(InterpError::with_span("string-downcase requires 1 argument", span));
+                }
+                match &args[0] {
+                    Value::String(s) => Ok(Value::String(s.to_lowercase())),
+                    _ => Err(InterpError::with_span("string-downcase expects a string", span)),
+                }
+            }
+            "string-trim" => {
+                if args.len() != 1 {
+                    return Err(InterpError::with_span("string-trim requires 1 argument", span));
+                }
+                match &args[0] {
+                    Value::String(s) => Ok(Value::String(s.trim().to_string())),
+                    _ => Err(InterpError::with_span("string-trim expects a string", span)),
+                }
+            }
+            "char-to-string" => {
+                if args.len() != 1 {
+                    return Err(InterpError::with_span("char-to-string requires 1 argument", span));
+                }
+                match &args[0] {
+                    Value::Int(code) => {
+                        match char::from_u32(*code as u32) {
+                            Some(c) => Ok(Value::String(c.to_string())),
+                            None => Err(InterpError::with_span(
+                                format!("invalid character code: {}", code),
+                                span,
+                            )),
+                        }
+                    }
+                    _ => Err(InterpError::with_span("char-to-string expects an integer", span)),
+                }
+            }
+
+            // ── File I/O ──
+            "read-file" => {
+                if args.len() != 1 {
+                    return Err(InterpError::with_span("read-file requires 1 argument", span));
+                }
+                match &args[0] {
+                    Value::String(path) => {
+                        match std::fs::read_to_string(path) {
+                            Ok(contents) => Ok(Value::String(contents)),
+                            Err(e) => Err(InterpError::with_span(
+                                format!("read-file failed: {}", e),
+                                span,
+                            )),
+                        }
+                    }
+                    _ => Err(InterpError::with_span("read-file expects a string path", span)),
+                }
+            }
+            "write-file" => {
+                if args.len() != 2 {
+                    return Err(InterpError::with_span("write-file requires 2 arguments", span));
+                }
+                match (&args[0], &args[1]) {
+                    (Value::String(path), Value::String(contents)) => {
+                        match std::fs::write(path, contents) {
+                            Ok(()) => Ok(Value::Unit),
+                            Err(e) => Err(InterpError::with_span(
+                                format!("write-file failed: {}", e),
+                                span,
+                            )),
+                        }
+                    }
+                    _ => Err(InterpError::with_span("write-file expects (string, string)", span)),
+                }
+            }
+
             _ => Err(InterpError::with_span(
                 format!("unknown builtin '{}'", name),
                 span,
@@ -1553,6 +1824,70 @@ impl<'a> Interpreter<'a> {
             span,
         ))
     }
+
+    fn f64_unary(
+        &self,
+        args: &[Value],
+        op: fn(f64) -> f64,
+        span: Span,
+    ) -> Result<Value, InterpError> {
+        if args.len() != 1 {
+            return Err(InterpError::with_span("expected 1 argument", span));
+        }
+        match &args[0] {
+            Value::Float(n) => Ok(Value::Float(op(*n))),
+            Value::Int(n) => Ok(Value::Float(op(*n as f64))),
+            _ => Err(InterpError::with_span("expected a numeric argument", span)),
+        }
+    }
+
+    fn f64_binary(
+        &self,
+        args: &[Value],
+        op: fn(f64, f64) -> f64,
+        span: Span,
+    ) -> Result<Value, InterpError> {
+        if args.len() != 2 {
+            return Err(InterpError::with_span("expected 2 arguments", span));
+        }
+        let a = match &args[0] {
+            Value::Float(n) => *n,
+            Value::Int(n) => *n as f64,
+            _ => return Err(InterpError::with_span("expected numeric arguments", span)),
+        };
+        let b = match &args[1] {
+            Value::Float(n) => *n,
+            Value::Int(n) => *n as f64,
+            _ => return Err(InterpError::with_span("expected numeric arguments", span)),
+        };
+        Ok(Value::Float(op(a, b)))
+    }
+}
+
+// ── Thread-local xorshift64 PRNG ─────────────────────────────────
+
+std::thread_local! {
+    static RNG_STATE: std::cell::Cell<u64> = const { std::cell::Cell::new(0x12345678_9abcdef0) };
+}
+
+fn xorshift64() -> u64 {
+    RNG_STATE.with(|state| {
+        let mut s = state.get();
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        state.set(s);
+        s
+    })
+}
+
+fn random_f64() -> f64 {
+    (xorshift64() >> 11) as f64 / ((1u64 << 53) as f64)
+}
+
+fn random_seed(seed: u64) {
+    let s = if seed == 0 { 1 } else { seed };
+    RNG_STATE.with(|state| state.set(s));
 }
 
 // ── Tests ────────────────────────────────────────────────────────

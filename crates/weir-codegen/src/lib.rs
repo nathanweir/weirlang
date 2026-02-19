@@ -330,6 +330,34 @@ impl<'a, M: Module> Compiler<'a, M> {
             ("par_for_each", "weir_par_for_each", &[types::I64, types::I64],              None),
             // Misc
             ("sleep_ms",     "weir_sleep_ms",     &[types::I64], None),
+            // Math (libm)
+            ("sin",          "weir_sin",          &[types::F64],               Some(types::F64)),
+            ("cos",          "weir_cos",          &[types::F64],               Some(types::F64)),
+            ("tan",          "weir_tan",          &[types::F64],               Some(types::F64)),
+            ("asin",         "weir_asin",         &[types::F64],               Some(types::F64)),
+            ("acos",         "weir_acos",         &[types::F64],               Some(types::F64)),
+            ("atan",         "weir_atan",         &[types::F64],               Some(types::F64)),
+            ("atan2",        "weir_atan2",        &[types::F64, types::F64],   Some(types::F64)),
+            ("exp",          "weir_exp",          &[types::F64],               Some(types::F64)),
+            ("log",          "weir_log",          &[types::F64],               Some(types::F64)),
+            ("pow",          "weir_pow",          &[types::F64, types::F64],   Some(types::F64)),
+            ("round",        "weir_round",        &[types::F64],               Some(types::F64)),
+            // Random
+            ("random",       "weir_random",       &[],                         Some(types::F64)),
+            ("random_int",   "weir_random_int",   &[types::I64],               Some(types::I64)),
+            ("random_seed",  "weir_random_seed",  &[types::I64],               None),
+            // String operations
+            ("string_length",   "weir_string_length",   &[types::I64],                              Some(types::I64)),
+            ("substring",       "weir_substring",       &[types::I64, types::I64, types::I64],      Some(types::I64)),
+            ("string_ref",      "weir_string_ref",      &[types::I64, types::I64],                  Some(types::I64)),
+            ("string_contains", "weir_string_contains", &[types::I64, types::I64],                  Some(types::I8)),
+            ("string_upcase",   "weir_string_upcase",   &[types::I64],                              Some(types::I64)),
+            ("string_downcase", "weir_string_downcase", &[types::I64],                              Some(types::I64)),
+            ("string_trim",     "weir_string_trim",     &[types::I64],                              Some(types::I64)),
+            ("char_to_string",  "weir_char_to_string",  &[types::I64],                              Some(types::I64)),
+            // File I/O
+            ("read_file",    "weir_read_file",    &[types::I64],               Some(types::I64)),
+            ("write_file",   "weir_write_file",   &[types::I64, types::I64],   None),
         ];
 
         for &(key, symbol, params, ret) in helpers {
@@ -2101,6 +2129,261 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                     self.builder.ins().call(func_ref, &[closure_ptr, vec_ptr]);
                     return Ok(None); // returns Unit
                 }
+
+                // ── Math: Cranelift-native f64 unary (sqrt, floor, ceil) ──
+                "sqrt" => {
+                    let val = self.compile_expr(args[0].value, &Ty::F64)?.unwrap();
+                    return Ok(Some(self.builder.ins().sqrt(val)));
+                }
+                "floor" => {
+                    let val = self.compile_expr(args[0].value, &Ty::F64)?.unwrap();
+                    return Ok(Some(self.builder.ins().floor(val)));
+                }
+                "ceil" => {
+                    let val = self.compile_expr(args[0].value, &Ty::F64)?.unwrap();
+                    return Ok(Some(self.builder.ins().ceil(val)));
+                }
+
+                // ── Math: abs (type-dependent) ──
+                "abs" => {
+                    let arg_ty = self.expr_ty(args[0].value);
+                    let val = self.compile_expr(args[0].value, &arg_ty)?.unwrap();
+                    match &arg_ty {
+                        Ty::F64 => return Ok(Some(self.builder.ins().fabs(val))),
+                        Ty::F32 => return Ok(Some(self.builder.ins().fabs(val))),
+                        _ => {
+                            // Integer abs: select(val < 0, -val, val)
+                            let cl_ty = self.ty_cl(&arg_ty).unwrap_or(types::I64);
+                            let zero = self.builder.ins().iconst(cl_ty, 0);
+                            let neg = self.builder.ins().ineg(val);
+                            let is_neg = self.builder.ins().icmp(IntCC::SignedLessThan, val, zero);
+                            return Ok(Some(self.builder.ins().select(is_neg, neg, val)));
+                        }
+                    }
+                }
+
+                // ── Math: min/max (type-dependent) ──
+                "min" => {
+                    let arg_ty = self.expr_ty(args[0].value);
+                    let a = self.compile_expr(args[0].value, &arg_ty)?.unwrap();
+                    let b = self.compile_expr(args[1].value, &arg_ty)?.unwrap();
+                    match &arg_ty {
+                        Ty::F64 | Ty::F32 => return Ok(Some(self.builder.ins().fmin(a, b))),
+                        _ => {
+                            let cmp = self.builder.ins().icmp(IntCC::SignedLessThan, a, b);
+                            return Ok(Some(self.builder.ins().select(cmp, a, b)));
+                        }
+                    }
+                }
+                "max" => {
+                    let arg_ty = self.expr_ty(args[0].value);
+                    let a = self.compile_expr(args[0].value, &arg_ty)?.unwrap();
+                    let b = self.compile_expr(args[1].value, &arg_ty)?.unwrap();
+                    match &arg_ty {
+                        Ty::F64 | Ty::F32 => return Ok(Some(self.builder.ins().fmax(a, b))),
+                        _ => {
+                            let cmp = self.builder.ins().icmp(IntCC::SignedGreaterThan, a, b);
+                            return Ok(Some(self.builder.ins().select(cmp, a, b)));
+                        }
+                    }
+                }
+
+                // ── Math: runtime calls (sin, cos, tan, etc.) ──
+                "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "exp" | "log" | "round" => {
+                    let val = self.compile_expr(args[0].value, &Ty::F64)?.unwrap();
+                    let func_id = self.runtime_fns[name.as_str()];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    let call = self.builder.ins().call(func_ref, &[val]);
+                    return Ok(Some(self.builder.inst_results(call)[0]));
+                }
+                "pow" | "atan2" => {
+                    let a = self.compile_expr(args[0].value, &Ty::F64)?.unwrap();
+                    let b = self.compile_expr(args[1].value, &Ty::F64)?.unwrap();
+                    let func_id = self.runtime_fns[name.as_str()];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    let call = self.builder.ins().call(func_ref, &[a, b]);
+                    return Ok(Some(self.builder.inst_results(call)[0]));
+                }
+
+                // ── Type conversions ──
+                "to-f64" => {
+                    let arg_ty = self.expr_ty(args[0].value);
+                    let val = self.compile_expr(args[0].value, &arg_ty)?.unwrap();
+                    let result = match &arg_ty {
+                        Ty::F64 => val,
+                        Ty::F32 => self.builder.ins().fpromote(types::F64, val),
+                        Ty::I64 => self.builder.ins().fcvt_from_sint(types::F64, val),
+                        Ty::I32 | Ty::I16 | Ty::I8 => {
+                            let ext = self.builder.ins().sextend(types::I64, val);
+                            self.builder.ins().fcvt_from_sint(types::F64, ext)
+                        }
+                        Ty::U64 => self.builder.ins().fcvt_from_uint(types::F64, val),
+                        Ty::U32 | Ty::U16 | Ty::U8 => {
+                            let ext = self.builder.ins().uextend(types::I64, val);
+                            self.builder.ins().fcvt_from_uint(types::F64, ext)
+                        }
+                        _ => self.builder.ins().fcvt_from_sint(types::F64, val),
+                    };
+                    return Ok(Some(result));
+                }
+                "to-i64" => {
+                    let arg_ty = self.expr_ty(args[0].value);
+                    let val = self.compile_expr(args[0].value, &arg_ty)?.unwrap();
+                    let result = match &arg_ty {
+                        Ty::I64 => val,
+                        Ty::I32 | Ty::I16 | Ty::I8 => self.builder.ins().sextend(types::I64, val),
+                        Ty::U64 => val, // same bits
+                        Ty::U32 | Ty::U16 | Ty::U8 => self.builder.ins().uextend(types::I64, val),
+                        Ty::F64 => self.builder.ins().fcvt_to_sint_sat(types::I64, val),
+                        Ty::F32 => {
+                            let promoted = self.builder.ins().fpromote(types::F64, val);
+                            self.builder.ins().fcvt_to_sint_sat(types::I64, promoted)
+                        }
+                        _ => val,
+                    };
+                    return Ok(Some(result));
+                }
+                "to-f32" => {
+                    let arg_ty = self.expr_ty(args[0].value);
+                    let val = self.compile_expr(args[0].value, &arg_ty)?.unwrap();
+                    let result = match &arg_ty {
+                        Ty::F32 => val,
+                        Ty::F64 => self.builder.ins().fdemote(types::F32, val),
+                        Ty::I64 | Ty::I32 | Ty::I16 | Ty::I8 => {
+                            let ext = if matches!(&arg_ty, Ty::I64) { val } else { self.builder.ins().sextend(types::I64, val) };
+                            let f64_val = self.builder.ins().fcvt_from_sint(types::F64, ext);
+                            self.builder.ins().fdemote(types::F32, f64_val)
+                        }
+                        Ty::U64 | Ty::U32 | Ty::U16 | Ty::U8 => {
+                            let ext = if matches!(&arg_ty, Ty::U64) { val } else { self.builder.ins().uextend(types::I64, val) };
+                            let f64_val = self.builder.ins().fcvt_from_uint(types::F64, ext);
+                            self.builder.ins().fdemote(types::F32, f64_val)
+                        }
+                        _ => val,
+                    };
+                    return Ok(Some(result));
+                }
+                "to-i32" => {
+                    let arg_ty = self.expr_ty(args[0].value);
+                    let val = self.compile_expr(args[0].value, &arg_ty)?.unwrap();
+                    let result = match &arg_ty {
+                        Ty::I32 => val,
+                        Ty::I64 => self.builder.ins().ireduce(types::I32, val),
+                        Ty::I16 | Ty::I8 => self.builder.ins().sextend(types::I32, val),
+                        Ty::U64 => self.builder.ins().ireduce(types::I32, val),
+                        Ty::U32 => val, // same bits
+                        Ty::U16 | Ty::U8 => self.builder.ins().uextend(types::I32, val),
+                        Ty::F64 => self.builder.ins().fcvt_to_sint_sat(types::I32, val),
+                        Ty::F32 => {
+                            let promoted = self.builder.ins().fpromote(types::F64, val);
+                            self.builder.ins().fcvt_to_sint_sat(types::I32, promoted)
+                        }
+                        _ => val,
+                    };
+                    return Ok(Some(result));
+                }
+
+                // ── Random ──
+                "random" => {
+                    let func_id = self.runtime_fns["random"];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    let call = self.builder.ins().call(func_ref, &[]);
+                    return Ok(Some(self.builder.inst_results(call)[0]));
+                }
+                "random-int" => {
+                    let val = self.compile_expr(args[0].value, &Ty::I64)?.unwrap();
+                    let func_id = self.runtime_fns["random_int"];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    let call = self.builder.ins().call(func_ref, &[val]);
+                    return Ok(Some(self.builder.inst_results(call)[0]));
+                }
+                "random-seed" => {
+                    let val = self.compile_expr(args[0].value, &Ty::I64)?.unwrap();
+                    let func_id = self.runtime_fns["random_seed"];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    self.builder.ins().call(func_ref, &[val]);
+                    return Ok(None);
+                }
+
+                // ── String operations ──
+                "string-length" => {
+                    let val = self.compile_expr(args[0].value, &Ty::Str)?.unwrap();
+                    let func_id = self.runtime_fns["string_length"];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    let call = self.builder.ins().call(func_ref, &[val]);
+                    return Ok(Some(self.builder.inst_results(call)[0]));
+                }
+                "substring" => {
+                    let s = self.compile_expr(args[0].value, &Ty::Str)?.unwrap();
+                    let start = self.compile_expr(args[1].value, &Ty::I64)?.unwrap();
+                    let end = self.compile_expr(args[2].value, &Ty::I64)?.unwrap();
+                    let func_id = self.runtime_fns["substring"];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    let call = self.builder.ins().call(func_ref, &[s, start, end]);
+                    return Ok(Some(self.builder.inst_results(call)[0]));
+                }
+                "string-ref" => {
+                    let s = self.compile_expr(args[0].value, &Ty::Str)?.unwrap();
+                    let idx = self.compile_expr(args[1].value, &Ty::I64)?.unwrap();
+                    let func_id = self.runtime_fns["string_ref"];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    let call = self.builder.ins().call(func_ref, &[s, idx]);
+                    return Ok(Some(self.builder.inst_results(call)[0]));
+                }
+                "string-contains" => {
+                    let h = self.compile_expr(args[0].value, &Ty::Str)?.unwrap();
+                    let n = self.compile_expr(args[1].value, &Ty::Str)?.unwrap();
+                    let func_id = self.runtime_fns["string_contains"];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    let call = self.builder.ins().call(func_ref, &[h, n]);
+                    return Ok(Some(self.builder.inst_results(call)[0]));
+                }
+                "string-upcase" => {
+                    let val = self.compile_expr(args[0].value, &Ty::Str)?.unwrap();
+                    let func_id = self.runtime_fns["string_upcase"];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    let call = self.builder.ins().call(func_ref, &[val]);
+                    return Ok(Some(self.builder.inst_results(call)[0]));
+                }
+                "string-downcase" => {
+                    let val = self.compile_expr(args[0].value, &Ty::Str)?.unwrap();
+                    let func_id = self.runtime_fns["string_downcase"];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    let call = self.builder.ins().call(func_ref, &[val]);
+                    return Ok(Some(self.builder.inst_results(call)[0]));
+                }
+                "string-trim" => {
+                    let val = self.compile_expr(args[0].value, &Ty::Str)?.unwrap();
+                    let func_id = self.runtime_fns["string_trim"];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    let call = self.builder.ins().call(func_ref, &[val]);
+                    return Ok(Some(self.builder.inst_results(call)[0]));
+                }
+                "char-to-string" => {
+                    let val = self.compile_expr(args[0].value, &Ty::I64)?.unwrap();
+                    let func_id = self.runtime_fns["char_to_string"];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    let call = self.builder.ins().call(func_ref, &[val]);
+                    return Ok(Some(self.builder.inst_results(call)[0]));
+                }
+
+                // ── File I/O ──
+                "read-file" => {
+                    let path = self.compile_expr(args[0].value, &Ty::Str)?.unwrap();
+                    let func_id = self.runtime_fns["read_file"];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    let call = self.builder.ins().call(func_ref, &[path]);
+                    return Ok(Some(self.builder.inst_results(call)[0]));
+                }
+                "write-file" => {
+                    let path = self.compile_expr(args[0].value, &Ty::Str)?.unwrap();
+                    let contents = self.compile_expr(args[1].value, &Ty::Str)?.unwrap();
+                    let func_id = self.runtime_fns["write_file"];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    self.builder.ins().call(func_ref, &[path, contents]);
+                    return Ok(None);
+                }
+
                 _ => {}
             }
 

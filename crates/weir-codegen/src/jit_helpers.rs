@@ -125,6 +125,133 @@ extern "C" fn weir_str_cmp(a: i64, b: i64) -> i64 {
     }
 }
 
+// ── Math runtime (libm wrappers) ────────────────────────────────
+
+extern "C" fn weir_sin(x: f64) -> f64 { x.sin() }
+extern "C" fn weir_cos(x: f64) -> f64 { x.cos() }
+extern "C" fn weir_tan(x: f64) -> f64 { x.tan() }
+extern "C" fn weir_asin(x: f64) -> f64 { x.asin() }
+extern "C" fn weir_acos(x: f64) -> f64 { x.acos() }
+extern "C" fn weir_atan(x: f64) -> f64 { x.atan() }
+extern "C" fn weir_atan2(y: f64, x: f64) -> f64 { y.atan2(x) }
+extern "C" fn weir_exp(x: f64) -> f64 { x.exp() }
+extern "C" fn weir_log(x: f64) -> f64 { x.ln() }
+extern "C" fn weir_pow(x: f64, y: f64) -> f64 { x.powf(y) }
+extern "C" fn weir_round(x: f64) -> f64 { x.round() }
+
+// ── Random (xorshift64) ─────────────────────────────────────────
+
+std::thread_local! {
+    static RNG_STATE: std::cell::Cell<u64> = const { std::cell::Cell::new(0x12345678_9abcdef0) };
+}
+
+extern "C" fn weir_random() -> f64 {
+    RNG_STATE.with(|state| {
+        let mut s = state.get();
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        state.set(s);
+        (s >> 11) as f64 / ((1u64 << 53) as f64)
+    })
+}
+
+extern "C" fn weir_random_int(n: i64) -> i64 {
+    let r = weir_random();
+    ((r * (n as f64)) as i64).min(n - 1)
+}
+
+extern "C" fn weir_random_seed(seed: i64) {
+    let s = if seed == 0 { 1u64 } else { seed as u64 };
+    RNG_STATE.with(|state| state.set(s));
+}
+
+// ── String operations ────────────────────────────────────────────
+
+extern "C" fn weir_string_length(ptr: i64) -> i64 {
+    let c_str = unsafe { std::ffi::CStr::from_ptr(ptr as *const std::ffi::c_char) };
+    c_str.to_bytes().len() as i64
+}
+
+extern "C" fn weir_substring(ptr: i64, start: i64, end: i64) -> i64 {
+    let c_str = unsafe { std::ffi::CStr::from_ptr(ptr as *const std::ffi::c_char) };
+    let s = c_str.to_str().unwrap_or("");
+    let start = start as usize;
+    let end = (end as usize).min(s.len());
+    let sub = if start > end || start > s.len() {
+        ""
+    } else {
+        &s[start..end]
+    };
+    std::ffi::CString::new(sub).unwrap().into_raw() as i64
+}
+
+extern "C" fn weir_string_ref(ptr: i64, idx: i64) -> i64 {
+    let c_str = unsafe { std::ffi::CStr::from_ptr(ptr as *const std::ffi::c_char) };
+    let bytes = c_str.to_bytes();
+    let idx = idx as usize;
+    if idx < bytes.len() {
+        bytes[idx] as i64
+    } else {
+        0 // out of bounds
+    }
+}
+
+extern "C" fn weir_string_contains(haystack: i64, needle: i64) -> i8 {
+    let h = unsafe { std::ffi::CStr::from_ptr(haystack as *const _) }
+        .to_str().unwrap_or("");
+    let n = unsafe { std::ffi::CStr::from_ptr(needle as *const _) }
+        .to_str().unwrap_or("");
+    if h.contains(n) { 1 } else { 0 }
+}
+
+extern "C" fn weir_string_upcase(ptr: i64) -> i64 {
+    let c_str = unsafe { std::ffi::CStr::from_ptr(ptr as *const std::ffi::c_char) };
+    let s = c_str.to_str().unwrap_or("");
+    std::ffi::CString::new(s.to_uppercase()).unwrap().into_raw() as i64
+}
+
+extern "C" fn weir_string_downcase(ptr: i64) -> i64 {
+    let c_str = unsafe { std::ffi::CStr::from_ptr(ptr as *const std::ffi::c_char) };
+    let s = c_str.to_str().unwrap_or("");
+    std::ffi::CString::new(s.to_lowercase()).unwrap().into_raw() as i64
+}
+
+extern "C" fn weir_string_trim(ptr: i64) -> i64 {
+    let c_str = unsafe { std::ffi::CStr::from_ptr(ptr as *const std::ffi::c_char) };
+    let s = c_str.to_str().unwrap_or("");
+    std::ffi::CString::new(s.trim()).unwrap().into_raw() as i64
+}
+
+extern "C" fn weir_char_to_string(code: i64) -> i64 {
+    let c = char::from_u32(code as u32).unwrap_or('\u{FFFD}');
+    std::ffi::CString::new(c.to_string()).unwrap().into_raw() as i64
+}
+
+// ── File I/O ─────────────────────────────────────────────────────
+
+extern "C" fn weir_read_file(path_ptr: i64) -> i64 {
+    let c_str = unsafe { std::ffi::CStr::from_ptr(path_ptr as *const std::ffi::c_char) };
+    let path = c_str.to_str().unwrap_or("");
+    match std::fs::read_to_string(path) {
+        Ok(contents) => std::ffi::CString::new(contents).unwrap().into_raw() as i64,
+        Err(e) => {
+            eprintln!("read-file failed: {}", e);
+            std::ffi::CString::new("").unwrap().into_raw() as i64
+        }
+    }
+}
+
+extern "C" fn weir_write_file(path_ptr: i64, contents_ptr: i64) {
+    let path = unsafe { std::ffi::CStr::from_ptr(path_ptr as *const std::ffi::c_char) }
+        .to_str().unwrap_or("");
+    let contents = unsafe { std::ffi::CStr::from_ptr(contents_ptr as *const std::ffi::c_char) }
+        .to_str().unwrap_or("");
+    if let Err(e) = std::fs::write(path, contents) {
+        eprintln!("write-file failed: {}", e);
+    }
+}
+
 /// Registers all JIT runtime symbols on a JITBuilder.
 pub(crate) fn register_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol("weir_print_i64", weir_print_i64 as *const u8);
@@ -164,4 +291,32 @@ pub(crate) fn register_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol("weir_thread_join", weir_thread_join as *const u8);
     builder.symbol("weir_par_map", weir_par_map as *const u8);
     builder.symbol("weir_par_for_each", weir_par_for_each as *const u8);
+    // Math (libm)
+    builder.symbol("weir_sin", weir_sin as *const u8);
+    builder.symbol("weir_cos", weir_cos as *const u8);
+    builder.symbol("weir_tan", weir_tan as *const u8);
+    builder.symbol("weir_asin", weir_asin as *const u8);
+    builder.symbol("weir_acos", weir_acos as *const u8);
+    builder.symbol("weir_atan", weir_atan as *const u8);
+    builder.symbol("weir_atan2", weir_atan2 as *const u8);
+    builder.symbol("weir_exp", weir_exp as *const u8);
+    builder.symbol("weir_log", weir_log as *const u8);
+    builder.symbol("weir_pow", weir_pow as *const u8);
+    builder.symbol("weir_round", weir_round as *const u8);
+    // Random
+    builder.symbol("weir_random", weir_random as *const u8);
+    builder.symbol("weir_random_int", weir_random_int as *const u8);
+    builder.symbol("weir_random_seed", weir_random_seed as *const u8);
+    // String operations
+    builder.symbol("weir_string_length", weir_string_length as *const u8);
+    builder.symbol("weir_substring", weir_substring as *const u8);
+    builder.symbol("weir_string_ref", weir_string_ref as *const u8);
+    builder.symbol("weir_string_contains", weir_string_contains as *const u8);
+    builder.symbol("weir_string_upcase", weir_string_upcase as *const u8);
+    builder.symbol("weir_string_downcase", weir_string_downcase as *const u8);
+    builder.symbol("weir_string_trim", weir_string_trim as *const u8);
+    builder.symbol("weir_char_to_string", weir_char_to_string as *const u8);
+    // File I/O
+    builder.symbol("weir_read_file", weir_read_file as *const u8);
+    builder.symbol("weir_write_file", weir_write_file as *const u8);
 }
