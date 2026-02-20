@@ -74,6 +74,7 @@ export default defineConfig({
           label: "Interop",
           items: [
             { label: "C FFI", slug: "interop/c-ffi" },
+            { label: "WebAssembly", slug: "interop/wasm" },
             { label: "Rust Integration", slug: "interop/rust" },
             { label: "Native Libraries", slug: "interop/native-libraries" },
           ],

@@ -1,0 +1,161 @@
+---
+// Standalone Tetris page — loads the WASM game outside the Starlight layout
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Tetris — Weir Language</title>
+    <link rel="icon" type="image/png" href="/favicon.png" />
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      body {
+        background: #1a1a2e;
+        color: #e0e0e0;
+        font-family:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        min-height: 100vh;
+      }
+      header {
+        width: 100%;
+        padding: 0.75rem 1.5rem;
+        background: #16213e;
+        border-bottom: 1px solid #0f3460;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        font-size: 0.9rem;
+      }
+      header a {
+        color: #a8b2d1;
+        text-decoration: none;
+      }
+      header a:hover {
+        color: #fff;
+      }
+      .header-title {
+        font-weight: 600;
+        color: #ccd6f6;
+      }
+      .game-container {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        padding: 1rem;
+      }
+      canvas {
+        display: block;
+        border-radius: 4px;
+        max-height: 80vh;
+        max-width: 90vw;
+      }
+      .controls {
+        margin-top: 1rem;
+        color: #8892b0;
+        font-size: 0.85rem;
+        text-align: center;
+        line-height: 1.6;
+      }
+      .controls kbd {
+        background: #233554;
+        border: 1px solid #0f3460;
+        border-radius: 3px;
+        padding: 0.1em 0.4em;
+        font-family: monospace;
+        font-size: 0.85em;
+        color: #ccd6f6;
+      }
+      #loading {
+        color: #8892b0;
+        font-size: 1.1rem;
+        padding: 2rem;
+      }
+      #error {
+        display: none;
+        color: #ff6b6b;
+        padding: 2rem;
+        text-align: center;
+        max-width: 500px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <span class="header-title">Weir Tetris</span>
+      <nav>
+        <a href="/">Docs</a>
+        &nbsp;&middot;&nbsp;
+        <a href="/interop/wasm/">WASM Guide</a>
+        &nbsp;&middot;&nbsp;
+        <a href="https://github.com/nathanweir/weirlang">GitHub</a>
+      </nav>
+    </header>
+    <div class="game-container">
+      <div id="loading">Loading WASM...</div>
+      <div id="error">
+        <p>Failed to load the game. Check the browser console for details.</p>
+      </div>
+      <canvas id="canvas" width="920" height="1280"></canvas>
+      <div class="controls">
+        <kbd>&larr;</kbd> <kbd>&rarr;</kbd> Move
+        &nbsp;&nbsp;
+        <kbd>&uarr;</kbd> Rotate
+        &nbsp;&nbsp;
+        <kbd>&darr;</kbd> Soft drop
+        &nbsp;&nbsp;
+        <kbd>Space</kbd> Hard drop
+      </div>
+    </div>
+    <script type="module">
+      import { createRuntime } from "/tetris/runtime.js";
+      import { createGLBridge } from "/tetris/gl_bridge.js";
+
+      const loading = document.getElementById("loading");
+      const errorDiv = document.getElementById("error");
+      const canvas = document.getElementById("canvas");
+
+      try {
+        const runtime = createRuntime();
+        const importObj = { env: { ...runtime.env } };
+
+        const gl = createGLBridge(canvas);
+        Object.assign(importObj.env, gl.env);
+
+        const { instance } = await WebAssembly.instantiateStreaming(
+          fetch("/tetris/app.wasm"),
+          importObj,
+        );
+
+        runtime.setMemory(instance.exports.memory);
+        gl.setMemory(instance.exports.memory);
+
+        loading.style.display = "none";
+
+        instance.exports.weir_main();
+
+        if (instance.exports.weir_frame) {
+          function frame() {
+            instance.exports.weir_frame();
+            requestAnimationFrame(frame);
+          }
+          requestAnimationFrame(frame);
+        }
+      } catch (e) {
+        loading.style.display = "none";
+        errorDiv.style.display = "block";
+        console.error("WASM load error:", e);
+      }
+    </script>
+  </body>
+</html>
