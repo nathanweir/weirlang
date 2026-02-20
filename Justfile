@@ -77,3 +77,7 @@ docs-dev:
 # Build docs site
 docs-build:
     cd docs && pnpm run build
+
+# Deploy docs to Cloudflare Pages
+docs-deploy:
+    cd docs && pnpm run deploy

@@ -6,8 +6,12 @@
     "dev": "astro dev",
     "start": "astro dev",
     "build": "astro build",
+    "deploy": "astro build && wrangler pages deploy dist --project-name=weirlang",
     "preview": "astro preview",
     "astro": "astro"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
   },
   "dependencies": {
     "@astrojs/starlight": "^0.37.0",
@@ -18,7 +22,8 @@
   "pnpm": {
     "onlyBuiltDependencies": [
       "esbuild",
-      "sharp"
+      "sharp",
+      "workerd"
     ]
   }
 }
