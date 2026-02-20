@@ -56,6 +56,9 @@ enum Command {
     Dev {
         /// Path to the .weir source file
         file: PathBuf,
+        /// Pre-load a shared library before JIT (makes symbols available via dlsym)
+        #[arg(long = "load")]
+        load: Vec<PathBuf>,
     },
     /// Start the Weir Language Server Protocol server
     Lsp,
@@ -265,7 +268,22 @@ fn main() {
                 }
             }
         }
-        Command::Dev { file } => {
+        Command::Dev { file, load } => {
+            // Pre-load shared libraries so their symbols are available via dlsym
+            for lib_path in &load {
+                let c_path = std::ffi::CString::new(
+                    lib_path.to_str().unwrap_or_default()
+                ).unwrap();
+                let handle = unsafe {
+                    libc::dlopen(c_path.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL)
+                };
+                if handle.is_null() {
+                    let err = unsafe { std::ffi::CStr::from_ptr(libc::dlerror()) };
+                    eprintln!("error: could not load {}: {}", lib_path.display(), err.to_string_lossy());
+                    std::process::exit(1);
+                }
+            }
+
             let source = with_prelude(&read_file(&file));
             let expanded = expand_source(&source, &file);
 

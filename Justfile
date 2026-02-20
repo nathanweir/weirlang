@@ -54,9 +54,14 @@ ts-test:
 tetris-build:
     cargo run --bin weir -- build demos/tetris_gl.weir -o tmp/tetris_gl --cc-arg libs/gl_helper.c -l glfw -l GL -l m
 
-# Run the OpenGL Tetris demo
+# Run the OpenGL Tetris demo (AOT)
 tetris: tetris-build
     ./tmp/tetris_gl
+
+# Run OpenGL Tetris in dev mode (live reload — edit demos/tetris_gl.weir while it runs)
+tetris-dev:
+    cc -shared -fPIC -o tmp/libgl_helper.so libs/gl_helper.c -lglfw -lGL -lm
+    cargo run --bin weir -- dev demos/tetris_gl.weir --load tmp/libgl_helper.so
 
 # Convert a BMP screenshot to PNG for viewing (usage: just screenshot tmp/tetris_screenshot.bmp)
 screenshot file:

@@ -121,6 +121,23 @@ fn compile_dev_module(
     register_jit_symbols(&mut builder);
     builder.symbol("weir_fn_table", fn_table_ptr as *const u8);
 
+    // Register extern "C" symbols via dlsym (libraries must already be loaded)
+    for (item, _) in &ast_module.items {
+        if let Item::ExternC(ext) = item {
+            for decl in &ext.declarations {
+                let c_name = std::ffi::CString::new(decl.name.as_str()).unwrap();
+                let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr()) };
+                if ptr.is_null() {
+                    return Err(CodegenError::new(format!(
+                        "extern function '{}' not found — is the library loaded? (use --load)",
+                        decl.name
+                    )));
+                }
+                builder.symbol(decl.name.as_str(), ptr as *const u8);
+            }
+        }
+    }
+
     let jit_module = JITModule::new(builder);
     let mut compiler = Compiler::new(ast_module, type_info, jit_module);
     compiler.declare_runtime_helpers()?;
