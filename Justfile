@@ -70,6 +70,10 @@ tetris-dev:
 screenshot file:
     convert {{ file }} -resize 50% {{ without_extension(file) }}.png && echo "Wrote {{ without_extension(file) }}.png"
 
+# Build Tetris demo to WASM
+wasm-tetris:
+    cd demos/tetris && cargo run --manifest-path ../../Cargo.toml --bin weir -- wasm
+
 # Start docs dev server
 docs-dev:
     cd docs && pnpm run dev

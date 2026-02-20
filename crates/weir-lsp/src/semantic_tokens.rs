@@ -375,6 +375,12 @@ impl<'a> TokenCollector<'a> {
                     self.collect_expr(*v);
                 }
             }
+            ExprKind::Target { branches } => {
+                self.push_keyword_at_form_start(expr.span, "target");
+                for (_name, expr) in branches {
+                    self.collect_expr(*expr);
+                }
+            }
             ExprKind::FieldAccess(_) => {}
         }
     }

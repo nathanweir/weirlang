@@ -1997,6 +1997,10 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                 Ok(Some(ptr))
             }
 
+            ExprKind::Target { .. } => Err(CodegenError::new(
+                "target form should have been resolved during expansion".to_string(),
+            )),
+
             _ => Err(CodegenError::new(format!(
                 "unsupported expression kind in codegen: {:?}",
                 std::mem::discriminant(&expr.kind)

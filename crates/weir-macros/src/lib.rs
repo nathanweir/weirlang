@@ -26,10 +26,19 @@ pub struct ExpandResult {
     pub errors: Vec<MacroError>,
 }
 
+pub use weir_ast::CompileTarget;
+
 /// Expand macros in source code.
 ///
 /// Pipeline: lex → read(SExpr) → expand → flatten(tokens) → reconstruct source.
 pub fn expand(source: &str) -> ExpandResult {
+    expand_for_target(source, None)
+}
+
+/// Expand macros in source code, resolving `(target ...)` forms for the given target.
+///
+/// If `target` is `None`, `(target ...)` forms are left intact for later resolution.
+pub fn expand_for_target(source: &str, target: Option<CompileTarget>) -> ExpandResult {
     let (tokens, lex_errors) = weir_lexer::lex(source);
 
     let mut errors: Vec<MacroError> = lex_errors
@@ -50,7 +59,7 @@ pub fn expand(source: &str) -> ExpandResult {
         };
     }
 
-    let (expanded, expand_errors) = expander::expand_toplevel(sexprs);
+    let (expanded, expand_errors) = expander::expand_toplevel(sexprs, target);
     errors.extend(expand_errors);
 
     if !errors.is_empty() {

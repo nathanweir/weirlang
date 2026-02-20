@@ -17,6 +17,7 @@ weir-codegen.workspace = true
 weir-macros.workspace = true
 weir-lsp.workspace = true
 weir-pkg.workspace = true
+weir-wasm.workspace = true
 clap.workspace = true
 smol_str.workspace = true
 libc = "0.2"

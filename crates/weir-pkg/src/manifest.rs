@@ -21,6 +21,8 @@ pub struct PackageManifest {
     pub deps: Vec<DepSpec>,
     pub native_sources: Vec<PathBuf>,
     pub link_libs: Vec<String>,
+    /// JS bridge files for WASM builds (from `(target (:wasm (wasm-bridge ...)))` or `(wasm-bridge ...)`).
+    pub wasm_bridge_files: Vec<PathBuf>,
 }
 
 /// Parse a `weir.pkg` manifest file.
@@ -53,6 +55,7 @@ pub fn parse_manifest(source: &str, manifest_path: &Path) -> Result<PackageManif
     let mut deps: Vec<DepSpec> = Vec::new();
     let mut native_sources: Vec<PathBuf> = Vec::new();
     let mut link_libs: Vec<String> = Vec::new();
+    let mut wasm_bridge_files: Vec<PathBuf> = Vec::new();
 
     // Parse fields until closing `)`
     while pos < toks.len() && *toks[pos] != Token::RParen {
@@ -98,31 +101,71 @@ pub fn parse_manifest(source: &str, manifest_path: &Path) -> Result<PackageManif
                 }
             }
             "native" => {
-                // Sub-fields: `(sources ...)` and `(link ...)`
+                parse_native_section(&toks, &mut pos, manifest_dir, &mut native_sources, &mut link_libs)?;
+            }
+            "wasm-bridge" => {
+                // One or more string literals for JS bridge files
                 while pos < toks.len() && *toks[pos] != Token::RParen {
-                    expect_tok(&toks, &mut pos, &Token::LParen, "expected `(` for native sub-field")?;
-                    let sub_field = read_symbol(&toks, &mut pos)?;
-                    match sub_field.as_str() {
-                        "sources" => {
+                    let s = read_string(&toks, &mut pos)?;
+                    wasm_bridge_files.push(manifest_dir.join(s));
+                }
+            }
+            "target" => {
+                // Per-target sections: (:native ...) (:wasm ...)
+                while pos < toks.len() && *toks[pos] != Token::RParen {
+                    expect_tok(&toks, &mut pos, &Token::LParen, "expected `(` for target branch")?;
+                    // Read keyword (:native or :wasm)
+                    let kw = read_keyword(&toks, &mut pos)?;
+                    match kw.as_str() {
+                        "native" => {
+                            // Inside (:native ...) — parse sub-fields like (native ...)
                             while pos < toks.len() && *toks[pos] != Token::RParen {
-                                let s = read_string(&toks, &mut pos)?;
-                                native_sources.push(manifest_dir.join(s));
+                                expect_tok(&toks, &mut pos, &Token::LParen, "expected `(` for native sub")?;
+                                let sub = read_symbol(&toks, &mut pos)?;
+                                match sub.as_str() {
+                                    "native" => {
+                                        parse_native_section(&toks, &mut pos, manifest_dir, &mut native_sources, &mut link_libs)?;
+                                    }
+                                    other => {
+                                        return Err(PkgError::ManifestParse(format!(
+                                            "unknown field `{}` inside target :native",
+                                            other
+                                        )));
+                                    }
+                                }
+                                expect_tok(&toks, &mut pos, &Token::RParen, "expected `)` for native sub")?;
                             }
                         }
-                        "link" => {
+                        "wasm" => {
+                            // Inside (:wasm ...) — parse wasm-bridge etc.
                             while pos < toks.len() && *toks[pos] != Token::RParen {
-                                let s = read_string(&toks, &mut pos)?;
-                                link_libs.push(s);
+                                expect_tok(&toks, &mut pos, &Token::LParen, "expected `(` for wasm sub")?;
+                                let sub = read_symbol(&toks, &mut pos)?;
+                                match sub.as_str() {
+                                    "wasm-bridge" => {
+                                        while pos < toks.len() && *toks[pos] != Token::RParen {
+                                            let s = read_string(&toks, &mut pos)?;
+                                            wasm_bridge_files.push(manifest_dir.join(s));
+                                        }
+                                    }
+                                    other => {
+                                        return Err(PkgError::ManifestParse(format!(
+                                            "unknown field `{}` inside target :wasm",
+                                            other
+                                        )));
+                                    }
+                                }
+                                expect_tok(&toks, &mut pos, &Token::RParen, "expected `)` for wasm sub")?;
                             }
                         }
                         other => {
                             return Err(PkgError::ManifestParse(format!(
-                                "unknown native sub-field `{}`",
+                                "unknown target keyword `:{}`",
                                 other
                             )));
                         }
                     }
-                    expect_tok(&toks, &mut pos, &Token::RParen, "expected `)` for native sub-field")?;
+                    expect_tok(&toks, &mut pos, &Token::RParen, "expected `)` for target branch")?;
                 }
             }
             other => {
@@ -150,7 +193,43 @@ pub fn parse_manifest(source: &str, manifest_path: &Path) -> Result<PackageManif
         deps,
         native_sources,
         link_libs,
+        wasm_bridge_files,
     })
+}
+
+fn parse_native_section(
+    toks: &[&Token],
+    pos: &mut usize,
+    manifest_dir: &Path,
+    native_sources: &mut Vec<PathBuf>,
+    link_libs: &mut Vec<String>,
+) -> Result<(), PkgError> {
+    while *pos < toks.len() && *toks[*pos] != Token::RParen {
+        expect_tok(toks, pos, &Token::LParen, "expected `(` for native sub-field")?;
+        let sub_field = read_symbol(toks, pos)?;
+        match sub_field.as_str() {
+            "sources" => {
+                while *pos < toks.len() && *toks[*pos] != Token::RParen {
+                    let s = read_string(toks, pos)?;
+                    native_sources.push(manifest_dir.join(s));
+                }
+            }
+            "link" => {
+                while *pos < toks.len() && *toks[*pos] != Token::RParen {
+                    let s = read_string(toks, pos)?;
+                    link_libs.push(s);
+                }
+            }
+            other => {
+                return Err(PkgError::ManifestParse(format!(
+                    "unknown native sub-field `{}`",
+                    other
+                )));
+            }
+        }
+        expect_tok(toks, pos, &Token::RParen, "expected `)` for native sub-field")?;
+    }
+    Ok(())
 }
 
 fn expect_tok(toks: &[&Token], pos: &mut usize, expected: &Token, msg: &str) -> Result<(), PkgError> {
@@ -200,6 +279,25 @@ fn read_symbol(toks: &[&Token], pos: &mut usize) -> Result<String, PkgError> {
         }
         other => Err(PkgError::ManifestParse(format!(
             "expected symbol, got {:?}",
+            other
+        ))),
+    }
+}
+
+fn read_keyword(toks: &[&Token], pos: &mut usize) -> Result<String, PkgError> {
+    if *pos >= toks.len() {
+        return Err(PkgError::ManifestParse(
+            "expected keyword (unexpected end of input)".into(),
+        ));
+    }
+    match toks[*pos] {
+        Token::Keyword(s) => {
+            let result = s.to_string();
+            *pos += 1;
+            Ok(result)
+        }
+        other => Err(PkgError::ManifestParse(format!(
+            "expected keyword, got {:?}",
             other
         ))),
     }

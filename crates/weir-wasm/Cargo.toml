@@ -1,5 +1,5 @@
 [package]
-name = "weir-macros"
+name = "weir-wasm"
 version.workspace = true
 edition.workspace = true
 
@@ -7,12 +7,14 @@ edition.workspace = true
 doctest = false
 
 [dependencies]
-weir-lexer.workspace = true
 weir-ast.workspace = true
+weir-typeck.workspace = true
+wasm-encoder = "0.225"
 smol_str.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
+wasmparser = "0.225"
 weir-parser.workspace = true
-weir-ast.workspace = true
+weir-macros.workspace = true

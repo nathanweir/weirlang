@@ -22,6 +22,8 @@ pub struct ResolvedProject {
     pub entry_source: Option<PathBuf>,
     pub native_sources: Vec<PathBuf>,
     pub link_libs: Vec<String>,
+    /// JS bridge files for WASM builds, collected from all packages.
+    pub wasm_bridge_files: Vec<PathBuf>,
     pub package_root: PathBuf,
 }
 
@@ -59,6 +61,7 @@ pub fn resolve_project(manifest_path: &Path) -> Result<ResolvedProject, PkgError
     let mut modules = Vec::new();
     let mut native_sources = Vec::new();
     let mut link_libs = Vec::new();
+    let mut wasm_bridge_files = Vec::new();
 
     for pkg_name in &sorted {
         let pkg = &packages[pkg_name];
@@ -72,6 +75,11 @@ pub fn resolve_project(manifest_path: &Path) -> Result<ResolvedProject, PkgError
         for lib in &pkg.manifest.link_libs {
             if !link_libs.contains(lib) {
                 link_libs.push(lib.clone());
+            }
+        }
+        for wf in &pkg.manifest.wasm_bridge_files {
+            if !wasm_bridge_files.contains(wf) {
+                wasm_bridge_files.push(wf.clone());
             }
         }
 
@@ -122,6 +130,7 @@ pub fn resolve_project(manifest_path: &Path) -> Result<ResolvedProject, PkgError
         entry_source,
         native_sources,
         link_libs,
+        wasm_bridge_files,
         package_root,
     })
 }

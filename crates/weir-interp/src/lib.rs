@@ -889,6 +889,13 @@ impl<'a> Interpreter<'a> {
                 let _val = self.eval_expr(env, *inner)?;
                 Ok(Value::Unit)
             }
+
+            ExprKind::Target { .. } => {
+                Err(InterpError::with_span(
+                    "target forms must be resolved before interpretation",
+                    span,
+                ))
+            }
         }
     }
 

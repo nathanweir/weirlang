@@ -330,6 +330,42 @@ Current baseline: 647 tests passing.
 
 ---
 
+## Phase 16: WASM Output Backend (In Progress)
+
+**Started 2026-02-19.** 651 tests passing. Added `weir wasm` CLI subcommand that compiles any Weir program to a browser-deployable WASM package.
+
+See `design/wasm-backend.md` for the full design.
+
+### Completed
+
+- [x] `CompileTarget` enum (`Native`, `Wasm`) added to `weir-ast`, threaded through pipeline
+- [x] `(target (:native expr) (:wasm expr))` special form — parser, typecker, codegen, LSP, interpreter
+- [x] Target resolution at macro expansion time (`weir-macros`)
+- [x] Package manifest `(target (:native ...) (:wasm ...))` section with `(wasm-bridge ...)` field
+- [x] `crates/weir-wasm/` crate scaffold:
+  - `types.rs` — Weir type to WASM ValType mapping (pointers = I32 in wasm32)
+  - `runtime.rs` — Linear memory layout, JS imports, GC/string/vector runtime functions emitted as WASM
+  - `emit.rs` — Full expression compilation (arithmetic, let, if, cond, match, ADTs, vectors, strings, builtins)
+  - `lib.rs` — `WasmCompiler` struct, three-pass compilation pipeline, `compile_to_wasm()` and `build_wasm_package()` API
+  - `glue.rs` — JS runtime bridge (`runtime.js`), `loader.js`, and `index.html` generation
+- [x] `weir wasm` CLI subcommand (single-file and package mode)
+- [x] WebGL bridge (`gl_bridge.js`) for `weir-opengl` — implements all 11 GL functions via WebGL 2
+- [x] `weir-opengl/weir.pkg` updated with `(target ...)` section
+- [x] Justfile `wasm-tetris` recipe
+- [x] `demos/tetris/.gitignore` for `web/` build artifacts
+- [x] All 651 existing tests still pass
+
+### Remaining
+
+- [ ] Closure compilation via WASM function table (`call_indirect`)
+- [ ] Shadow stack for GC root tracking
+- [ ] `weir_frame` export + game loop adaptation in Tetris demo
+- [ ] `wasm-set-state` / `wasm-get-state` builtins
+- [ ] End-to-end test: compile and run simple Weir program in browser
+- [ ] End-to-end: Tetris running in browser
+
+---
+
 ## File change summary
 
 | File | Phase 11 | Phase 12 | Phase 13 |

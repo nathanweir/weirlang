@@ -869,6 +869,9 @@ impl Parser {
         } else if self.check_symbol("spawn") {
             self.advance();
             self.parse_spawn_body(start)
+        } else if self.check_symbol("target") {
+            self.advance();
+            self.parse_target_body(start)
         } else {
             self.parse_call_body(start)
         };
@@ -1119,6 +1122,36 @@ impl Parser {
     fn parse_spawn_body(&mut self, _start: Span) -> Option<ExprKind> {
         let inner = self.parse_expr()?;
         Some(ExprKind::Spawn(inner))
+    }
+
+    fn parse_target_body(&mut self, _start: Span) -> Option<ExprKind> {
+        let mut branches = Vec::new();
+        while !self.at_end() && !self.check(&Token::RParen) {
+            // Each branch: (:keyword expr)
+            self.expect(&Token::LParen)?;
+            let keyword = if let Some(Token::Keyword(_)) = self.peek() {
+                let (tok, _) = self.advance();
+                if let Token::Keyword(k) = tok {
+                    k
+                } else {
+                    unreachable!()
+                }
+            } else {
+                let span = self.peek_span();
+                self.error("expected keyword (e.g. :native, :wasm) in target branch".into(), span);
+                self.recover_to_close_paren();
+                continue;
+            };
+            let expr = self.parse_expr()?;
+            self.expect(&Token::RParen)?;
+            branches.push((keyword, expr));
+        }
+        if branches.is_empty() {
+            let span = self.peek_span();
+            self.error("target requires at least one branch".into(), span);
+            return None;
+        }
+        Some(ExprKind::Target { branches })
     }
 
     fn parse_call_body(&mut self, _start: Span) -> Option<ExprKind> {

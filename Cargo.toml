@@ -11,6 +11,7 @@ members = [
     "crates/weir-macros",
     "crates/weir-lsp",
     "crates/weir-pkg",
+    "crates/weir-wasm",
     "crates/weir-cli",
 ]
 exclude = [
@@ -70,3 +71,4 @@ weir-macros = { path = "crates/weir-macros" }
 weir-runtime = { path = "crates/weir-runtime" }
 weir-lsp = { path = "crates/weir-lsp" }
 weir-pkg = { path = "crates/weir-pkg" }
+weir-wasm = { path = "crates/weir-wasm" }

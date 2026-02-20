@@ -4,6 +4,25 @@ use la_arena::{Arena, Idx};
 use smol_str::SmolStr;
 pub use weir_lexer::Span;
 
+// ── Compile target ───────────────────────────────────────────────
+
+/// Which platform the compiler is targeting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CompileTarget {
+    Native,
+    Wasm,
+}
+
+impl CompileTarget {
+    /// The keyword string used in `(target (:native ...) (:wasm ...))` forms.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            CompileTarget::Native => "native",
+            CompileTarget::Wasm => "wasm",
+        }
+    }
+}
+
 // ── ID types ──────────────────────────────────────────────────────
 
 pub type ExprId = Idx<Expr>;
@@ -269,6 +288,10 @@ pub enum ExprKind {
     WithTasks { body: Vec<ExprId> },
     /// Spawn a task: `(spawn expr)` — must be inside with-tasks
     Spawn(ExprId),
+    /// Platform conditional: `(target (:native expr) (:wasm expr))`
+    Target {
+        branches: Vec<(SmolStr, ExprId)>,
+    },
 }
 
 /// A function call argument (positional or named).
@@ -858,6 +881,17 @@ impl<'a> PrettyPrinter<'a> {
             ExprKind::Spawn(inner) => {
                 self.buf.push_str("(spawn ");
                 self.print_expr(*inner);
+                self.buf.push(')');
+            }
+            ExprKind::Target { branches } => {
+                self.buf.push_str("(target");
+                for (kw, expr) in branches {
+                    self.buf.push_str(" (:");
+                    self.buf.push_str(kw);
+                    self.buf.push(' ');
+                    self.print_expr(*expr);
+                    self.buf.push(')');
+                }
                 self.buf.push(')');
             }
         }

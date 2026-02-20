@@ -260,6 +260,12 @@ fn collect_expr_hints(
             }
         }
 
+        ExprKind::Target { branches } => {
+            for (_name, expr) in branches {
+                collect_expr_hints(*expr, module, type_result, line_index, range, hints);
+            }
+        }
+
         // Leaves — no sub-expressions to recurse into
         ExprKind::Lit(_) | ExprKind::Var(_) | ExprKind::FieldAccess(_) => {}
     }

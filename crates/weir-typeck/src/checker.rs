@@ -2054,6 +2054,19 @@ impl<'a> TypeChecker<'a> {
                 let _inner_ty = self.check_expr(*inner);
                 Ty::Unit
             }
+
+            ExprKind::Target { branches } => {
+                // Target forms should be resolved during expansion, but if one
+                // reaches the type checker (e.g. in an editor), check all branches
+                // and unify their types.
+                let mut result_ty = self.fresh_var();
+                for (_keyword, expr) in branches {
+                    let ty = self.check_expr(*expr);
+                    self.unify(&result_ty, &ty, span);
+                    result_ty = ty;
+                }
+                result_ty
+            }
         }
     }
 

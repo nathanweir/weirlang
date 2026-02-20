@@ -75,7 +75,3 @@ docs/               Documentation website (Astro + Starlight)
 ## Documentation
 
 See [`docs/`](docs/) for the full documentation site, or run `just docs-dev` to browse locally.
-
-## License
-
-Personal project. No license specified.

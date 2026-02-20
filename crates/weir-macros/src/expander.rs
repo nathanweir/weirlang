@@ -4,6 +4,7 @@ use crate::sexpr::SExpr;
 use crate::MacroError;
 use smol_str::SmolStr;
 use std::collections::HashMap;
+use weir_ast::CompileTarget;
 use weir_lexer::{Span, Token};
 
 const MAX_EXPANSION_DEPTH: usize = 256;
@@ -23,7 +24,14 @@ enum MacroParam {
 }
 
 /// Expand all macros in a top-level list of S-expressions.
-pub fn expand_toplevel(sexprs: Vec<SExpr>) -> (Vec<SExpr>, Vec<MacroError>) {
+///
+/// If `target` is `Some`, `(target ...)` forms are resolved at expansion time —
+/// the matching branch is kept and non-matching branches are discarded.
+/// Top-level `(target ...)` forms may expand to zero or more top-level items.
+pub fn expand_toplevel(
+    sexprs: Vec<SExpr>,
+    target: Option<CompileTarget>,
+) -> (Vec<SExpr>, Vec<MacroError>) {
     let mut macros: HashMap<SmolStr, MacroDef> = HashMap::new();
     let mut errors = Vec::new();
 
@@ -42,12 +50,36 @@ pub fn expand_toplevel(sexprs: Vec<SExpr>) -> (Vec<SExpr>, Vec<MacroError>) {
         }
     }
 
-    // Second pass: expand macro calls
+    // Second pass: expand macro calls and resolve target forms
     let mut expanded = Vec::new();
     for sexpr in remaining {
-        match expand_sexpr(sexpr, &macros, 0) {
-            Ok(result) => expanded.push(result),
-            Err(err) => errors.push(err),
+        // Check for top-level (target ...) form — it can wrap multiple items
+        if is_target_form(&sexpr) {
+            if let Some(t) = target {
+                match resolve_target_toplevel(&sexpr, t) {
+                    Ok(items) => {
+                        // Recursively expand the resolved items
+                        for item in items {
+                            match expand_sexpr(item, &macros, 0, target) {
+                                Ok(result) => expanded.push(result),
+                                Err(err) => errors.push(err),
+                            }
+                        }
+                    }
+                    Err(err) => errors.push(err),
+                }
+            } else {
+                // No target specified — pass through (will be handled later)
+                match expand_sexpr(sexpr, &macros, 0, target) {
+                    Ok(result) => expanded.push(result),
+                    Err(err) => errors.push(err),
+                }
+            }
+        } else {
+            match expand_sexpr(sexpr, &macros, 0, target) {
+                Ok(result) => expanded.push(result),
+                Err(err) => errors.push(err),
+            }
         }
     }
 
@@ -61,6 +93,86 @@ fn is_defmacro(sexpr: &SExpr) -> bool {
         }
     }
     false
+}
+
+fn is_target_form(sexpr: &SExpr) -> bool {
+    if let SExpr::List(children, _) = sexpr {
+        if let Some(first) = children.first() {
+            return first.is_symbol("target");
+        }
+    }
+    false
+}
+
+/// Resolve a top-level `(target (:native ...) (:wasm ...))` form.
+///
+/// A top-level target branch may contain multiple items (e.g. defn, extern blocks),
+/// so this returns a Vec of S-expressions.
+fn resolve_target_toplevel(
+    sexpr: &SExpr,
+    target: CompileTarget,
+) -> Result<Vec<SExpr>, MacroError> {
+    let SExpr::List(children, _span) = sexpr else {
+        return Err(MacroError {
+            message: "expected target form".into(),
+            span: sexpr.span(),
+        });
+    };
+
+    let target_kw = target.keyword();
+
+    for child in &children[1..] {
+        if let SExpr::List(branch_children, _) = child {
+            if let Some(SExpr::Atom(Token::Keyword(kw), _)) = branch_children.first() {
+                if kw.as_str() == target_kw {
+                    // Return all items after the keyword in this branch
+                    return Ok(branch_children[1..].to_vec());
+                }
+            }
+        }
+    }
+
+    // No matching branch — return empty (silently omit)
+    Ok(Vec::new())
+}
+
+/// Resolve an expression-level `(target (:native expr) (:wasm expr))` form.
+///
+/// Returns the matching branch expression, or an error if no branch matches.
+fn resolve_target_expr(
+    children: &[SExpr],
+    target: CompileTarget,
+    span: Span,
+) -> Result<SExpr, MacroError> {
+    let target_kw = target.keyword();
+
+    for child in &children[1..] {
+        if let SExpr::List(branch_children, _) = child {
+            if let Some(SExpr::Atom(Token::Keyword(kw), _)) = branch_children.first() {
+                if kw.as_str() == target_kw {
+                    if branch_children.len() == 2 {
+                        return Ok(branch_children[1].clone());
+                    } else if branch_children.len() > 2 {
+                        // Multiple expressions — wrap in (do ...)
+                        let mut do_list = vec![SExpr::Atom(
+                            Token::Symbol(SmolStr::new("do")),
+                            branch_children[0].span(),
+                        )];
+                        do_list.extend(branch_children[1..].iter().cloned());
+                        return Ok(SExpr::List(do_list, span));
+                    }
+                }
+            }
+        }
+    }
+
+    Err(MacroError {
+        message: format!(
+            "no matching branch for target '{}' in target form",
+            target_kw
+        ),
+        span,
+    })
 }
 
 fn parse_defmacro(sexpr: &SExpr) -> Result<(SmolStr, MacroDef), MacroError> {
@@ -137,6 +249,7 @@ fn expand_sexpr(
     sexpr: SExpr,
     macros: &HashMap<SmolStr, MacroDef>,
     depth: usize,
+    target: Option<CompileTarget>,
 ) -> Result<SExpr, MacroError> {
     if depth > MAX_EXPANSION_DEPTH {
         return Err(MacroError {
@@ -152,11 +265,20 @@ fn expand_sexpr(
             }
 
             if let Some(name) = children[0].as_symbol() {
+                // Resolve (target ...) forms at expansion time
+                if name == "target" {
+                    if let Some(t) = target {
+                        let resolved = resolve_target_expr(&children, t, span)?;
+                        return expand_sexpr(resolved, macros, depth + 1, target);
+                    }
+                    // No target specified — pass through
+                }
+
                 // Check for built-in macros first
                 if builtins::is_builtin_macro(name) {
                     let args: Vec<SExpr> = children[1..].to_vec();
                     let expanded = builtins::expand_builtin(name, &args, span)?;
-                    return expand_sexpr(expanded, macros, depth + 1);
+                    return expand_sexpr(expanded, macros, depth + 1, target);
                 }
 
                 // Check for user-defined macros
@@ -167,14 +289,14 @@ fn expand_sexpr(
                     let bindings = bind_params(&mac.params, &args, span)?;
                     let template = apply_hygiene(&mac.body, &bindings);
                     let expanded = eval_template(&template, &bindings)?;
-                    return expand_sexpr(expanded, macros, depth + 1);
+                    return expand_sexpr(expanded, macros, depth + 1, target);
                 }
             }
 
             // Not a macro call — recursively expand children
             let mut expanded_children = Vec::with_capacity(children.len());
             for child in children {
-                expanded_children.push(expand_sexpr(child, macros, depth)?);
+                expanded_children.push(expand_sexpr(child, macros, depth, target)?);
             }
             Ok(SExpr::List(expanded_children, span))
         }
@@ -182,7 +304,7 @@ fn expand_sexpr(
         SExpr::Vector(children, span) => {
             let mut expanded = Vec::with_capacity(children.len());
             for child in children {
-                expanded.push(expand_sexpr(child, macros, depth)?);
+                expanded.push(expand_sexpr(child, macros, depth, target)?);
             }
             Ok(SExpr::Vector(expanded, span))
         }
@@ -190,7 +312,7 @@ fn expand_sexpr(
         SExpr::Map(children, span) => {
             let mut expanded = Vec::with_capacity(children.len());
             for child in children {
-                expanded.push(expand_sexpr(child, macros, depth)?);
+                expanded.push(expand_sexpr(child, macros, depth, target)?);
             }
             Ok(SExpr::Map(expanded, span))
         }
@@ -475,7 +597,7 @@ mod tests {
     fn expand_source(source: &str) -> (Vec<SExpr>, Vec<MacroError>) {
         let (tokens, _) = weir_lexer::lex(source);
         let (sexprs, _) = sexpr::read(&tokens);
-        expand_toplevel(sexprs)
+        expand_toplevel(sexprs, None)
     }
 
     fn expand_to_source(source: &str) -> String {
@@ -665,5 +787,42 @@ mod tests {
             "macro-introduced 'y' should be renamed: {}",
             result
         );
+    }
+
+    // ── Target resolution tests ──────────────────────────────────
+
+    #[test]
+    fn test_target_native_selects_native_branch() {
+        let source = r#"(defn main () (target (:native (println "native")) (:wasm (println "wasm"))))"#;
+        let result = crate::expand_for_target(source, Some(CompileTarget::Native));
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        assert!(result.source.contains("\"native\""), "result: {}", result.source);
+        assert!(!result.source.contains("\"wasm\""), "result: {}", result.source);
+    }
+
+    #[test]
+    fn test_target_wasm_selects_wasm_branch() {
+        let source = r#"(defn main () (target (:native (println "native")) (:wasm (println "wasm"))))"#;
+        let result = crate::expand_for_target(source, Some(CompileTarget::Wasm));
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        assert!(!result.source.contains("\"native\""), "result: {}", result.source);
+        assert!(result.source.contains("\"wasm\""), "result: {}", result.source);
+    }
+
+    #[test]
+    fn test_target_no_target_passes_through() {
+        let source = r#"(defn main () (target (:native 1) (:wasm 2)))"#;
+        let result = crate::expand_for_target(source, None);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        assert!(result.source.contains("target"), "result: {}", result.source);
+    }
+
+    #[test]
+    fn test_target_toplevel_native() {
+        let source = r#"(target (:native (defn foo () 1)) (:wasm (defn foo () 2)))"#;
+        let result = crate::expand_for_target(source, Some(CompileTarget::Native));
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        assert!(result.source.contains("1"), "result: {}", result.source);
+        assert!(!result.source.contains("2"), "result: {}", result.source);
     }
 }

@@ -65,6 +65,11 @@ For performance-critical code, the developer explicitly opts into arena allocati
 
 ### Arena Escape Prevention
 
+:::danger
+Claude insists arena allocations cannot escape, but I am highly skeptical of this. My understanding is that truly solving
+arena escapes is a halting problem-problem. This feature was intentionally designed to allow for more efficient hotpaths, albeit with some danger.
+:::
+
 Arena-allocated values cannot escape their `with-arena` block. The compiler enforces this via **lexical escape analysis**:
 
 ```mermaid

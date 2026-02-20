@@ -61,6 +61,14 @@ enum Command {
         #[arg(long = "load")]
         load: Vec<PathBuf>,
     },
+    /// Compile a .weir file to a WASM binary for the browser
+    Wasm {
+        /// Path to the .weir source file (omit to use weir.pkg)
+        file: Option<PathBuf>,
+        /// Output directory (default: ./web/)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
     /// Start the Weir Language Server Protocol server
     Lsp,
 }
@@ -108,6 +116,8 @@ struct PackageSource {
     native_sources: Vec<PathBuf>,
     /// Libraries to link (-l flags).
     link_libs: Vec<String>,
+    /// JS bridge files for WASM builds.
+    wasm_bridge_files: Vec<PathBuf>,
     /// Path to display in error messages.
     display_path: PathBuf,
     /// The entry source file path (for dev mode watching).
@@ -222,6 +232,7 @@ fn resolve_and_concatenate() -> PackageSource {
         deps: vec![],
         native_sources: vec![],
         link_libs: vec![],
+        wasm_bridge_files: vec![],
     };
     let manifest = weir_pkg::manifest::parse_manifest(&manifest_source, Path::new("weir.pkg"))
         .unwrap_or(manifest);
@@ -235,6 +246,7 @@ fn resolve_and_concatenate() -> PackageSource {
         expanded_source: concatenated,
         native_sources: project.native_sources,
         link_libs: project.link_libs,
+        wasm_bridge_files: project.wasm_bridge_files,
         display_path,
         entry_path: project.entry_source,
         package_name: manifest.name,
@@ -471,6 +483,25 @@ fn main() {
             let expanded = expand_source(&source, &file);
             print!("{}", expanded);
         }
+        Command::Wasm { file, output } => {
+            if let Some(file) = file {
+                // Single-file mode
+                let source = with_prelude(&read_file(&file));
+                let expanded = expand_source(&source, &file);
+                let output_dir = output.unwrap_or_else(|| PathBuf::from("web"));
+                build_wasm(&expanded, &file, &output_dir, &[]);
+            } else {
+                // Package mode
+                let pkg = resolve_and_concatenate();
+                let output_dir = output.unwrap_or_else(|| PathBuf::from("web"));
+                build_wasm(
+                    &pkg.expanded_source,
+                    &pkg.display_path,
+                    &output_dir,
+                    &pkg.wasm_bridge_files,
+                );
+            }
+        }
         Command::Lsp => {
             let rt =
                 tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
@@ -686,6 +717,7 @@ fn resolve_and_concatenate_result() -> Result<PackageSource, String> {
             deps: vec![],
             native_sources: vec![],
             link_libs: vec![],
+            wasm_bridge_files: vec![],
         });
 
     let display_path = project
@@ -697,8 +729,60 @@ fn resolve_and_concatenate_result() -> Result<PackageSource, String> {
         expanded_source: concatenated,
         native_sources: project.native_sources,
         link_libs: project.link_libs,
+        wasm_bridge_files: project.wasm_bridge_files,
         display_path,
         entry_path: project.entry_source,
         package_name: manifest.name,
     })
+}
+
+/// Parse, typecheck, and compile source code to a WASM package.
+fn build_wasm(
+    expanded_source: &str,
+    display_path: &Path,
+    output_dir: &Path,
+    bridge_files: &[PathBuf],
+) {
+    let (module, parse_errors) = weir_parser::parse(expanded_source);
+
+    if !parse_errors.is_empty() {
+        for error in &parse_errors {
+            eprintln!(
+                "{}:{}:{}: parse error: {}",
+                display_path.display(),
+                error.span.start,
+                error.span.end,
+                error.message
+            );
+        }
+        std::process::exit(1);
+    }
+
+    let type_info = weir_typeck::check(&module);
+
+    if !type_info.errors.is_empty() {
+        for error in &type_info.errors {
+            eprintln!(
+                "{}:{}:{}: type error: {}",
+                display_path.display(),
+                error.span.start,
+                error.span.end,
+                error.message
+            );
+        }
+        std::process::exit(1);
+    }
+
+    match weir_wasm::build_wasm_package(&module, &type_info, bridge_files, output_dir) {
+        Ok(()) => {
+            eprintln!(
+                "WASM package built: {}/",
+                output_dir.display()
+            );
+        }
+        Err(e) => {
+            eprintln!("{}: wasm error: {}", display_path.display(), e);
+            std::process::exit(1);
+        }
+    }
 }

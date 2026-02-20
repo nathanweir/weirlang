@@ -511,6 +511,11 @@ impl<'a> IndexBuilder<'a> {
                     self.walk_expr(*v, scope);
                 }
             }
+            ExprKind::Target { branches } => {
+                for (_name, expr) in branches {
+                    self.walk_expr(*expr, scope);
+                }
+            }
             ExprKind::Lit(_) | ExprKind::FieldAccess(_) => {}
         }
     }
