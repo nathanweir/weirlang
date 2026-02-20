@@ -843,6 +843,597 @@ pub fn emit_random_int(func: &mut Function) {
     func.instruction(&Instruction::End);
 }
 
+/// Emit `weir_f64_to_str(n: f64) -> i32`.
+///
+/// Converts an f64 to a null-terminated decimal string.
+/// Uses a simple digit-extraction approach. Handles negative, zero, integer-like floats.
+/// Allocates from the GC heap.
+pub fn emit_f64_to_str(func: &mut Function) {
+    // local 0 = n (f64)        — parameter
+    // local 1 = buf (i32)      — pointer to 32-byte buffer
+    // local 2 = pos (i32)      — write position (end of buffer)
+    // local 3 = is_neg (i32)   — 1 if negative
+    // local 4 = int_part (i64) — integer part
+    // local 5 = frac_part (i64) — fractional part (6 digits)
+    // local 6 = digit (i64)    — current digit
+    // local 7 = i (i32)        — counter
+    // local 8 = temp_f64 (f64) — temp
+
+    // Allocate 32-byte buffer from heap
+    func.instruction(&Instruction::GlobalGet(GLOBAL_HEAP_PTR));
+    func.instruction(&Instruction::LocalTee(1)); // buf
+    func.instruction(&Instruction::I32Const(32));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::GlobalSet(GLOBAL_HEAP_PTR));
+
+    // pos = buf + 30 (leave room for null terminator at buf+31)
+    func.instruction(&Instruction::LocalGet(1));
+    func.instruction(&Instruction::I32Const(30));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalSet(2));
+
+    // Store null terminator at buf+31
+    func.instruction(&Instruction::LocalGet(1));
+    func.instruction(&Instruction::I32Const(0));
+    func.instruction(&Instruction::I32Store8(memarg(31)));
+
+    // Check if negative
+    func.instruction(&Instruction::I32Const(0));
+    func.instruction(&Instruction::LocalSet(3)); // is_neg = 0
+    func.instruction(&Instruction::LocalGet(0));
+    func.instruction(&Instruction::F64Const(0.0));
+    func.instruction(&Instruction::F64Lt);
+    func.instruction(&Instruction::If(BlockType::Empty));
+    func.instruction(&Instruction::I32Const(1));
+    func.instruction(&Instruction::LocalSet(3)); // is_neg = 1
+    func.instruction(&Instruction::LocalGet(0));
+    func.instruction(&Instruction::F64Neg);
+    func.instruction(&Instruction::LocalSet(0)); // n = -n
+    func.instruction(&Instruction::End);
+
+    // int_part = trunc(n)
+    func.instruction(&Instruction::LocalGet(0));
+    func.instruction(&Instruction::F64Floor);
+    func.instruction(&Instruction::I64TruncF64U);
+    func.instruction(&Instruction::LocalSet(4)); // int_part
+
+    // frac = n - int_part, scaled to 6 digits: round((n - int_part) * 1000000)
+    func.instruction(&Instruction::LocalGet(0));
+    func.instruction(&Instruction::LocalGet(4));
+    func.instruction(&Instruction::F64ConvertI64U);
+    func.instruction(&Instruction::F64Sub);
+    func.instruction(&Instruction::F64Const(1000000.0));
+    func.instruction(&Instruction::F64Mul);
+    func.instruction(&Instruction::F64Nearest); // round
+    func.instruction(&Instruction::I64TruncF64U);
+    func.instruction(&Instruction::LocalSet(5)); // frac_part
+
+    // Check if frac_part is 0 → integer-like float, skip decimal
+    func.instruction(&Instruction::LocalGet(5));
+    func.instruction(&Instruction::I64Eqz);
+    func.instruction(&Instruction::If(BlockType::Empty));
+
+    // --- Integer-like path: just emit int_part digits ---
+    // Handle zero
+    func.instruction(&Instruction::LocalGet(4));
+    func.instruction(&Instruction::I64Eqz);
+    func.instruction(&Instruction::If(BlockType::Empty));
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I32Const(48)); // '0'
+    func.instruction(&Instruction::I32Store8(memarg(0)));
+    // If negative and zero, skip the minus sign (it's -0.0 → "0")
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::Return);
+    func.instruction(&Instruction::End);
+
+    // Extract digits from int_part
+    func.instruction(&Instruction::Block(BlockType::Empty));
+    func.instruction(&Instruction::Loop(BlockType::Empty));
+    func.instruction(&Instruction::LocalGet(4));
+    func.instruction(&Instruction::I64Eqz);
+    func.instruction(&Instruction::BrIf(1));
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::LocalGet(4));
+    func.instruction(&Instruction::I64Const(10));
+    func.instruction(&Instruction::I64RemU);
+    func.instruction(&Instruction::I32WrapI64);
+    func.instruction(&Instruction::I32Const(48));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::I32Store8(memarg(0)));
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I32Const(1));
+    func.instruction(&Instruction::I32Sub);
+    func.instruction(&Instruction::LocalSet(2));
+    func.instruction(&Instruction::LocalGet(4));
+    func.instruction(&Instruction::I64Const(10));
+    func.instruction(&Instruction::I64DivU);
+    func.instruction(&Instruction::LocalSet(4));
+    func.instruction(&Instruction::Br(0));
+    func.instruction(&Instruction::End); // loop
+    func.instruction(&Instruction::End); // block
+
+    // If negative, store '-'
+    func.instruction(&Instruction::LocalGet(3));
+    func.instruction(&Instruction::If(BlockType::Empty));
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I32Const(45)); // '-'
+    func.instruction(&Instruction::I32Store8(memarg(0)));
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I32Const(1));
+    func.instruction(&Instruction::I32Sub);
+    func.instruction(&Instruction::LocalSet(2));
+    func.instruction(&Instruction::End);
+
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I32Const(1));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::Return);
+
+    func.instruction(&Instruction::Else);
+
+    // --- Fractional path: emit int_part.frac_part ---
+    // First emit fractional digits (reversed) - strip trailing zeros
+    // Strip trailing zeros from frac_part
+    func.instruction(&Instruction::Block(BlockType::Empty));
+    func.instruction(&Instruction::Loop(BlockType::Empty));
+    func.instruction(&Instruction::LocalGet(5));
+    func.instruction(&Instruction::I64Const(10));
+    func.instruction(&Instruction::I64RemU);
+    func.instruction(&Instruction::I64Eqz);
+    func.instruction(&Instruction::I32Eqz); // not zero → break
+    func.instruction(&Instruction::BrIf(1));
+    func.instruction(&Instruction::LocalGet(5));
+    func.instruction(&Instruction::I64Const(10));
+    func.instruction(&Instruction::I64DivU);
+    func.instruction(&Instruction::LocalSet(5));
+    func.instruction(&Instruction::Br(0));
+    func.instruction(&Instruction::End); // loop
+    func.instruction(&Instruction::End); // block
+
+    // Emit frac digits (reversed)
+    func.instruction(&Instruction::Block(BlockType::Empty));
+    func.instruction(&Instruction::Loop(BlockType::Empty));
+    func.instruction(&Instruction::LocalGet(5));
+    func.instruction(&Instruction::I64Eqz);
+    func.instruction(&Instruction::BrIf(1));
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::LocalGet(5));
+    func.instruction(&Instruction::I64Const(10));
+    func.instruction(&Instruction::I64RemU);
+    func.instruction(&Instruction::I32WrapI64);
+    func.instruction(&Instruction::I32Const(48));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::I32Store8(memarg(0)));
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I32Const(1));
+    func.instruction(&Instruction::I32Sub);
+    func.instruction(&Instruction::LocalSet(2));
+    func.instruction(&Instruction::LocalGet(5));
+    func.instruction(&Instruction::I64Const(10));
+    func.instruction(&Instruction::I64DivU);
+    func.instruction(&Instruction::LocalSet(5));
+    func.instruction(&Instruction::Br(0));
+    func.instruction(&Instruction::End); // loop
+    func.instruction(&Instruction::End); // block
+
+    // Emit '.'
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I32Const(46)); // '.'
+    func.instruction(&Instruction::I32Store8(memarg(0)));
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I32Const(1));
+    func.instruction(&Instruction::I32Sub);
+    func.instruction(&Instruction::LocalSet(2));
+
+    // Emit int_part digits (same as above but reload int_part)
+    // Re-compute int_part since we used it
+    func.instruction(&Instruction::LocalGet(0));
+    func.instruction(&Instruction::F64Floor);
+    func.instruction(&Instruction::I64TruncF64U);
+    func.instruction(&Instruction::LocalSet(4));
+
+    // Handle int_part == 0
+    func.instruction(&Instruction::LocalGet(4));
+    func.instruction(&Instruction::I64Eqz);
+    func.instruction(&Instruction::If(BlockType::Empty));
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I32Const(48)); // '0'
+    func.instruction(&Instruction::I32Store8(memarg(0)));
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I32Const(1));
+    func.instruction(&Instruction::I32Sub);
+    func.instruction(&Instruction::LocalSet(2));
+    func.instruction(&Instruction::End);
+
+    func.instruction(&Instruction::Block(BlockType::Empty));
+    func.instruction(&Instruction::Loop(BlockType::Empty));
+    func.instruction(&Instruction::LocalGet(4));
+    func.instruction(&Instruction::I64Eqz);
+    func.instruction(&Instruction::BrIf(1));
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::LocalGet(4));
+    func.instruction(&Instruction::I64Const(10));
+    func.instruction(&Instruction::I64RemU);
+    func.instruction(&Instruction::I32WrapI64);
+    func.instruction(&Instruction::I32Const(48));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::I32Store8(memarg(0)));
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I32Const(1));
+    func.instruction(&Instruction::I32Sub);
+    func.instruction(&Instruction::LocalSet(2));
+    func.instruction(&Instruction::LocalGet(4));
+    func.instruction(&Instruction::I64Const(10));
+    func.instruction(&Instruction::I64DivU);
+    func.instruction(&Instruction::LocalSet(4));
+    func.instruction(&Instruction::Br(0));
+    func.instruction(&Instruction::End); // loop
+    func.instruction(&Instruction::End); // block
+
+    // If negative, store '-'
+    func.instruction(&Instruction::LocalGet(3));
+    func.instruction(&Instruction::If(BlockType::Empty));
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I32Const(45)); // '-'
+    func.instruction(&Instruction::I32Store8(memarg(0)));
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I32Const(1));
+    func.instruction(&Instruction::I32Sub);
+    func.instruction(&Instruction::LocalSet(2));
+    func.instruction(&Instruction::End);
+
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I32Const(1));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::Return);
+
+    func.instruction(&Instruction::End); // end if/else (frac == 0)
+
+    // Unreachable fallback
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::End);
+}
+
+/// Emit `weir_bool_to_str(b: i32) -> i32`.
+///
+/// Returns a pointer to "true" or "false" string.
+/// Allocates from the GC heap.
+pub fn emit_bool_to_str(func: &mut Function) {
+    // local 0 = b (i32)       — parameter
+    // local 1 = ptr (i32)     — result pointer
+
+    func.instruction(&Instruction::LocalGet(0));
+    func.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+
+    // true: allocate 5 bytes "true\0"
+    func.instruction(&Instruction::GlobalGet(GLOBAL_HEAP_PTR));
+    func.instruction(&Instruction::LocalTee(1));
+    func.instruction(&Instruction::I32Const(8)); // aligned
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::GlobalSet(GLOBAL_HEAP_PTR));
+    // Store 't','r','u','e','\0'
+    func.instruction(&Instruction::LocalGet(1));
+    func.instruction(&Instruction::I32Const(0x65757274)); // "true" as little-endian i32
+    func.instruction(&Instruction::I32Store(memarg(0)));
+    func.instruction(&Instruction::LocalGet(1));
+    func.instruction(&Instruction::I32Const(0));
+    func.instruction(&Instruction::I32Store8(memarg(4)));
+    func.instruction(&Instruction::LocalGet(1));
+
+    func.instruction(&Instruction::Else);
+
+    // false: allocate 6 bytes "false\0"
+    func.instruction(&Instruction::GlobalGet(GLOBAL_HEAP_PTR));
+    func.instruction(&Instruction::LocalTee(1));
+    func.instruction(&Instruction::I32Const(8)); // aligned
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::GlobalSet(GLOBAL_HEAP_PTR));
+    // Store 'f','a','l','s','e','\0'
+    func.instruction(&Instruction::LocalGet(1));
+    func.instruction(&Instruction::I32Const(0x736C6166)); // "fals" as little-endian i32
+    func.instruction(&Instruction::I32Store(memarg(0)));
+    func.instruction(&Instruction::LocalGet(1));
+    func.instruction(&Instruction::I32Const(0x65)); // 'e'
+    func.instruction(&Instruction::I32Store8(memarg(4)));
+    func.instruction(&Instruction::LocalGet(1));
+    func.instruction(&Instruction::I32Const(0));
+    func.instruction(&Instruction::I32Store8(memarg(5)));
+    func.instruction(&Instruction::LocalGet(1));
+
+    func.instruction(&Instruction::End);
+
+    func.instruction(&Instruction::End);
+}
+
+/// Emit `weir_str_cmp(a: i32, b: i32) -> i64`.
+///
+/// Returns -1, 0, or 1 (as i64) for lexicographic comparison.
+pub fn emit_str_cmp(func: &mut Function) {
+    // local 0 = a (i32), local 1 = b (i32)
+    // local 2 = i (i32), local 3 = ca (i32), local 4 = cb (i32)
+
+    func.instruction(&Instruction::I32Const(0));
+    func.instruction(&Instruction::LocalSet(2)); // i = 0
+
+    func.instruction(&Instruction::Block(BlockType::Empty));
+    func.instruction(&Instruction::Loop(BlockType::Empty));
+
+    // ca = a[i]
+    func.instruction(&Instruction::LocalGet(0));
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::I32Load8U(memarg(0)));
+    func.instruction(&Instruction::LocalSet(3));
+
+    // cb = b[i]
+    func.instruction(&Instruction::LocalGet(1));
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::I32Load8U(memarg(0)));
+    func.instruction(&Instruction::LocalSet(4));
+
+    // if ca < cb: return -1
+    func.instruction(&Instruction::LocalGet(3));
+    func.instruction(&Instruction::LocalGet(4));
+    func.instruction(&Instruction::I32LtU);
+    func.instruction(&Instruction::If(BlockType::Empty));
+    func.instruction(&Instruction::I64Const(-1));
+    func.instruction(&Instruction::Return);
+    func.instruction(&Instruction::End);
+
+    // if ca > cb: return 1
+    func.instruction(&Instruction::LocalGet(3));
+    func.instruction(&Instruction::LocalGet(4));
+    func.instruction(&Instruction::I32GtU);
+    func.instruction(&Instruction::If(BlockType::Empty));
+    func.instruction(&Instruction::I64Const(1));
+    func.instruction(&Instruction::Return);
+    func.instruction(&Instruction::End);
+
+    // if ca == 0 (and ca == cb): both ended, return 0
+    func.instruction(&Instruction::LocalGet(3));
+    func.instruction(&Instruction::I32Eqz);
+    func.instruction(&Instruction::If(BlockType::Empty));
+    func.instruction(&Instruction::I64Const(0));
+    func.instruction(&Instruction::Return);
+    func.instruction(&Instruction::End);
+
+    // i++
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I32Const(1));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalSet(2));
+    func.instruction(&Instruction::Br(0));
+    func.instruction(&Instruction::End); // loop
+    func.instruction(&Instruction::End); // block
+
+    // Unreachable fallback
+    func.instruction(&Instruction::I64Const(0));
+    func.instruction(&Instruction::End);
+}
+
+/// Emit `weir_substring(s: i32, start: i64, end: i64) -> i32`.
+///
+/// Returns a new string that is a slice of s from [start, end).
+pub fn emit_substring(func: &mut Function) {
+    // local 0 = s (i32), local 1 = start (i64), local 2 = end (i64)
+    // local 3 = len (i32), local 4 = dst (i32), local 5 = i (i32)
+
+    // len = end - start
+    func.instruction(&Instruction::LocalGet(2)); // end
+    func.instruction(&Instruction::LocalGet(1)); // start
+    func.instruction(&Instruction::I64Sub);
+    func.instruction(&Instruction::I32WrapI64);
+    func.instruction(&Instruction::LocalSet(3)); // len
+
+    // Allocate len+1 bytes, aligned
+    func.instruction(&Instruction::GlobalGet(GLOBAL_HEAP_PTR));
+    func.instruction(&Instruction::LocalTee(4)); // dst
+
+    func.instruction(&Instruction::LocalGet(3));
+    func.instruction(&Instruction::I32Const(1 + 7));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::I32Const(-8_i32));
+    func.instruction(&Instruction::I32And);
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::GlobalSet(GLOBAL_HEAP_PTR));
+
+    // Copy bytes from s[start..end]
+    func.instruction(&Instruction::I32Const(0));
+    func.instruction(&Instruction::LocalSet(5)); // i = 0
+
+    func.instruction(&Instruction::Block(BlockType::Empty));
+    func.instruction(&Instruction::Loop(BlockType::Empty));
+
+    func.instruction(&Instruction::LocalGet(5));
+    func.instruction(&Instruction::LocalGet(3)); // len
+    func.instruction(&Instruction::I32GeU);
+    func.instruction(&Instruction::BrIf(1));
+
+    // dst[i] = s[start + i]
+    func.instruction(&Instruction::LocalGet(4)); // dst
+    func.instruction(&Instruction::LocalGet(5)); // i
+    func.instruction(&Instruction::I32Add);
+
+    func.instruction(&Instruction::LocalGet(0)); // s
+    func.instruction(&Instruction::LocalGet(1)); // start
+    func.instruction(&Instruction::I32WrapI64);
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalGet(5)); // i
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::I32Load8U(memarg(0)));
+
+    func.instruction(&Instruction::I32Store8(memarg(0)));
+
+    func.instruction(&Instruction::LocalGet(5));
+    func.instruction(&Instruction::I32Const(1));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalSet(5));
+    func.instruction(&Instruction::Br(0));
+    func.instruction(&Instruction::End); // loop
+    func.instruction(&Instruction::End); // block
+
+    // Null terminator
+    func.instruction(&Instruction::LocalGet(4));
+    func.instruction(&Instruction::LocalGet(3));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::I32Const(0));
+    func.instruction(&Instruction::I32Store8(memarg(0)));
+
+    // Return dst
+    func.instruction(&Instruction::LocalGet(4));
+    func.instruction(&Instruction::End);
+}
+
+/// Emit `weir_string_ref(s: i32, idx: i64) -> i64`.
+///
+/// Returns the byte at index idx in the string.
+pub fn emit_string_ref(func: &mut Function) {
+    // local 0 = s (i32), local 1 = idx (i64)
+    func.instruction(&Instruction::LocalGet(0));
+    func.instruction(&Instruction::LocalGet(1));
+    func.instruction(&Instruction::I32WrapI64);
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::I32Load8U(memarg(0)));
+    func.instruction(&Instruction::I64ExtendI32U);
+    func.instruction(&Instruction::End);
+}
+
+/// Emit `weir_string_contains(haystack: i32, needle: i32) -> i64`.
+///
+/// Returns 1 if needle is a substring of haystack, 0 otherwise.
+/// Simple O(n*m) search.
+pub fn emit_string_contains(func: &mut Function) {
+    // local 0 = haystack (i32), local 1 = needle (i32)
+    // local 2 = h_len (i32), local 3 = n_len (i32)
+    // local 4 = i (i32), local 5 = j (i32)
+    // local 6 = matched (i32)
+
+    // Compute h_len
+    func.instruction(&Instruction::I32Const(0));
+    func.instruction(&Instruction::LocalSet(2));
+    func.instruction(&Instruction::Block(BlockType::Empty));
+    func.instruction(&Instruction::Loop(BlockType::Empty));
+    func.instruction(&Instruction::LocalGet(0));
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::I32Load8U(memarg(0)));
+    func.instruction(&Instruction::I32Eqz);
+    func.instruction(&Instruction::BrIf(1));
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I32Const(1));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalSet(2));
+    func.instruction(&Instruction::Br(0));
+    func.instruction(&Instruction::End);
+    func.instruction(&Instruction::End);
+
+    // Compute n_len
+    func.instruction(&Instruction::I32Const(0));
+    func.instruction(&Instruction::LocalSet(3));
+    func.instruction(&Instruction::Block(BlockType::Empty));
+    func.instruction(&Instruction::Loop(BlockType::Empty));
+    func.instruction(&Instruction::LocalGet(1));
+    func.instruction(&Instruction::LocalGet(3));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::I32Load8U(memarg(0)));
+    func.instruction(&Instruction::I32Eqz);
+    func.instruction(&Instruction::BrIf(1));
+    func.instruction(&Instruction::LocalGet(3));
+    func.instruction(&Instruction::I32Const(1));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalSet(3));
+    func.instruction(&Instruction::Br(0));
+    func.instruction(&Instruction::End);
+    func.instruction(&Instruction::End);
+
+    // If n_len == 0, return 1 (empty string is always contained)
+    func.instruction(&Instruction::LocalGet(3));
+    func.instruction(&Instruction::I32Eqz);
+    func.instruction(&Instruction::If(BlockType::Empty));
+    func.instruction(&Instruction::I64Const(1));
+    func.instruction(&Instruction::Return);
+    func.instruction(&Instruction::End);
+
+    // For i = 0 to h_len - n_len
+    func.instruction(&Instruction::I32Const(0));
+    func.instruction(&Instruction::LocalSet(4)); // i = 0
+
+    func.instruction(&Instruction::Block(BlockType::Empty));
+    func.instruction(&Instruction::Loop(BlockType::Empty));
+
+    // if i > h_len - n_len, break (not found)
+    func.instruction(&Instruction::LocalGet(4));
+    func.instruction(&Instruction::LocalGet(2)); // h_len
+    func.instruction(&Instruction::LocalGet(3)); // n_len
+    func.instruction(&Instruction::I32Sub);
+    func.instruction(&Instruction::I32Const(1));
+    func.instruction(&Instruction::I32Add); // h_len - n_len + 1
+    func.instruction(&Instruction::I32GeU);
+    func.instruction(&Instruction::BrIf(1));
+
+    // Check if haystack[i..i+n_len] == needle
+    func.instruction(&Instruction::I32Const(1));
+    func.instruction(&Instruction::LocalSet(6)); // matched = 1
+    func.instruction(&Instruction::I32Const(0));
+    func.instruction(&Instruction::LocalSet(5)); // j = 0
+
+    func.instruction(&Instruction::Block(BlockType::Empty));
+    func.instruction(&Instruction::Loop(BlockType::Empty));
+    func.instruction(&Instruction::LocalGet(5));
+    func.instruction(&Instruction::LocalGet(3)); // n_len
+    func.instruction(&Instruction::I32GeU);
+    func.instruction(&Instruction::BrIf(1));
+
+    // if haystack[i+j] != needle[j], matched = 0, break
+    func.instruction(&Instruction::LocalGet(0)); // haystack
+    func.instruction(&Instruction::LocalGet(4)); // i
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalGet(5)); // j
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::I32Load8U(memarg(0)));
+
+    func.instruction(&Instruction::LocalGet(1)); // needle
+    func.instruction(&Instruction::LocalGet(5)); // j
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::I32Load8U(memarg(0)));
+
+    func.instruction(&Instruction::I32Ne);
+    func.instruction(&Instruction::If(BlockType::Empty));
+    func.instruction(&Instruction::I32Const(0));
+    func.instruction(&Instruction::LocalSet(6)); // matched = 0
+    func.instruction(&Instruction::Br(2)); // break inner loop
+    func.instruction(&Instruction::End);
+
+    func.instruction(&Instruction::LocalGet(5));
+    func.instruction(&Instruction::I32Const(1));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalSet(5));
+    func.instruction(&Instruction::Br(0));
+    func.instruction(&Instruction::End); // inner loop
+    func.instruction(&Instruction::End); // inner block
+
+    // If matched, return 1
+    func.instruction(&Instruction::LocalGet(6));
+    func.instruction(&Instruction::If(BlockType::Empty));
+    func.instruction(&Instruction::I64Const(1));
+    func.instruction(&Instruction::Return);
+    func.instruction(&Instruction::End);
+
+    // i++
+    func.instruction(&Instruction::LocalGet(4));
+    func.instruction(&Instruction::I32Const(1));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalSet(4));
+    func.instruction(&Instruction::Br(0));
+    func.instruction(&Instruction::End); // outer loop
+    func.instruction(&Instruction::End); // outer block
+
+    // Not found
+    func.instruction(&Instruction::I64Const(0));
+    func.instruction(&Instruction::End);
+}
+
 /// Emit no-op functions for stubs.
 pub fn emit_noop(func: &mut Function) {
     func.instruction(&Instruction::End);

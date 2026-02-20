@@ -1,0 +1,10 @@
+;; Test that (target ...) forms resolve correctly for each compile target.
+
+(target
+  (:native
+    (defn platform-id () : i64 1))
+  (:wasm
+    (defn platform-id () : i64 2)))
+
+(defn main () : Unit
+  (println (platform-id)))

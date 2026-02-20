@@ -265,6 +265,45 @@ fn build_tco() {
     assert!(stdout.contains("12586269025"), "fib-iter 50");
 }
 
+// ── target forms ──────────────────────────────────────────
+
+#[test]
+fn build_target_forms() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("target_forms_bin");
+
+    weir()
+        .args([
+            "build",
+            &fixture_path("target-forms"),
+            "-o",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert!(output.exists(), "binary should be created");
+
+    let out = std::process::Command::new(output)
+        .output()
+        .expect("failed to run compiled binary");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("1"),
+        "native build should resolve to native branch (platform-id=1), got: {}",
+        stdout
+    );
+}
+
+#[test]
+fn run_target_forms() {
+    weir()
+        .args(["run", &fixture_path("target-forms")])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1"));
+}
+
 // ── CFFI / extern "C" ─────────────────────────────────────
 
 #[test]

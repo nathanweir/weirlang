@@ -92,7 +92,7 @@ fn read_file(file: &std::path::Path) -> String {
 /// Run macro expansion on source, returning the expanded source string.
 /// Exits on expansion errors.
 fn expand_source(source: &str, file: &std::path::Path) -> String {
-    expand_source_for_target(source, file, None)
+    expand_source_for_target(source, file, Some(weir_macros::CompileTarget::Native))
 }
 
 /// Run macro expansion with an optional compile target for resolving `(target ...)` forms.
@@ -393,7 +393,7 @@ fn main() {
                 run_jit(&expanded, &file);
             } else {
                 // Package mode
-                let pkg = resolve_and_concatenate_for_target(None);
+                let pkg = resolve_and_concatenate_for_target(Some(weir_macros::CompileTarget::Native));
                 load_native_sources(&pkg.native_sources, &pkg.link_libs);
                 run_jit(&pkg.expanded_source, &pkg.display_path);
             }
@@ -415,7 +415,7 @@ fn main() {
                 build_binary(&expanded, &file, &output_path, &cc_args, &link_flags);
             } else {
                 // Package mode
-                let pkg = resolve_and_concatenate_for_target(None);
+                let pkg = resolve_and_concatenate_for_target(Some(weir_macros::CompileTarget::Native));
                 let output_path = output.unwrap_or_else(|| PathBuf::from(&pkg.package_name));
 
                 let mut all_cc_args = cc_args;
@@ -447,7 +447,7 @@ fn main() {
                 run_dev(&expanded, &file);
             } else {
                 // Package mode
-                let pkg = resolve_and_concatenate_for_target(None);
+                let pkg = resolve_and_concatenate_for_target(Some(weir_macros::CompileTarget::Native));
                 load_native_sources(&pkg.native_sources, &pkg.link_libs);
                 let watch_path = pkg
                     .entry_path

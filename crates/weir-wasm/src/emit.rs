@@ -801,11 +801,30 @@ impl WasmCompiler<'_> {
             "str" => {
                 if args.is_empty() { return None; }
 
+                // Helper closure: convert a value to string based on its type
+                // (inlined below since closures can't capture &mut self)
+
                 // Convert first arg to string
                 let first_ty = self.expr_ty(args[0].value);
                 let first_wt = self.compile_expr(args[0].value, func);
                 match &first_ty {
                     Ty::Str => { /* already a string */ }
+                    Ty::F32 | Ty::F64 => {
+                        // Convert to f64 if f32
+                        if first_wt == Some(ValType::F32) {
+                            func.instruction(&Instruction::F64PromoteF32);
+                        }
+                        if let Some(&idx) = self.runtime_fn_indices.get("weir_f64_to_str") {
+                            func.instruction(&Instruction::Call(idx));
+                        }
+                    }
+                    Ty::Bool => {
+                        // Bool is i64, narrow to i32 for weir_bool_to_str
+                        func.instruction(&Instruction::I32WrapI64);
+                        if let Some(&idx) = self.runtime_fn_indices.get("weir_bool_to_str") {
+                            func.instruction(&Instruction::Call(idx));
+                        }
+                    }
                     _ => {
                         // Widen to I64 if needed (weir_i64_to_str expects I64)
                         if first_wt == Some(ValType::I32) {
@@ -823,6 +842,20 @@ impl WasmCompiler<'_> {
                     let arg_wt = self.compile_expr(arg.value, func);
                     match &arg_ty {
                         Ty::Str => { /* already a string */ }
+                        Ty::F32 | Ty::F64 => {
+                            if arg_wt == Some(ValType::F32) {
+                                func.instruction(&Instruction::F64PromoteF32);
+                            }
+                            if let Some(&idx) = self.runtime_fn_indices.get("weir_f64_to_str") {
+                                func.instruction(&Instruction::Call(idx));
+                            }
+                        }
+                        Ty::Bool => {
+                            func.instruction(&Instruction::I32WrapI64);
+                            if let Some(&idx) = self.runtime_fn_indices.get("weir_bool_to_str") {
+                                func.instruction(&Instruction::Call(idx));
+                            }
+                        }
                         _ => {
                             // Widen to I64 if needed
                             if arg_wt == Some(ValType::I32) {

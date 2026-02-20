@@ -22,12 +22,14 @@ use weir_typeck::TypeCheckResult;
 use weir_ast::tco;
 
 use runtime::{
-    emit_gc_alloc, emit_gc_str_alloc, emit_gc_str_dup, emit_gc_vec_alloc, emit_i64_to_str,
-    emit_noop, emit_random_int, emit_random_seed, emit_shadow_pop, emit_shadow_push,
-    emit_str_concat, emit_str_eq, emit_string_length, emit_vec_append, emit_vec_get, emit_vec_len,
-    emit_vec_set, emit_vec_set_nth, GC_HEAP_START, INITIAL_PAGES, JS_IMPORTS,
+    emit_bool_to_str, emit_f64_to_str, emit_gc_alloc, emit_gc_str_alloc, emit_gc_str_dup,
+    emit_gc_vec_alloc, emit_i64_to_str, emit_noop, emit_random_int, emit_random_seed,
+    emit_shadow_pop, emit_shadow_push, emit_str_cmp, emit_str_concat, emit_str_eq,
+    emit_string_contains, emit_string_length, emit_string_ref, emit_substring, emit_vec_append,
+    emit_vec_get, emit_vec_len, emit_vec_set, emit_vec_set_nth, GC_HEAP_START, INITIAL_PAGES,
+    JS_IMPORTS,
 };
-use types::{ty_to_wasm, wasm_val_size, TaggedAdt};
+use types::{ty_to_wasm, TaggedAdt};
 
 // ── Error ────────────────────────────────────────────────────────
 
@@ -191,6 +193,57 @@ const RUNTIME_FNS: &[RuntimeFn] = &[
         extra_locals: &[],
         emitter: emit_shadow_pop,
     },
+    RuntimeFn {
+        name: "weir_f64_to_str",
+        params: &[ValType::F64],
+        results: &[ValType::I32],
+        extra_locals: &[
+            ValType::I32, // buf
+            ValType::I32, // pos
+            ValType::I32, // is_neg
+            ValType::I64, // int_part
+            ValType::I64, // frac_part
+            ValType::I64, // digit
+            ValType::I32, // i
+            ValType::F64, // temp_f64
+        ],
+        emitter: emit_f64_to_str,
+    },
+    RuntimeFn {
+        name: "weir_bool_to_str",
+        params: &[ValType::I32],
+        results: &[ValType::I32],
+        extra_locals: &[ValType::I32],
+        emitter: emit_bool_to_str,
+    },
+    RuntimeFn {
+        name: "weir_str_cmp",
+        params: &[ValType::I32, ValType::I32],
+        results: &[ValType::I64],
+        extra_locals: &[ValType::I32, ValType::I32, ValType::I32],
+        emitter: emit_str_cmp,
+    },
+    RuntimeFn {
+        name: "weir_substring",
+        params: &[ValType::I32, ValType::I64, ValType::I64],
+        results: &[ValType::I32],
+        extra_locals: &[ValType::I32, ValType::I32, ValType::I32],
+        emitter: emit_substring,
+    },
+    RuntimeFn {
+        name: "weir_string_ref",
+        params: &[ValType::I32, ValType::I64],
+        results: &[ValType::I64],
+        extra_locals: &[],
+        emitter: emit_string_ref,
+    },
+    RuntimeFn {
+        name: "weir_string_contains",
+        params: &[ValType::I32, ValType::I32],
+        results: &[ValType::I64],
+        extra_locals: &[ValType::I32, ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+        emitter: emit_string_contains,
+    },
 ];
 
 // ── WasmCompiler ─────────────────────────────────────────────────
@@ -314,19 +367,17 @@ impl<'a> WasmCompiler<'a> {
     }
 
     /// Get the byte offset of a struct field in linear memory.
+    /// All fields are stored in 8-byte slots (matching the constructor's `i * 8` layout).
     fn get_field_offset(&self, struct_ty: &Ty, field_name: &SmolStr) -> Option<u32> {
         let struct_name = match struct_ty {
             Ty::Con(name, _) => name,
             _ => return None,
         };
         let info = self.type_info.struct_defs.get(struct_name)?;
-        let mut offset = 0u32;
-        for (fname, fty) in &info.fields {
+        for (i, (fname, _fty)) in info.fields.iter().enumerate() {
             if fname == field_name {
-                return Some(offset);
+                return Some((i * 8) as u32);
             }
-            let wt = self.wasm_ty(fty).unwrap_or(ValType::I32);
-            offset += wasm_val_size(wt);
         }
         None
     }

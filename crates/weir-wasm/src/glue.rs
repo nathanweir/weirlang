@@ -18,23 +18,48 @@ export function createRuntime() {
             const lo = Number(n & BigInt(0xFFFFFFFF));
             const hi = Number((n >> BigInt(32)) & BigInt(0xFFFFFFFF));
             const val = hi !== 0 ? Number(n) : lo;
-            process.stdout ? process.stdout.write(String(val)) : document.getElementById('output')?.insertAdjacentText('beforeend', String(val));
+            if (typeof process !== 'undefined' && process.stdout) {
+                process.stdout.write(String(val));
+            } else {
+                const el = document.getElementById('output');
+                if (el) el.insertAdjacentText('beforeend', String(val));
+            }
         },
         weir_print_f64(n) {
             const s = String(n);
-            process.stdout ? process.stdout.write(s) : document.getElementById('output')?.insertAdjacentText('beforeend', s);
+            if (typeof process !== 'undefined' && process.stdout) {
+                process.stdout.write(s);
+            } else {
+                const el = document.getElementById('output');
+                if (el) el.insertAdjacentText('beforeend', s);
+            }
         },
         weir_print_str(ptr) {
             const s = readString(ptr);
-            process.stdout ? process.stdout.write(s) : document.getElementById('output')?.insertAdjacentText('beforeend', s);
+            if (typeof process !== 'undefined' && process.stdout) {
+                process.stdout.write(s);
+            } else {
+                const el = document.getElementById('output');
+                if (el) el.insertAdjacentText('beforeend', s);
+            }
         },
         weir_print_bool(b) {
             const s = b ? 'true' : 'false';
-            process.stdout ? process.stdout.write(s) : document.getElementById('output')?.insertAdjacentText('beforeend', s);
+            if (typeof process !== 'undefined' && process.stdout) {
+                process.stdout.write(s);
+            } else {
+                const el = document.getElementById('output');
+                if (el) el.insertAdjacentText('beforeend', s);
+            }
         },
         weir_print_unit() {
             const s = '()';
-            process.stdout ? process.stdout.write(s) : document.getElementById('output')?.insertAdjacentText('beforeend', s);
+            if (typeof process !== 'undefined' && process.stdout) {
+                process.stdout.write(s);
+            } else {
+                const el = document.getElementById('output');
+                if (el) el.insertAdjacentText('beforeend', s);
+            }
         },
         weir_print_newline() {
             if (typeof process !== 'undefined' && process.stdout) {
