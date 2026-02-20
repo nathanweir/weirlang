@@ -450,16 +450,7 @@ The compiler scans all `.weir` files, parses imports, builds a dependency DAG, a
 
 ### Project configuration
 
-```toml
-# weir.toml
-[project]
-name = "my-game"
-version = "0.1.0"
-entry = "src/main.weir"
-
-[dependencies]
-# external packages
-```
+Project metadata and dependencies are declared in `weir.pkg` using S-expression syntax. See [packages.md](packages.md) for the full manifest format, module naming conventions, and dependency resolution design.
 
 ## Type definition forms
 

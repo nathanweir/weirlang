@@ -259,6 +259,81 @@ Not in immediate scope, but documenting the path forward:
 
 ---
 
+## Phase 15: Package System
+
+**Status: Not started.**
+
+Implement the package system designed in [packages.md](packages.md). This replaces manual `--cc-arg` / `-l` / `--load` flags with declarative `weir.pkg` manifests, adds multi-module compilation with real import resolution, and enables library packages (starting with weir-gl).
+
+### Current state
+
+| Layer | Status |
+|-------|--------|
+| Manifest format | Designed — S-expression `weir.pkg` |
+| Parser / AST | Partial — `Import` AST node exists, `parse_import()` works |
+| Type checker | Partial — `check_with_externals()` exists but ignores `Item::Import` |
+| Codegen | Ignores imports — single-module only |
+| CLI | File-arg only — no manifest discovery |
+
+### Steps
+
+#### 15.1 — `crates/weir-pkg/`: manifest parsing + dependency resolution
+
+New crate. Parse `weir.pkg` S-expressions into `PackageManifest`. Recursively resolve path-based dependencies. Topologically sort the dependency graph (error on cycles). Produce a `ResolvedProject` with all source files, module names, native code, and link flags.
+
+**Files:** new `crates/weir-pkg/src/lib.rs`, `crates/weir-pkg/Cargo.toml`
+
+#### 15.2 — Multi-module parsing
+
+Read all source files from the resolved project. Build a `ModuleIndex` (topologically ordered). For each module: prepend prelude, expand macros, parse into AST, extract top-level symbol names.
+
+**Files:** `crates/weir-cli/src/main.rs` (or a new orchestration module)
+
+#### 15.3 — Type checker: `check_with_imports`
+
+New entry point that accepts imported symbols with real types. Process `Item::Import` nodes in `collect_definitions()` — look up module, add named symbols to scope. Type-check modules in topological order, threading each module's exports to its dependents.
+
+**Files:** `crates/weir-typeck/src/lib.rs`, `crates/weir-typeck/src/checker.rs`, `crates/weir-typeck/src/result.rs`
+
+#### 15.4 — AST merging for codegen
+
+After all modules are type-checked, merge their ASTs into a single `Module` for codegen. Collect all native C sources and link libraries across packages. No structural changes to codegen internals needed.
+
+**Files:** `crates/weir-codegen/src/lib.rs`, `crates/weir-codegen/src/aot.rs`
+
+#### 15.5 — CLI integration
+
+When `weir build/run/dev` is invoked without a file argument, discover `weir.pkg` in the current directory. Resolve the project, compile native code, and proceed with multi-module compilation. Single-file mode (with file arg) unchanged.
+
+**Files:** `crates/weir-cli/src/main.rs`, `crates/weir-cli/Cargo.toml`
+
+#### 15.6 — Extract weir-gl + create demos/tetris package
+
+Create `/home/nathan/dev/weir-gl/` as a standalone library package. Create `demos/tetris/` with a `weir.pkg` that depends on weir-gl. Verify end-to-end build and run.
+
+**Files:** external `weir-gl/` repo, `demos/tetris/weir.pkg`, `demos/tetris/tetris.weir`
+
+#### 15.7 — Tests
+
+- `cargo test --workspace` — all existing tests still pass
+- Package manifest parsing unit tests
+- Multi-module type checking tests (import resolution, unknown symbol errors)
+- End-to-end: `cd demos/tetris && weir build -o ../../tmp/tetris_gl` builds and runs
+- Backwards compatibility: `weir run examples/hello.weir` still works
+
+### Acceptance criteria
+
+- [ ] `weir.pkg` manifest parsed correctly for both library and application packages
+- [ ] Dependencies resolved recursively with topological sort
+- [ ] Imports type-checked with real types from dependency modules
+- [ ] Multi-module programs compile and run via JIT and AOT
+- [ ] `weir build` / `weir run` work with manifest discovery (no file arg)
+- [ ] Single-file mode still works when file arg is provided
+- [ ] weir-gl library package builds and is consumable by tetris
+- [ ] All existing tests pass
+
+---
+
 ## Verification plan
 
 After each phase, all existing tests must continue to pass:

@@ -12,6 +12,7 @@ Remaining design questions organized by topic. See individual design documents f
 - [concurrency.md](concurrency.md) — Layered concurrency model with compile-time safety
 - [syntax.md](syntax.md) — Syntax decisions, type annotation style, collection literals
 - [future-work.md](future-work.md) — Deferred features with analysis and reconsideration criteria
+- [packages.md](packages.md) — Package system: manifests, imports, multi-module compilation
 - [implementation-plan.md](implementation-plan.md) — Phased implementation roadmap
 
 ## Decision summary
@@ -53,6 +54,10 @@ Remaining design questions organized by topic. See individual design documents f
 | Type assertion | `(ann type expr)` — disambiguation, not casting |
 | Block expressions | Implicit sequencing in bodies; explicit `do` block |
 | Threading | `->` (thread-first) and `->>` (thread-last) |
+| Package manifest | S-expression format in `weir.pkg` |
+| Module naming | `lib.weir` maps to bare package name |
+| Import resolution | Full type-checked wiring (not source concatenation) |
+| Dependencies | Local path-based only (registry deferred) |
 
 ---
 
