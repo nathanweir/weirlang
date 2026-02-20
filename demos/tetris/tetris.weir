@@ -1,27 +1,18 @@
 ;; ── OpenGL Tetris ────────────────────────────────────────────────────
 ;;
-;; Graphical Tetris demo using GLFW + OpenGL via Weir's CFFI.
-;; Renders in a 400x640 window with 30px cells and a sidebar.
+;; Graphical Tetris demo using GLFW + OpenGL via the weir-opengl package.
+;; Renders in a 920x1280 window with 60px cells and a sidebar.
 ;;
 ;; Controls:
 ;;   Arrow keys  — move / rotate / soft-drop
 ;;   Space       — hard drop
 ;;   Q / Escape  — quit
 
-;; ── CFFI: GL helper bindings ────────────────────────────────────────
+;; ── Import GL bindings from weir-opengl ──────────────────────────────
 
-(extern "C" (defn gl_init ((w : i64) (h : i64) (title : String)) : i64) (defn gl_should_close () : i64) (defn gl_begin_frame () : Unit) (defn gl_end_frame () : Unit) (defn gl_draw_rect ((x
-    :
-    i64)
-  (y : i64)
-  (w : i64)
-  (h : i64)
-  (color : i64)) : Unit) (defn gl_draw_text ((x : i64)
-  (y : i64)
-  (text : String)
-  (color : i64)) : Unit) (defn gl_get_key_pressed ((key : i64)) : i64) (defn gl_time_ms () : i64) (defn gl_screenshot ((path
-    :
-    String)) : i64) (defn gl_cleanup () : Unit))
+(import weir-opengl (gl_init gl_should_close gl_begin_frame gl_end_frame
+                     gl_draw_rect gl_draw_text gl_get_key_pressed
+                     gl_time_ms gl_screenshot gl_cleanup))
 
 ;; ── GLFW key codes ──────────────────────────────────────────────────
 

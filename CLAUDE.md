@@ -23,7 +23,7 @@ When processing a new transcript, ingest it into the existing design documents i
 - **Memory** — tracing GC by default + opt-in arena allocation for hot paths, with compile-time arena escape prevention
 - **Macros** — purely syntactic, hygienic, can generate type definitions
 - **Guard rails philosophy** — prevent footguns, safe defaults, explicit opt-in for advanced/unsafe features
-- **Modern tooling** — first-class LSP and editor support from day one using existing user-written Common Lisp language server (/home/nathan/dev/clef) and Zed editor extension (/home/nathan/dev/zed-common-lisp) as reference
+- **Modern tooling** — first-class LSP (`crates/weir-lsp`) and Zed editor extension (`/home/nathan/dev/zed-weir`) from day one
 - **Implementation** — leaning Rust (Cranelift for dev-mode codegen, potentially LLVM for release builds)
 
 ## Development Environment

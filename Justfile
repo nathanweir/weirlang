@@ -50,18 +50,21 @@ ts-generate:
 ts-test:
     cd tree-sitter-weir && tree-sitter test
 
-# Build the OpenGL Tetris demo
+# Build the OpenGL Tetris demo via package system
 tetris-build:
-    cargo run --bin weir -- build demos/tetris_gl.weir -o tmp/tetris_gl --cc-arg libs/gl_helper.c -l glfw -l GL -l m
+    cd demos/tetris && cargo run --manifest-path ../../Cargo.toml --bin weir -- build -o ../../tmp/tetris_gl
 
 # Run the OpenGL Tetris demo (AOT)
 tetris: tetris-build
     ./tmp/tetris_gl
 
-# Run OpenGL Tetris in dev mode (live reload — edit demos/tetris_gl.weir while it runs)
+# Run OpenGL Tetris via JIT (package system)
+tetris-run:
+    cd demos/tetris && cargo run --manifest-path ../../Cargo.toml --bin weir -- run
+
+# Run OpenGL Tetris in dev mode (live reload — edit demos/tetris/tetris.weir while it runs)
 tetris-dev:
-    cc -shared -fPIC -o tmp/libgl_helper.so libs/gl_helper.c -lglfw -lGL -lm
-    cargo run --bin weir -- dev demos/tetris_gl.weir --load tmp/libgl_helper.so
+    cd demos/tetris && cargo run --manifest-path ../../Cargo.toml --bin weir -- dev
 
 # Convert a BMP screenshot to PNG for viewing (usage: just screenshot tmp/tetris_screenshot.bmp)
 screenshot file:

@@ -1,0 +1,8 @@
+(package
+  (name "tetris")
+  (version "0.1.0")
+
+  (deps
+    (weir-opengl (path "/home/nathan/dev/weir-opengl")))
+
+  (main "tetris.weir"))
