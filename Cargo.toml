@@ -10,6 +10,7 @@ members = [
     "crates/weir-runtime",
     "crates/weir-macros",
     "crates/weir-lsp",
+    "crates/weir-pkg",
     "crates/weir-cli",
 ]
 exclude = [
@@ -68,3 +69,4 @@ weir-codegen = { path = "crates/weir-codegen" }
 weir-macros = { path = "crates/weir-macros" }
 weir-runtime = { path = "crates/weir-runtime" }
 weir-lsp = { path = "crates/weir-lsp" }
+weir-pkg = { path = "crates/weir-pkg" }

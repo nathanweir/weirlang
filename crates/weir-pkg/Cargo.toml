@@ -1,0 +1,10 @@
+[package]
+name = "weir-pkg"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+weir-lexer.workspace = true
+weir-ast.workspace = true
+smol_str.workspace = true
+thiserror.workspace = true

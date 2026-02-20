@@ -14,6 +14,15 @@ fn fixture_path(name: &str) -> String {
     )
 }
 
+fn fixture_dir(name: &str) -> String {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    format!(
+        "{}/tests/fixtures/{}",
+        manifest_dir.replace("/crates/weir-cli", ""),
+        name
+    )
+}
+
 // ── check command ───────────────────────────────────────────
 
 #[test]
@@ -314,4 +323,68 @@ fn check_cffi_unsafe_required() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("unsafe"));
+}
+
+// ── package system ────────────────────────────────────────
+
+#[test]
+fn pkg_run_app() {
+    weir()
+        .current_dir(fixture_dir("pkg-app"))
+        .args(["run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("7"))
+        .stdout(predicate::str::contains("30"));
+}
+
+#[test]
+fn pkg_build_app() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("test_app_bin");
+
+    weir()
+        .current_dir(fixture_dir("pkg-app"))
+        .args(["build", "-o", output.to_str().unwrap()])
+        .assert()
+        .success();
+
+    assert!(output.exists(), "binary should be created");
+
+    let out = std::process::Command::new(&output)
+        .output()
+        .expect("failed to run compiled binary");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("7"), "add-nums 3 4 = 7");
+    assert!(stdout.contains("30"), "multiply-nums 5 6 = 30");
+}
+
+#[test]
+fn pkg_bad_import_produces_error() {
+    weir()
+        .current_dir(fixture_dir("pkg-bad-import"))
+        .args(["run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("nonexistent-fn"));
+}
+
+#[test]
+fn pkg_missing_manifest_produces_error() {
+    let dir = tempfile::tempdir().unwrap();
+    weir()
+        .current_dir(dir.path())
+        .args(["run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("weir.pkg"));
+}
+
+#[test]
+fn single_file_mode_still_works() {
+    weir()
+        .args(["run", &fixture_path("codegen-functions")])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("120"));
 }

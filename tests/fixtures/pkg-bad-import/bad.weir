@@ -1,0 +1,4 @@
+(import test-lib (nonexistent-fn))
+
+(defn main () : Unit
+  (println (nonexistent-fn 1 2)))

@@ -2082,6 +2082,7 @@ dependencies = [
  "libc",
  "miette",
  "predicates",
+ "smol_str",
  "tempfile",
  "tokio",
  "weir-ast",
@@ -2091,6 +2092,7 @@ dependencies = [
  "weir-lsp",
  "weir-macros",
  "weir-parser",
+ "weir-pkg",
  "weir-typeck",
 ]
 
@@ -2177,6 +2179,16 @@ dependencies = [
  "insta",
  "proptest",
  "smol_str",
+ "weir-ast",
+ "weir-lexer",
+]
+
+[[package]]
+name = "weir-pkg"
+version = "0.1.0"
+dependencies = [
+ "smol_str",
+ "thiserror",
  "weir-ast",
  "weir-lexer",
 ]

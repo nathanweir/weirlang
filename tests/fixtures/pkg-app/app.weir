@@ -1,0 +1,5 @@
+(import test-lib (add-nums multiply-nums))
+
+(defn main () : Unit
+  (println (add-nums 3 4))
+  (println (multiply-nums 5 6)))

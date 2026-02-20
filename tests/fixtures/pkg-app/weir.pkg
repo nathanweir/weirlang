@@ -1,0 +1,6 @@
+(package
+  (name "test-app")
+  (version "0.1.0")
+  (deps
+    (test-lib (path "../pkg-lib")))
+  (main "app.weir"))
