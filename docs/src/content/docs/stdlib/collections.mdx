@@ -1,31 +1,145 @@
 ---
 title: Collections
-description: Lists, vectors, and hash-maps in Weir.
+description: Vectors, hash-maps, and collection operations in Weir.
 ---
 
-Weir provides vector and hash-map collection types with literal syntax and built-in operations.
+Weir provides two collection types with literal syntax: vectors (ordered, indexed) and hash-maps (key-value).
 
-:::note
-This page is under construction. Full content coming soon.
-:::
+## Vectors
 
-## Quick Reference
-
-### Vectors
+Vectors are ordered, indexed collections created with square bracket literals:
 
 ```lisp
-[1 2 3 4 5]                     ;; vector literal
-(len [1 2 3])                    ;; => 3
-(nth [10 20 30] 1)               ;; => 20
-(append [1 2] 3)                 ;; => [1 2 3]
-(set-nth [1 2 3] 1 99)           ;; => [1 99 3]
+[1 2 3 4 5]
+["hello" "world"]
+[]                       ;; empty vector
 ```
 
-### Hash-Maps
+Vectors are typed — all elements must have the same type. The element type is inferred from contents:
 
 ```lisp
-{:name "Alice" :health 100}     ;; map literal
-(len {:a 1 :b 2})                ;; => 2
+(let ((nums [1 2 3])             ;; (Vector i64)
+      (names ["alice" "bob"]))   ;; (Vector String)
+  ...)
 ```
 
-See [Built-in Functions](/stdlib/builtins/#collections) for full details.
+### Operations
+
+#### `len`
+
+Returns the number of elements:
+
+```lisp
+(len [1 2 3])                ;; => 3
+(len [])                      ;; => 0
+```
+
+#### `nth`
+
+Gets the element at an index (zero-based):
+
+```lisp
+(nth [10 20 30] 0)            ;; => 10
+(nth [10 20 30] 2)            ;; => 30
+```
+
+#### `append`
+
+Returns a new vector with an element added at the end:
+
+```lisp
+(append [1 2] 3)              ;; => [1 2 3]
+(append [] "hello")            ;; => ["hello"]
+```
+
+#### `set-nth`
+
+Returns a new vector with the element at an index replaced:
+
+```lisp
+(set-nth [1 2 3] 1 99)        ;; => [1 99 3]
+```
+
+Vectors are immutable — `append` and `set-nth` return new vectors, leaving the original unchanged:
+
+```lisp
+(let ((v [1 2 3])
+      (v2 (append v 4)))
+  (println (len v))            ;; => 3 (unchanged)
+  (println (len v2)))          ;; => 4
+```
+
+### Higher-Order Operations
+
+Vectors work with closures and higher-order patterns:
+
+```lisp
+;; Map a function over positions
+(map .pos enemies)
+
+;; Filter with a predicate
+(filter (fn (e) (> (.health e) 0)) enemies)
+```
+
+### Parallel Operations
+
+For bulk processing, parallel versions are available:
+
+```lisp
+(par-map update-position entities)
+(par-for-each process-chunk chunks)
+```
+
+See [Built-in Functions — Concurrency](/stdlib/builtins/#concurrency) for details.
+
+## Hash-Maps
+
+Hash-maps are unordered key-value collections created with curly brace literals. Keys are typically keywords:
+
+```lisp
+{:name "Alice"
+ :health 100
+ :pos (Vec2 0.0 0.0)}
+
+{}                           ;; empty map
+```
+
+### Nested Maps
+
+Maps can be nested:
+
+```lisp
+{:player {:name "Alice" :level 5}
+ :enemies [(spawn-goblin) (spawn-orc)]}
+```
+
+### Operations
+
+#### `len`
+
+Returns the number of entries:
+
+```lisp
+(len {:a 1 :b 2 :c 3})      ;; => 3
+```
+
+## Summary
+
+| Function | Signature | Description |
+|---|---|---|
+| `len` | `(Fn ['a] i64)` | Length of vector, map, or string |
+| `nth` | `(Fn [(Vector 'a) i64] 'a)` | Get element at index |
+| `append` | `(Fn [(Vector 'a) 'a] (Vector 'a))` | Append element |
+| `set-nth` | `(Fn [(Vector 'a) i64 'a] (Vector 'a))` | Replace element at index |
+| `par-map` | `(Fn [(Fn ['a] 'b) (Vector 'a)] (Vector 'b))` | Parallel map |
+| `par-for-each` | `(Fn [(Fn ['a] Unit) (Vector 'a)] Unit)` | Parallel for-each |
+
+## Collection Literals vs. S-Expressions
+
+| Syntax | Meaning |
+|---|---|
+| `(f x y)` | S-expression — function call |
+| `[x y z]` | Vector literal |
+| `{:k1 v1 :k2 v2}` | Hash-map literal |
+
+Parentheses are always code. Square brackets and curly braces are always data.

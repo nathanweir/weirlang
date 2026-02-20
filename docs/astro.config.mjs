@@ -8,6 +8,14 @@ export default defineConfig({
   integrations: [
     starlight({
       title: "Weir Language",
+      logo: {
+        src: "./src/assets/weir-icon.png",
+        alt: "Weir Language",
+      },
+      favicon: "/favicon.png",
+      components: {
+        Banner: "./src/components/Banner.astro",
+      },
       plugins: [starlightClientMermaid()],
       social: [
         {

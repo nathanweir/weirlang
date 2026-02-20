@@ -1,23 +1,93 @@
 ---
 title: Rust Integration
-description: How Weir's runtime is implemented in Rust and how Rust functions are exposed.
+description: How Weir's runtime is implemented in Rust and exposes safe functions.
 ---
 
-Weir's runtime, standard library, and compiler are implemented in Rust. Safe Rust functions are exposed to Weir code without requiring `unsafe`.
+Weir's compiler, runtime, and standard library are all implemented in Rust. This page explains how Rust code powers the language and how safe Rust functions are exposed to Weir programs.
 
-:::note
-This page is under construction. Full content coming soon.
-:::
+## Two Layers of Foreign Code
 
-## Quick Reference
+Weir has two distinct layers for calling non-Weir code:
 
-The standard library and runtime are Rust-implemented. Functions like `println`, `str`, `len`, and math operations are Rust functions linked into the runtime. They don't require `unsafe` — the Rust compiler already enforces safety.
+| Layer | Safety | Mechanism | Example |
+|---|---|---|---|
+| **Rust runtime** | Safe | Linked at compile time | `println`, `str`, `len`, `sqrt` |
+| **C FFI** | `unsafe` required | `extern "C"` + `dlsym`/linker | `SDL_Init`, `abs`, `glfw*` |
 
-```lisp
-;; These are safe — implemented in Rust
-(println "Hello")
-(let ((v [1 2 3]))
-  (println (len v)))
+The vast majority of "built-in" functions in Weir are actually Rust functions compiled into the runtime. They don't require `unsafe` because the Rust compiler already enforces safety on that side.
+
+## How Built-in Functions Work
+
+Built-in functions like `println`, `sqrt`, `len`, and `append` are implemented in Rust across two crates:
+
+### `weir-runtime`
+
+The runtime crate provides core services:
+
+- **Garbage collector** — `weir_gc_alloc`, `weir_gc_collect`, root tracking
+- **Arena allocator** — `weir_arena_alloc`, bulk deallocation
+- **String operations** — allocation, concatenation, conversion
+- **Vector operations** — allocation, indexing, append
+- **I/O** — print, file read/write
+- **Math** — wrappers around `libm` functions
+
+These are exported as `extern "C"` functions from Rust (so Cranelift can call them), but they're safe Rust internally:
+
+```rust
+// In weir-runtime — safe Rust, exported for Cranelift
+#[no_mangle]
+pub extern "C" fn weir_println(val: i64) {
+    // Safe Rust implementation
+    println!("{}", format_value(val));
+}
 ```
 
-Only `extern "C"` functions (external C libraries) require `unsafe` blocks.
+### `weir-interp`
+
+The interpreter implements the same built-ins as native Rust functions called directly during tree-walking evaluation:
+
+```rust
+// In weir-interp
+fn builtin_println(args: &[Value]) -> Result<Value, InterpError> {
+    // Direct Rust implementation
+    println!("{}", args[0].display());
+    Ok(Value::Unit)
+}
+```
+
+## The Compilation Pipeline is Rust
+
+Every stage of the compiler is a Rust crate:
+
+| Crate | Purpose |
+|---|---|
+| `weir-lexer` | Tokenizer |
+| `weir-parser` | S-expression parser |
+| `weir-ast` | AST types, pretty printing, TCO analysis |
+| `weir-macros` | Macro expander |
+| `weir-typeck` | Type checker with local inference |
+| `weir-codegen` | Cranelift JIT/AOT backend |
+| `weir-interp` | Tree-walking interpreter |
+| `weir-runtime` | GC, arenas, runtime support |
+| `weir-pkg` | Package system |
+| `weir-lsp` | Language Server Protocol |
+| `weir-cli` | CLI frontend (clap) |
+
+## Why Rust
+
+The strongest argument for Rust is **Cranelift** — a Rust-native code generation library designed for fast runtime code generation. Cranelift prioritizes compilation speed over maximum optimization, which is exactly right for dev-mode live reloading.
+
+Additional benefits:
+- **Parser, type checker, LSP** — benefit enormously from Rust's type system and ownership model
+- **Memory safety** — the runtime core requires `unsafe` for executable memory management, but the majority of the codebase is safe
+- **Ecosystem** — `clap` for CLI, `tokio` for async LSP, `cranelift` for codegen, `libffi` for interpreter FFI
+
+## Extending the Runtime
+
+Adding a new built-in function to Weir requires changes in three places:
+
+1. **`weir-typeck`** — register the function name and type signature in `check_builtin_call`
+2. **`weir-interp`** — implement the function in `register_builtins`
+3. **`weir-codegen`** — either emit inline Cranelift IR or call a `weir-runtime` C-exported function
+
+The type checker, interpreter, and codegen must all agree on the function's behavior and type signature.

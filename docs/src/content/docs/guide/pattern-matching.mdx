@@ -3,20 +3,30 @@ title: Pattern Matching
 description: Match expressions, destructuring, and exhaustiveness in Weir.
 ---
 
-Weir has built-in pattern matching with compile-time exhaustiveness checking.
+Weir has built-in pattern matching with compile-time exhaustiveness checking. Patterns can match on sum type variants, destructure structs, and bind variables.
 
-:::note
-This page is under construction. Full content coming soon.
-:::
+## `match` Expressions
 
-## Quick Reference
-
-Pattern matching uses the `match` form. Each case is wrapped in its own parens, and all variants of a sum type must be handled:
+Each case is wrapped in its own parenthesized pair — pattern first, then body:
 
 ```lisp
-(match option-val
-  ((Some x) (use x))
+(match x
+  ((Some val) (use val))
   (None (default-value)))
+```
+
+`match` is an expression — it returns a value. All branches must have the same type.
+
+## Sum Type Matching
+
+Match against variants of a `deftype`:
+
+```lisp
+(deftype EnemyState
+  Idle
+  (Patrol Vec2 Vec2)
+  (Chase i64)
+  Dead)
 
 (match enemy-state
   ((Patrol start end) (move-between start end))
@@ -25,11 +35,123 @@ Pattern matching uses the `match` form. Each case is wrapped in its own parens, 
   (Dead (remove-entity)))
 ```
 
-Struct destructuring uses keyword syntax:
+### Nested Patterns
+
+Patterns can be nested to match deeper structures:
 
 ```lisp
-(let (({:x :y} my-vec))
-  (+ x y))
+(match opt
+  ((Some (Some x)) (str "doubly wrapped: " x))
+  ((Some None) "outer Some, inner None")
+  (None "nothing"))
 ```
 
-Irrefutable patterns (always match) work in `let` and function params. Refutable patterns (may not match) require `match`.
+### Literal Patterns
+
+Match against specific values:
+
+```lisp
+(match key-code
+  (27 (quit))          ;; ESC
+  (32 (jump))          ;; space
+  (_ (ignore)))        ;; anything else
+```
+
+## Exhaustiveness
+
+Pattern matching is **exhaustive by default**. If you don't handle all variants, the compiler produces an error:
+
+```lisp
+;; Compile error — missing Dead and Idle
+(match enemy-state
+  ((Patrol start end) (move-between start end))
+  ((Chase target-id) (pursue target-id)))
+```
+
+Use `_` as a wildcard to explicitly handle remaining cases:
+
+```lisp
+(match enemy-state
+  (Dead (remove-entity))
+  (_ (update-ai entity)))
+```
+
+This is a guard rail: when you add a new variant to a sum type, the compiler tells you everywhere you need to handle it. During live reloading, exhaustiveness is re-checked on type redefinition.
+
+## Struct Destructuring
+
+Structs are destructured using keyword syntax in `let` bindings and function parameters:
+
+```lisp
+(defstruct Vec2
+  (x : f64)
+  (y : f64))
+
+;; Destructure all fields (binding names match field names)
+(let (({:x :y} my-vec))
+  (+ x y))
+
+;; Partial destructuring (only some fields)
+(let (({:health} enemy))
+  (> health 0))
+```
+
+### Renamed Bindings
+
+Put a binding name after the keyword to rename:
+
+```lisp
+;; Rename x→ax, y→ay for the first vec; x→bx, y→by for the second
+(defn distance (({:x ax :y ay} : Vec2) ({:x bx :y by} : Vec2)) : f64
+  (sqrt (+ (* (- bx ax) (- bx ax)) (* (- by ay) (- by ay)))))
+```
+
+### In `match` Arms
+
+Struct destructuring also works in `match` patterns:
+
+```lisp
+(defn get-x ((v : Vec2)) : f64
+  (match v
+    ({:x} x)))
+```
+
+## Irrefutable vs. Refutable Patterns
+
+**Irrefutable patterns** always match. They are allowed in `let` bindings and function parameters:
+- Struct destructuring (a struct always has all its fields)
+- Tuple destructuring
+- Simple variable binding
+
+**Refutable patterns** might not match. They are only allowed in `match`:
+- Sum type variants (`Some`, `None`, etc.)
+- Literal values
+
+```lisp
+;; OK — struct destructuring always succeeds (irrefutable)
+(let (({:x :y} my-vec))
+  (+ x y))
+
+;; COMPILE ERROR — Option might be None (refutable)
+(let (((Some val) maybe-result))
+  (use val))
+
+;; Correct — use match for refutable patterns
+(match maybe-result
+  ((Some val) (use val))
+  (None (default-value)))
+```
+
+This is a guard rail: the compiler prevents destructuring that could fail at runtime. If a pattern can fail, you're forced to handle all cases.
+
+## Wildcard `_`
+
+The `_` pattern matches anything and binds nothing:
+
+```lisp
+(match result
+  ((Ok val) (use val))
+  ((Err _) (println "something went wrong")))
+```
+
+Use `_` when you need to handle a case but don't need the contained value.

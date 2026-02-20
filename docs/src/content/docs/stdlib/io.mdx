@@ -1,36 +1,139 @@
 ---
 title: I/O
-description: Input/output functions in Weir.
+description: Input/output functions in Weir — console, file, and terminal.
 ---
 
-Weir provides built-in functions for console I/O, file I/O, and terminal control.
+Weir provides built-in functions for console output, file I/O, terminal control, and timing.
 
-:::note
-This page is under construction. Full content coming soon.
-:::
+## Console Output
 
-## Quick Reference
+### `println`
 
-### Console
+Prints a value followed by a newline. Accepts zero or one argument:
 
-| Function | Description |
-|---|---|
-| `println` | Print value + newline |
-| `print` | Print value (no newline) |
+```lisp
+(println "Hello, World!")      ;; prints: Hello, World!\n
+(println 42)                   ;; prints: 42\n
+(println)                      ;; prints a blank line
+```
 
-### File I/O
+### `print`
 
-| Function | Description |
-|---|---|
-| `read-file` | Read file contents as string |
-| `write-file` | Write string to file |
+Prints a value without a trailing newline:
 
-### Terminal
+```lisp
+(print "Enter name: ")        ;; prints: Enter name: (no newline)
+(print 42)                     ;; prints: 42
+```
 
-| Function | Description |
-|---|---|
-| `term-init` | Enter raw mode |
-| `term-restore` | Restore normal mode |
-| `read-key` | Read single keypress |
+### `str`
 
-See [Built-in Functions](/stdlib/builtins/) for full signatures and examples.
+Not strictly I/O, but commonly used with it — concatenates values into a string:
+
+```lisp
+(println (str "Score: " score " / " total))
+```
+
+## File I/O
+
+### `read-file`
+
+Reads the entire contents of a file as a string:
+
+```lisp
+(defn load-config () : String
+  (read-file "config.txt"))
+
+(let ((data (read-file "level.dat")))
+  (println (str "Loaded " (string-length data) " bytes")))
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `path` | `String` | File path to read |
+| **Returns** | `String` | File contents |
+
+### `write-file`
+
+Writes a string to a file (creates or overwrites):
+
+```lisp
+(write-file "output.txt" "Hello, file!")
+(write-file "scores.txt" (str "High score: " high-score))
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `path` | `String` | File path to write |
+| `contents` | `String` | String to write |
+| **Returns** | `Unit` | — |
+
+## Terminal I/O
+
+For building terminal-based applications (e.g., the terminal Tetris demo):
+
+### `term-init`
+
+Puts the terminal into raw mode — keypresses are delivered immediately without waiting for Enter:
+
+```lisp
+(term-init)
+```
+
+### `term-restore`
+
+Restores the terminal to its normal (cooked) mode. Always call this before exiting to avoid leaving the terminal in a broken state:
+
+```lisp
+(term-restore)
+```
+
+### `read-key`
+
+Reads a single keypress and returns the key code as an integer:
+
+```lisp
+(let ((key (read-key)))
+  (cond
+    ((= key 27) (quit))           ;; ESC
+    ((= key 119) (move-up))       ;; 'w'
+    ((= key 115) (move-down))     ;; 's'
+    (else (ignore))))
+```
+
+Requires `term-init` to have been called. Blocks until a key is pressed.
+
+## Timing
+
+### `time-ms`
+
+Returns the current time in milliseconds (monotonic clock):
+
+```lisp
+(let ((start (time-ms)))
+  (do-expensive-work)
+  (println (str "Took " (- (time-ms) start) "ms")))
+```
+
+### `sleep`
+
+Pauses execution for the given number of milliseconds:
+
+```lisp
+(sleep 16)     ;; ~60 FPS frame delay
+(sleep 1000)   ;; 1 second
+```
+
+## Summary
+
+| Function | Signature | Description |
+|---|---|---|
+| `println` | `(Fn ['a] Unit)` | Print value + newline |
+| `print` | `(Fn ['a] Unit)` | Print value (no newline) |
+| `read-file` | `(Fn [String] String)` | Read entire file |
+| `write-file` | `(Fn [String String] Unit)` | Write string to file |
+| `term-init` | `(Fn [] Unit)` | Enter raw terminal mode |
+| `term-restore` | `(Fn [] Unit)` | Restore normal terminal mode |
+| `read-key` | `(Fn [] i64)` | Read single keypress |
+| `time-ms` | `(Fn [] i64)` | Current time in milliseconds |
+| `sleep` | `(Fn [i64] Unit)` | Sleep for N milliseconds |

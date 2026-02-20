@@ -3,28 +3,161 @@ title: C FFI
 description: Calling C libraries from Weir via extern "C" declarations.
 ---
 
-Weir can call C functions directly using `extern "C"` declarations, with safety enforced via `unsafe` blocks.
+Weir can call C functions directly via `extern "C"` declarations. This is how Weir interacts with system libraries like OpenGL, GLFW, SDL, and the C standard library.
 
-:::note
-This page is under construction. Full content coming soon.
-:::
+## Declaring External Functions
 
-## Quick Reference
+Use `extern "C"` to declare C function signatures. Multiple functions can be declared in a single block:
 
 ```lisp
-;; Declare external C functions
 (extern "C"
   (defn abs ((n : i32)) : i32)
-  (defn SDL_Init ((flags : u32)) : i32))
-
-;; Must use unsafe to call them
-(unsafe
-  (println (abs -42)))
+  (defn SDL_Init ((flags : u32)) : i32)
+  (defn SDL_CreateWindow ((title : String) (x : i32) (y : i32)
+                          (w : i32) (h : i32) (flags : u32)) : Ptr))
 ```
 
-- **`Ty::Ptr`** — raw pointer type for FFI, represented as `i64`
-- **JIT**: symbols resolved via `dlsym` at runtime
-- **AOT**: linked via `cc` with `-l` flags
-- **Interpreter**: dynamic calls via `libffi`
+The type checker registers these signatures and makes them available for calling.
 
-See also: [Native Libraries](/interop/native-libraries/) for building shared libraries.
+## The `unsafe` Requirement
+
+Calling extern functions requires an `unsafe` block — C code can violate all of Weir's safety guarantees:
+
+```lisp
+(defn main ()
+  (unsafe
+    (println (abs -42))
+    (println (abs 7))))
+```
+
+Without `unsafe`, the compiler produces an error:
+
+```lisp
+;; Compile error: calling extern function 'abs' requires unsafe block
+(println (abs -42))
+```
+
+### What `unsafe` Means
+
+`unsafe` is narrower than in Rust. It means: "I'm calling code that the Weir compiler can't verify." Specifically:
+- Calling `extern "C"` functions
+- Calling Rust functions explicitly marked `unsafe`
+
+Safe Rust runtime functions (like `println`, `str`, `len`) do not require `unsafe`.
+
+## The `Ptr` Type
+
+`Ptr` is a raw pointer type for FFI. It represents an opaque pointer to C memory:
+
+```lisp
+(extern "C"
+  (defn malloc ((size : i64)) : Ptr)
+  (defn free ((ptr : Ptr)) : Unit))
+```
+
+`Ptr` is represented as `i64` internally (pointer-sized). It is not GC-managed — the developer is responsible for memory.
+
+## FFI Types
+
+C types map to Weir types:
+
+| C Type | Weir Type |
+|---|---|
+| `int` / `int32_t` | `i32` |
+| `long` / `int64_t` | `i64` |
+| `unsigned int` | `u32` |
+| `float` | `f32` |
+| `double` | `f64` |
+| `char*` / `const char*` | `String` |
+| Any pointer | `Ptr` |
+| `void` (return) | `Unit` |
+
+## How Symbols Are Resolved
+
+The mechanism depends on the execution mode:
+
+| Mode | Resolution |
+|---|---|
+| **JIT** (`weir run`) | `dlsym(RTLD_DEFAULT, name)` — looks up symbols in loaded shared libraries |
+| **AOT** (`weir build`) | System linker (`cc`) with `-l` flags |
+| **Interpreter** (`weir interp`) | `libffi` + `dlsym` for dynamic C function invocation |
+
+### Pre-loading Libraries (JIT)
+
+For JIT mode, shared libraries must be loaded before symbols can be resolved:
+
+```bash
+# Via --load flag
+weir run game.weir --load /usr/lib/libglfw.so
+
+# Via package system (automatic)
+cd demos/tetris && weir run   # reads native.link from weir.pkg
+```
+
+### Linking Libraries (AOT)
+
+For AOT builds, pass library names with `-l`:
+
+```bash
+weir build game.weir -l glfw -l GL -l m
+```
+
+Or declare them in `weir.pkg` for automatic linking:
+
+```lisp
+(package
+  (name "my-game")
+  (version "0.1.0")
+  (main "game.weir")
+  (native
+    (link "glfw" "GL" "m")))
+```
+
+## Native C Source Files
+
+Packages can include C source files that are compiled automatically:
+
+```lisp
+(native
+  (sources "gl_helper.c" "audio.c")
+  (link "glfw" "GL" "m"))
+```
+
+See [Native Libraries](/interop/native-libraries/) for details.
+
+## Real-World Example
+
+The OpenGL Tetris demo uses C FFI extensively:
+
+```lisp
+;; Declare OpenGL/GLFW wrapper functions
+(extern "C"
+  (defn gl_init ((w : i64) (h : i64) (title : String)) : i64)
+  (defn gl_should_close () : i64)
+  (defn gl_begin_frame () : Unit)
+  (defn gl_draw_rect ((x : f64) (y : f64) (w : f64) (h : f64)
+                       (r : f64) (g : f64) (b : f64) (a : f64)) : Unit)
+  (defn gl_end_frame () : Unit)
+  (defn gl_cleanup () : Unit))
+
+;; Use in game code
+(defn main ()
+  (unsafe
+    (gl_init 800 600 "Tetris")
+    ;; game loop...
+    (gl_cleanup)))
+```
+
+## Safe Wrappers
+
+The expected pattern is for C FFI to live behind safe wrapper libraries. Most developers should never write `unsafe`:
+
+```lisp
+;; In weir-gl library (wraps the unsafe calls)
+(pub defn create-window ((w : i64) (h : i64) (title : String)) : i64
+  (unsafe (gl_init w h title)))
+
+;; In game code (safe — no unsafe needed)
+(let ((window (create-window 800 600 "My Game")))
+  ...)
+```

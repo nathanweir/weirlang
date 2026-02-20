@@ -1,22 +1,94 @@
 ---
 title: Operator Precedence
-description: Operator precedence and evaluation order in Weir.
+description: Operators and evaluation order in Weir.
 ---
 
-Weir uses prefix notation — there is no operator precedence in the traditional sense.
+Weir uses S-expression syntax with prefix notation — there is no operator precedence in the traditional sense. The nesting of parentheses fully determines evaluation order.
 
-:::note
-This page is under construction. Full content coming soon.
-:::
+## No Precedence Rules Needed
 
-## Overview
-
-Since Weir uses S-expression syntax, all operations are explicit function calls with parenthesized prefix notation:
+In infix languages, `2 + 3 * 4` requires precedence rules to determine whether it means `(2 + 3) * 4` or `2 + (3 * 4)`. In Weir, the parentheses make it explicit:
 
 ```lisp
-(+ (* 2 3) (* 4 5))    ;; 2*3 + 4*5 = 26
+(+ 2 (* 3 4))     ;; 2 + (3 * 4) = 14
+(* (+ 2 3) 4)     ;; (2 + 3) * 4 = 20
 ```
 
-There is no ambiguity — the nesting of parentheses fully determines evaluation order. Operator precedence rules from infix languages do not apply.
+No ambiguity — what you write is what you get.
 
-The built-in operators are: `+`, `-`, `*`, `/`, `mod`, `=`, `!=`, `<`, `>`, `<=`, `>=`, `not`, `and`, `or`.
+## Arithmetic Operators
+
+| Operator | Arity | Description | Example |
+|---|---|---|---|
+| `+` | Variadic (2+) | Addition | `(+ 1 2 3)` → `6` |
+| `-` | 1 or variadic | Negation / subtraction | `(- 5)` → `-5`, `(- 10 3)` → `7` |
+| `*` | Variadic (2+) | Multiplication | `(* 2 3 4)` → `24` |
+| `/` | 2 | Division | `(/ 10 3)` → `3` |
+| `mod` | 2 | Modulo | `(mod 10 3)` → `1` |
+
+Arithmetic operators are polymorphic — they work on any numeric type, but all operands must be the same type:
+
+```lisp
+(+ 1 2)           ;; OK: i64 + i64
+(+ 1.0 2.0)       ;; OK: f64 + f64
+(+ 1 2.0)         ;; Error: can't mix i64 and f64
+```
+
+## Comparison Operators
+
+| Operator | Description | Example |
+|---|---|---|
+| `=` | Equal | `(= 1 1)` → `true` |
+| `!=` | Not equal | `(!= 1 2)` → `true` |
+| `<` | Less than | `(< 3 5)` → `true` |
+| `>` | Greater than | `(> 5 3)` → `true` |
+| `<=` | Less than or equal | `(<= 5 5)` → `true` |
+| `>=` | Greater than or equal | `(>= 5 5)` → `true` |
+
+All comparison operators take exactly two arguments and return `Bool`. Operands are unified (must be the same type).
+
+## Logical Operators
+
+| Operator | Arity | Description | Example |
+|---|---|---|---|
+| `not` | 1 | Logical NOT | `(not true)` → `false` |
+| `and` | Variadic (2+) | Logical AND | `(and true true false)` → `false` |
+| `or` | Variadic (2+) | Logical OR | `(or false false true)` → `true` |
+
+Logical operators require `Bool` operands and return `Bool`.
+
+## Special Operators
+
+| Operator | Description | Example |
+|---|---|---|
+| `?` | Error propagation (postfix) | `(read-file path)?` |
+| `->` | Thread-first macro | `(-> x f g)` → `(g (f x))` |
+| `->>` | Thread-last macro | `(->> x f g)` → `(g (f x))` |
+| `.field` | Field accessor | `(.x vec)` |
+
+### Threading Macro Expansion
+
+`->` inserts the previous result as the **first** argument:
+```lisp
+(-> enemy .pos .x)
+;; expands to: (.x (.pos enemy))
+```
+
+`->>` inserts as the **last** argument:
+```lisp
+(->> (range 100) (filter even?) (take 10))
+;; expands to: (take (filter (range 100) even?) 10)
+```
+
+## Evaluation Order
+
+Within an S-expression, arguments are evaluated left to right before the function is called:
+
+```lisp
+(f (g x) (h y))
+;; 1. Evaluate (g x)
+;; 2. Evaluate (h y)
+;; 3. Call f with both results
+```
+
+Short-circuit evaluation applies to `and`, `or`, `if`, `cond`, and `when`/`unless` — they may not evaluate all of their arguments.

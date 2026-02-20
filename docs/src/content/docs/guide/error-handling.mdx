@@ -3,27 +3,113 @@ title: Error Handling
 description: Result types, the ? operator, and error patterns in Weir.
 ---
 
-Weir uses the `Result` type for error handling. Errors are values visible in type signatures, and the `?` operator provides ergonomic propagation.
+Weir treats errors as values using the `Result` type. Errors are visible in type signatures, and the `?` operator provides ergonomic propagation. There are no exceptions.
 
-:::note
-This page is under construction. Full content coming soon.
-:::
+## The `Result` Type
 
-## Quick Reference
+`Result` is a sum type defined in the prelude:
 
 ```lisp
-;; Function that can fail
-(defn load-level ((path : String)) : (Result Level IOError)
-  (let ((data (read-file path)?)
-        (entities (parse-entities data)?))
-    (Ok (Level entities))))
-
-;; Handle the result
-(match (load-level "level1.weir")
-  ((Ok level) (start level))
-  ((Err e) (show-error e)))
+(deftype (Result 'ok 'err)
+  (Ok 'ok)
+  (Err 'err))
 ```
 
-The `?` operator on `(Result 'a 'err)`:
-- If `(Ok val)` — unwraps to `val`, continues
+Functions that can fail declare this in their return type:
+
+```lisp
+(defn safe-div ((x : i32) (y : i32)) : (Result i32 String)
+  (if (= y 0)
+    (Err "division by zero")
+    (Ok (/ x y))))
+```
+
+## Handling Results
+
+Use pattern matching to handle both cases:
+
+```lisp
+(match (safe-div 10 3)
+  ((Ok val) (println (str "Result: " val)))
+  ((Err msg) (println (str "Error: " msg))))
+```
+
+Or define helper functions:
+
+```lisp
+(defn unwrap-or ((r : (Result i64 String)) (default : i64)) : i64
+  (match r
+    ((Ok val) val)
+    ((Err _) default)))
+```
+
+## The `?` Operator
+
+The `?` operator propagates errors up the call stack. Applied to a `(Result 'a 'err)` expression:
+
+- If `(Ok val)` — unwraps to `val`, execution continues
 - If `(Err e)` — immediately returns `(Err e)` from the enclosing function
+
+```lisp
+(defn load-level ((path : String)) : (Result Level IOError)
+  (let ((data (read-file path)?)            ;; propagates on error
+        (entities (parse-entities data)?))   ;; propagates on error
+    (Ok (Level entities))))
+```
+
+Without `?`, you'd need nested `match` expressions:
+
+```lisp
+;; Without ? — verbose
+(defn load-level ((path : String)) : (Result Level IOError)
+  (match (read-file path)
+    ((Err e) (Err e))
+    ((Ok data)
+      (match (parse-entities data)
+        ((Err e) (Err e))
+        ((Ok entities) (Ok (Level entities)))))))
+```
+
+The `?` operator can only be used inside functions that return `Result`.
+
+## Error Conversion with `From`
+
+When a function can produce multiple error types, the `From` typeclass enables automatic conversion at `?` sites:
+
+```lisp
+;; Define conversions
+(instance (From IOError GameError)
+  (defn from (e) (GameError :io e)))
+
+(instance (From ParseError GameError)
+  (defn from (e) (GameError :parse e)))
+
+;; ? automatically converts via From
+(defn load-level ((path : String)) : (Result Level GameError)
+  (let ((data (read-file path)?)            ;; IOError → GameError via From
+        (entities (parse-entities data)?))   ;; ParseError → GameError via From
+    (Ok (Level entities))))
+```
+
+This pattern mirrors Rust's `From` trait and `?` operator.
+
+## Design Philosophy
+
+Errors as values align with Weir's guard rails philosophy:
+
+- **Errors are visible in types** — you can't accidentally ignore a fallible operation
+- **No hidden control flow** — unlike exceptions, `?` is explicit at every propagation point
+- **Exhaustive handling** — pattern matching on `Result` forces you to handle both cases
+- **Composable** — `Result` is a regular type that works with all existing language features
+
+```lisp
+;; A list of results
+(defn try-all ((inputs : (Vector String))) : (Vector (Result i64 String))
+  (map parse-int inputs))
+
+;; The compiler ensures you handle the error case
+(match (safe-div x y)
+  ((Ok val) (use val))
+  ;; forgetting (Err _) here is a compile error
+  )
+```

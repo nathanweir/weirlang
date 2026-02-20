@@ -1,20 +1,185 @@
 ---
 title: Grammar
-description: Formal grammar specification for the Weir language.
+description: Grammar specification for the Weir language.
 ---
 
-This page will contain the formal grammar specification for Weir's S-expression syntax.
+This page describes Weir's grammar informally. Weir uses S-expression syntax — all code is parenthesized prefix notation with extensions for collection literals, type annotations, and keywords.
 
-:::note
-This page is under construction. Full content coming soon.
-:::
+## Lexical Elements
 
-## Overview
+### Delimiters
 
-Weir uses S-expression syntax with extensions for type annotations, collection literals, and keywords. The parser recognizes:
+| Token | Usage |
+|---|---|
+| `(` `)` | S-expressions (code, function calls, definitions) |
+| `[` `]` | Vector literals |
+| `{` `}` | Hash-map literals |
 
-- **Delimiters**: `()` for S-expressions, `[]` for vectors, `{}` for maps
-- **Atoms**: identifiers, numeric literals, string literals, keywords (`:name`), type variables (`'a`)
-- **Special forms**: `defn`, `deftype`, `defstruct`, `defclass`, `instance`, `defmacro`, `let`, `if`, `cond`, `match`, `when`, `unless`, `fn`, `do`, `set!`, `import`, `extern`, `unsafe`
+### Atoms
 
-A tree-sitter grammar is available at `tree-sitter-weir/` for syntax highlighting.
+| Kind | Examples | Description |
+|---|---|---|
+| Identifier | `foo`, `add`, `spawn-enemy`, `set!` | Function/variable names. May contain `-`, `?`, `!`, `<`, `>`, `=` |
+| Integer | `42`, `-7`, `0` | Default type `i64` |
+| Float | `3.14`, `-0.5`, `1e10` | Default type `f64` |
+| String | `"hello"`, `"line\n"` | UTF-8, with escape sequences |
+| Keyword | `:name`, `:health`, `:pos` | Colon-prefixed, used as map keys and named arguments |
+| Type variable | `'a`, `'b`, `'elem` | Quote-prefixed, used in type expressions |
+| Boolean | `true`, `false` | Boolean literals |
+
+### Comments
+
+```lisp
+;; Line comment — everything after ; to end of line
+```
+
+### Whitespace
+
+Spaces, tabs, newlines, and commas are all whitespace. Commas are ignored (can be used for readability in collections).
+
+## Top-Level Items
+
+A Weir source file is a sequence of top-level items:
+
+```
+program ::= item*
+
+item ::= defn | deftype | defstruct | defclass | instance
+       | defmacro | declare | import | extern-c | expr
+```
+
+### Function Definition
+
+```
+defn ::= '(' 'defn' name param* [':' type] body+ ')'
+       | '(' 'pub' 'defn' name param* [':' type] body+ ')'
+
+param ::= '(' name ':' type ')'
+        | '(' 'mut' name ':' type ')'
+        | '(' struct-destructure ':' type ')'
+```
+
+### Sum Type Definition
+
+```
+deftype ::= '(' 'deftype' ['(' name type-var* ')' | name] constructor+ ')'
+
+constructor ::= name                    ;; no-data variant
+              | '(' name type+ ')'      ;; variant with data
+```
+
+### Struct Definition
+
+```
+defstruct ::= '(' 'defstruct' name field+ ')'
+
+field ::= '(' name ':' type ')'
+```
+
+### Typeclass Definition
+
+```
+defclass ::= '(' 'defclass' [constraints] '(' name type-var+ ')' method+ ')'
+
+method ::= '(' name ':' type ')'
+
+constraints ::= '(' '=>' constraint+ ... ')'
+constraint ::= '(' class-name type-var ')'
+```
+
+### Instance Declaration
+
+```
+instance ::= '(' 'instance' [constraints] '(' class-name type+ ')' defn+ ')'
+```
+
+### Import
+
+```
+import ::= '(' 'import' module-path import-spec ')'
+
+import-spec ::= '(' name+ ')'          ;; specific names
+              | ':as' name               ;; alias
+              | ':all'                    ;; everything
+```
+
+### Extern C
+
+```
+extern-c ::= '(' 'extern' '"C"' defn+ ')'
+```
+
+## Expressions
+
+```
+expr ::= literal | name | call | let | if | cond | match
+       | when | unless | fn | do | set! | unsafe | ann
+       | field-access | vector-lit | map-lit | threading
+
+call ::= '(' expr expr* ')'
+
+let ::= '(' 'let' '(' binding+ ')' body+ ')'
+binding ::= '(' name expr ')'
+          | '(' 'mut' name expr ')'
+          | '(' '(' name ':' type ')' expr ')'
+          | '(' struct-destructure expr ')'
+
+if ::= '(' 'if' expr expr [expr] ')'
+
+cond ::= '(' 'cond' cond-clause+ ')'
+cond-clause ::= '(' expr expr ')'
+              | '(' 'else' expr ')'
+
+match ::= '(' 'match' expr match-arm+ ')'
+match-arm ::= '(' pattern expr ')'
+
+when ::= '(' 'when' expr body+ ')'
+unless ::= '(' 'unless' expr body+ ')'
+
+fn ::= '(' 'fn' '(' param* ')' [':' type] body+ ')'
+
+do ::= '(' 'do' expr+ ')'
+
+set! ::= '(' 'set!' name expr ')'
+
+unsafe ::= '(' 'unsafe' body+ ')'
+
+ann ::= '(' 'ann' type expr ')'
+
+field-access ::= '.' name
+
+vector-lit ::= '[' expr* ']'
+map-lit ::= '{' (keyword expr)* '}'
+
+threading ::= '(' '->' expr form+ ')'
+            | '(' '->>' expr form+ ')'
+```
+
+## Patterns
+
+```
+pattern ::= '_'                          ;; wildcard
+           | name                         ;; variable binding or no-data variant
+           | literal                      ;; literal match
+           | '(' name pattern* ')'        ;; constructor pattern
+           | '{' (':' name [name])* '}'   ;; struct destructure
+```
+
+## Type Expressions
+
+```
+type ::= name                             ;; simple type: i64, String, Bool
+       | type-var                          ;; 'a, 'b
+       | '(' 'Fn' '[' type* ']' type ')'  ;; function type
+       | '(' name type+ ')'               ;; type application: (Option i64)
+       | 'Ptr'                             ;; raw pointer (FFI)
+```
+
+## Tree-Sitter Grammar
+
+A [tree-sitter](https://tree-sitter.github.io/) grammar for syntax highlighting is available at `tree-sitter-weir/` in the repository. This provides accurate parsing for editor integration.
+
+```bash
+cd tree-sitter-weir && tree-sitter generate
+cd tree-sitter-weir && tree-sitter test
+```

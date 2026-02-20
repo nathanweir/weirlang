@@ -3,26 +3,121 @@ title: Macros
 description: Hygienic, purely syntactic macros in Weir.
 ---
 
-Weir's macro system is purely syntactic — macros transform S-expressions into S-expressions without type knowledge. They are hygienic by default.
+Weir's macros are purely syntactic transformations — they rewrite S-expressions into other S-expressions without any knowledge of types. They are hygienic by default, preventing accidental variable capture.
 
-:::note
-This page is under construction. Full content coming soon.
-:::
+## Position in the Pipeline
 
-## Quick Reference
+Macros operate at a fixed point in the compilation pipeline:
 
-Macros operate in the pipeline as: `parse → macro expand → type check → compile`
+```
+parse → macro expand → type check → compile
+```
 
-Key properties:
-- **Purely syntactic** — transform S-expressions without querying types
-- **Hygienic by default** — no accidental variable capture
-- **Can generate types** — macros can emit `deftype`, `defstruct`, and `instance` forms
-- **Cascade-aware** — macro redefinition triggers re-expansion of all call sites
+No circular dependencies between expansion and type checking. This keeps the [cascade model](/concepts/live-reloading/) clean — re-expansion feeds into re-typechecking, which feeds into recompilation.
+
+## What Macros Can Do
+
+- Transform and generate arbitrary S-expression code
+- Generate type definitions (`deftype`, `defstruct`)
+- Generate typeclass instances (`derive`-style)
+- Generate function definitions
+- Pattern-based or quasiquote-based code generation
 
 ```lisp
 (defmacro defsystem (name component-type &body body)
   `(defn ,name ((entities : (List ,component-type))) : Unit
      (for-each entities (fn (e) ,@body))))
+
+;; Expands to a real function definition
+(defsystem update-enemies Enemy
+  (set! (.pos e) (move (.pos e))))
 ```
 
-Use `weir expand` to inspect macro output.
+## What Macros Cannot Do
+
+- Query the type of an expression during expansion
+- Adapt output based on types of arguments
+- Perform side effects during expansion (discouraged)
+
+These use cases are better served by the [type system](/guide/typeclasses/) — typeclasses, associated types, and generics.
+
+## Hygiene
+
+Macro-generated code cannot accidentally shadow or capture variables from the call site. This is especially important in a live-reloading context where code is being swapped in and out — accidental capture across reload boundaries would produce the worst kind of intermittent bugs.
+
+```lisp
+;; The macro's internal variable 'tmp' won't conflict with
+;; a 'tmp' at the call site
+(defmacro swap! (a b)
+  `(let ((tmp ,a))
+     (set! ,a ,b)
+     (set! ,b tmp)))
+```
+
+Explicit escape hatches for intentional capture are available when needed.
+
+## Type Generation
+
+Macros can emit type definitions, which is essential for first-class macro citizenship:
+
+```lisp
+;; A macro that generates a struct and its constructor
+(defmacro defcomponent (name &rest fields)
+  `(defstruct ,name ,@fields))
+
+;; A derive-style macro generating a typeclass instance
+(defmacro derive-show (type-name field-names)
+  `(instance (Show ,type-name)
+     (defn show (x)
+       (str ,(str type-name "(")
+            ,@(interpose ", "
+                (map (fn (f) `(str ,(str f "=") (show (. x ,f))))
+                     field-names))
+            ")"))))
+```
+
+## Interaction with Live Reloading
+
+The dependency tracker distinguishes between user-defined code and macro-generated code:
+
+| Change | Effect |
+|---|---|
+| Edit a macro call site | Re-expand that call, cascade if output changed |
+| Edit a macro definition | Re-expand **all** call sites of that macro |
+| Macro output unchanged | Short-circuit — skip downstream cascade |
+
+### Short-Circuit Optimization
+
+Most macro redefinitions don't change most expansions. The dependency tracker compares expansion outputs structurally and skips the downstream cascade when output hasn't changed. This is critical for performance.
+
+### Error Reporting
+
+When macro-generated code has a type error:
+
+1. **Primary location**: the macro call site ("error in expansion of `defsystem` at game.weir:15")
+2. **Secondary location**: the specific point in the expansion that failed
+3. **Expansion visibility**: inspect expanded code with `weir expand`
+
+During live reloading, the old working version keeps running while errors are reported.
+
+## Inspecting Expansions
+
+Use the `expand` command to see what macros produce:
+
+```bash
+weir expand myfile.weir
+```
+
+This prints the source after all macros have been expanded — useful for debugging macro output.
+
+## Design Rationale
+
+Weir deliberately keeps macros simple (purely syntactic, no type awareness) and invests in [typeclass expressiveness](/guide/typeclasses/) instead. A more expressive type system reduces the pressure on the macro system:
+
+| Pattern | Without Typeclasses | With Typeclasses |
+|---|---|---|
+| Polymorphic printing | Macro per type | `(Show 'a)` instance |
+| Generic map | Macro per container | `(Functor 'f)` instance |
+| Auto-derived equality | Code-walking macro | `(Eq 'a)` derive macro (simpler) |
+
+The result is a macro system that's easier to reason about, with fewer edge cases and better error messages.

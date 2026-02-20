@@ -3,24 +3,130 @@ title: String Operations
 description: String manipulation functions in Weir.
 ---
 
-Weir provides built-in string operations for common text manipulation tasks.
+Weir provides built-in string operations for construction, inspection, and transformation.
 
-:::note
-This page is under construction. Full content coming soon.
-:::
+## Creating Strings
 
-## Quick Reference
+### String Literals
+
+```lisp
+"hello, world"
+"line one\nline two"
+""   ;; empty string
+```
+
+### Concatenation with `str`
+
+`str` is variadic — it concatenates any number of values into a string, converting each via its `Show` representation:
+
+```lisp
+(str "Hello, " name "!")              ;; => "Hello, Alice!"
+(str "x=" x " y=" y)                  ;; => "x=5 y=10"
+(str "score: " (+ base bonus))        ;; => "score: 42"
+```
+
+## Inspection
+
+### `string-length`
+
+Returns the length of a string:
+
+```lisp
+(string-length "hello")       ;; => 5
+(string-length "")             ;; => 0
+(string-length "emoji: hi")   ;; => 9
+```
+
+### `string-ref`
+
+Returns the character code (integer) at a given index:
+
+```lisp
+(string-ref "hello" 0)        ;; => 104 (ASCII 'h')
+(string-ref "ABC" 1)          ;; => 66 (ASCII 'B')
+```
+
+### `string-contains`
+
+Checks if a string contains a substring:
+
+```lisp
+(string-contains "hello world" "world")  ;; => true
+(string-contains "hello world" "xyz")    ;; => false
+(string-contains "hello" "")             ;; => true
+```
+
+### `len`
+
+The generic `len` function also works on strings:
+
+```lisp
+(len "hello")                  ;; => 5
+```
+
+## Extraction
+
+### `substring`
+
+Extracts a substring from start index (inclusive) to end index (exclusive):
+
+```lisp
+(substring "hello world" 0 5)    ;; => "hello"
+(substring "hello world" 6 11)   ;; => "world"
+(substring "abcdef" 2 4)         ;; => "cd"
+```
+
+## Transformation
+
+### `string-upcase`
+
+Converts all characters to uppercase:
+
+```lisp
+(string-upcase "hello")           ;; => "HELLO"
+(string-upcase "Hello World")     ;; => "HELLO WORLD"
+```
+
+### `string-downcase`
+
+Converts all characters to lowercase:
+
+```lisp
+(string-downcase "HELLO")         ;; => "hello"
+(string-downcase "Hello World")   ;; => "hello world"
+```
+
+### `string-trim`
+
+Removes leading and trailing whitespace:
+
+```lisp
+(string-trim "  hello  ")         ;; => "hello"
+(string-trim "\n  spaced  \t")    ;; => "spaced"
+```
+
+## Conversion
+
+### `char-to-string`
+
+Converts a character code (integer) to a single-character string:
+
+```lisp
+(char-to-string 65)               ;; => "A"
+(char-to-string 104)              ;; => "h"
+(char-to-string 10)               ;; => "\n"
+```
+
+## Summary
 
 | Function | Signature | Description |
 |---|---|---|
 | `str` | `(Fn ['a ...] String)` | Concatenate values into a string |
 | `string-length` | `(Fn [String] i64)` | Length of string |
 | `substring` | `(Fn [String i64 i64] String)` | Extract substring (start, end) |
-| `string-ref` | `(Fn [String i64] i64)` | Get character code at index |
-| `string-contains` | `(Fn [String String] Bool)` | Check if string contains substring |
-| `string-upcase` | `(Fn [String] String)` | Convert to uppercase |
-| `string-downcase` | `(Fn [String] String)` | Convert to lowercase |
+| `string-ref` | `(Fn [String i64] i64)` | Character code at index |
+| `string-contains` | `(Fn [String String] Bool)` | Substring search |
+| `string-upcase` | `(Fn [String] String)` | To uppercase |
+| `string-downcase` | `(Fn [String] String)` | To lowercase |
 | `string-trim` | `(Fn [String] String)` | Trim whitespace |
-| `char-to-string` | `(Fn [i64] String)` | Convert character code to string |
-
-See [Built-in Functions](/stdlib/builtins/#string-operations) for full details and examples.
+| `char-to-string` | `(Fn [i64] String)` | Char code to string |

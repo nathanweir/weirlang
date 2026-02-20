@@ -3,29 +3,113 @@ title: Control Flow
 description: Conditionals, branching, and looping in Weir.
 ---
 
-Weir provides several control flow forms: `if`, `cond`, `match`, `when`, and `unless`.
+Weir provides several control flow forms. All are expressions — they return values. Looping is done via recursion (with tail-call optimization).
 
-:::note
-This page is under construction. Full content coming soon.
-:::
+## `if` — Binary Conditional
 
-## Quick Reference
-
-- **`if`** — Binary conditional. Else branch required when result is used.
-- **`cond`** — Multi-branch conditional with required `else`.
-- **`match`** — Pattern matching with exhaustiveness checking.
-- **`when` / `unless`** — Single-branch side-effecting forms (return `Unit`).
-- **`do`** — Explicit sequencing block for multi-expression positions.
+`if` takes a condition and two branches. When the result is used, the else branch is required:
 
 ```lisp
+;; As expression — else required
+(let ((status (if alive? :active :dead)))
+  (println status))
+
+;; As statement (result unused) — else optional, implicit Unit
+(if (key-pressed? :escape)
+  (open-menu))
+```
+
+Both branches must have the same type when the result is used:
+
+```lisp
+;; OK — both branches return String
 (if (> x 0) "positive" "non-positive")
 
+;; Compile error — type mismatch
+(if (> x 0) "positive" 42)
+```
+
+## `cond` — Multi-branch Conditional
+
+`cond` is a multi-way `if`. The `else` branch is **required** — an unhandled case is a silent bug:
+
+```lisp
 (cond
   ((< health 0) (die))
   ((< health 20) (flee))
+  ((< health 50) (defend))
   (else (attack)))
+```
 
+Conditions are tested in order. The first truthy condition's body is evaluated and returned. All branches must return the same type when the result is used.
+
+## `match` — Pattern Matching
+
+`match` dispatches on the structure of a value. See [Pattern Matching](/guide/pattern-matching/) for full details.
+
+```lisp
+(match enemy-state
+  ((Patrol start end) (move-between start end))
+  ((Chase target-id) (pursue target-id))
+  (Idle (stand-still))
+  (Dead (remove-entity)))
+```
+
+Pattern matching is **exhaustive by default** — missing a variant is a compile error. Use `_` as a wildcard to handle remaining cases.
+
+## `when` / `unless` — Side-effecting Conditionals
+
+Single-branch forms that always return `Unit`. No else branch — they make intent clear: "I only care about this one case."
+
+```lisp
 (when (key-pressed? :escape)
   (open-menu)
   (pause-game))
+
+(unless (alive? entity)
+  (remove entity))
 ```
+
+`when` executes its body when the condition is true. `unless` executes when the condition is false. Both support multiple expressions in the body.
+
+## `do` — Explicit Sequencing
+
+Function bodies, `let` bodies, and lambda bodies implicitly sequence multiple expressions. The `do` block provides explicit sequencing where only a single expression is expected:
+
+```lisp
+(if condition
+  (do (log "taking branch A")
+      (branch-a))
+  (branch-b))
+```
+
+The last expression in a `do` block is its return value.
+
+## Looping via Recursion
+
+Weir has no `for` or `while` loops. Iteration is expressed via recursion. Self-recursive calls in tail position are optimized into loops by the compiler, so there's no stack overflow risk:
+
+```lisp
+;; Count down from n — compiled as a loop
+(defn count-down ((n : i64)) : i64
+  (if (= n 0) 0 (count-down (- n 1))))
+
+;; Sum a list — compiled as a loop
+(defn sum-list ((xs : (Vector i64)) (i : i64) (acc : i64)) : i64
+  (if (= i (len xs))
+    acc
+    (sum-list xs (+ i 1) (+ acc (nth xs i)))))
+```
+
+See [Functions — Tail-Call Optimization](/guide/functions/#tail-call-optimization) for details on which positions qualify for optimization.
+
+## Summary
+
+| Form | Branches | Returns | Use When |
+|---|---|---|---|
+| `if` | 2 (else optional as statement) | Expression value | Binary choice |
+| `cond` | N + required `else` | Expression value | Multi-way choice |
+| `match` | N (exhaustive) | Expression value | Dispatching on data structure |
+| `when` | 1 | `Unit` | Side effect on true |
+| `unless` | 1 | `Unit` | Side effect on false |
+| `do` | N (sequenced) | Last expression | Explicit multi-expression block |

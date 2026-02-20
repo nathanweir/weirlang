@@ -3,34 +3,188 @@ title: Structs & Types
 description: Defining structs, sum types, and algebraic data types in Weir.
 ---
 
-Weir uses separate forms for product types (`defstruct`) and sum types (`deftype`), following Coalton's pattern.
+Weir uses separate forms for product types (`defstruct`) and sum types (`deftype`), following Coalton's pattern. Together they form the language's algebraic data type system.
 
-:::note
-This page is under construction. Full content coming soon.
-:::
+## Product Types — `defstruct`
 
-## Quick Reference
+Structs are fixed collections of named, typed fields:
 
 ```lisp
-;; Product type (struct)
 (defstruct Vec2
   (x : f64)
   (y : f64))
 
-;; Sum type (enum)
+(defstruct Enemy
+  (pos : Vec2)
+  (health : i32)
+  (state : EnemyState))
+```
+
+No `fields` keyword needed — `defstruct` is unambiguous. Fields always have names and types.
+
+### Construction
+
+The type name is automatically a constructor function. Both positional and named arguments are supported:
+
+```lisp
+;; Positional (fine for small structs)
+(Vec2 1.0 2.0)
+
+;; Named (keyword arguments — better for larger structs)
+(Enemy :pos (Vec2 0.0 0.0) :health 100 :state Idle)
+
+;; Mixed (positional first, then named)
+(Enemy (Vec2 0.0 0.0) :health 100 :state Idle)
+```
+
+The compiler verifies keyword names match field names at compile time.
+
+### Field Access
+
+`.field` is a first-class accessor function (Coalton-style):
+
+```lisp
+(.pos enemy)              ;; access the pos field
+(.x (.pos enemy))         ;; nested access
+
+;; Chained with threading macro
+(-> enemy .pos .x)        ;; equivalent to (.x (.pos enemy))
+
+;; Composable with higher-order functions
+(map .pos enemies)        ;; extract all positions
+(filter (fn (e) (> (.health e) 0)) enemies)
+```
+
+### Functional Update
+
+Weir is immutable by default — there's no field mutation. Instead, use `update` to create a modified copy:
+
+```lisp
+(defn damage ((e : Enemy) (amount : i32)) : Enemy
+  (update e :health (- (.health e) amount)))
+
+;; Original unchanged
+(let ((e (Enemy :pos (Vec2 0.0 0.0) :health 100 :state Idle))
+      (e2 (damage e 10)))
+  (.health e)    ;; => 100 (unchanged)
+  (.health e2))  ;; => 90
+
+;; Multiple fields
+(update enemy
+  :health (- (.health enemy) damage)
+  :state (if (< (.health enemy) 0) Dead (.state enemy)))
+```
+
+With arena allocation, functional update is near-zero-cost (bump allocation is a pointer increment).
+
+### Destructuring
+
+Structs can be destructured in `let` bindings, function parameters, and `match` arms using keyword syntax:
+
+```lisp
+(let (({:x :y} my-vec))
+  (+ x y))
+
+(defn distance (({:x ax :y ay} : Vec2) ({:x bx :y by} : Vec2)) : f64
+  (sqrt (+ (* (- bx ax) (- bx ax)) (* (- by ay) (- by ay)))))
+```
+
+See [Pattern Matching](/guide/pattern-matching/#struct-destructuring) for full details.
+
+## Sum Types — `deftype`
+
+Sum types (tagged unions / enums) have multiple variants, each optionally carrying data:
+
+```lisp
+;; Simple enum (no data)
+(deftype Direction North South East West)
+
+;; Enum with mixed data
+(deftype EnemyState
+  Idle
+  (Patrol Vec2 Vec2)
+  (Chase i64)
+  Dead)
+
+;; Generic sum type
 (deftype (Option 'a)
   (Some 'a)
   None)
 
-;; Construction
-(Vec2 1.0 2.0)
-(Some 42)
-
-;; Field access
-(.x my-vec)
-
-;; Pattern matching
-(match opt
-  ((Some val) val)
-  (None 0))
+(deftype (Result 'ok 'err)
+  (Ok 'ok)
+  (Err 'err))
 ```
+
+### Constructors
+
+Each variant is a constructor function:
+
+```lisp
+(Some 42)                  ;; => (Option i64)
+None                       ;; => (Option 'a)
+(Patrol (Vec2 0.0 0.0) (Vec2 10.0 0.0))  ;; => EnemyState
+Idle                       ;; => EnemyState (no-arg variant)
+```
+
+### Pattern Matching
+
+Sum types are consumed via exhaustive pattern matching:
+
+```lisp
+(defn unwrap-or ((opt : (Option i64)) (default : i64)) : i64
+  (match opt
+    ((Some val) val)
+    (None default)))
+```
+
+All variants must be handled. See [Pattern Matching](/guide/pattern-matching/) for details.
+
+## Type Parameters
+
+Both `deftype` and `defstruct` support type parameters (quote-prefixed):
+
+```lisp
+(deftype (Either 'a 'b)
+  (Left 'a)
+  (Right 'b))
+
+(defstruct (Pair 'a 'b)
+  (fst : 'a)
+  (snd : 'b))
+```
+
+## Type Annotations — `ann`
+
+When the compiler can't determine which type you want (e.g., for numeric literals), use `ann` to constrain inference:
+
+```lisp
+(ann i32 42)                              ;; force i32 instead of i64
+(ann f32 3.14)                            ;; force f32 instead of f64
+(ann (List Enemy) (filter alive? entities))  ;; pin a polymorphic return
+```
+
+`ann` is a constraint, not a cast — if the expression can't be the asserted type, it's a compile error. For actual type conversion, use conversion functions like `to-f64` or `to-i32`.
+
+## Visibility
+
+Type definitions are private by default. Use `pub` to export:
+
+```lisp
+(pub defstruct Vec2
+  (x : f64)
+  (y : f64))
+
+(pub deftype (Option 'a)
+  (Some 'a)
+  None)
+```
+
+## The Prelude Types
+
+These types are automatically available in all modules:
+
+| Type | Variants | Source |
+|---|---|---|
+| `Result 'ok 'err` | `Ok 'ok`, `Err 'err` | Prelude |
+| `Ordering` | `LT`, `EQ`, `GT` | Prelude |

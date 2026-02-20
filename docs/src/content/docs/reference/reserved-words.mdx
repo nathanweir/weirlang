@@ -1,70 +1,109 @@
 ---
 title: Reserved Words
-description: Keywords and reserved identifiers in Weir.
+description: Keywords, special forms, and reserved identifiers in Weir.
 ---
 
-This page lists all reserved words and special identifiers in Weir.
+This page lists all reserved words and special identifiers in Weir. These cannot be used as variable or function names.
 
-:::note
-This page is under construction. Full content coming soon.
-:::
+## Definition Forms
 
-## Special Forms
+| Keyword | Purpose | Example |
+|---|---|---|
+| `defn` | Function definition | `(defn add ((x : i32) (y : i32)) : i32 (+ x y))` |
+| `deftype` | Sum type (enum) definition | `(deftype (Option 'a) (Some 'a) None)` |
+| `defstruct` | Product type (struct) definition | `(defstruct Vec2 (x : f64) (y : f64))` |
+| `defclass` | Typeclass definition | `(defclass (Show 'a) (show : (Fn ['a] String)))` |
+| `defmacro` | Macro definition | `(defmacro when (cond &body body) ...)` |
+| `instance` | Typeclass instance | `(instance (Show Vec2) (defn show ...))` |
+| `declare` | Separate type declaration | `(declare map (Fn [(Fn ['a] 'b) (List 'a)] (List 'b)))` |
 
-These identifiers are recognized by the parser as special forms and cannot be used as variable or function names:
+## Expression Forms
 
-| Keyword | Purpose |
+| Keyword | Purpose | Example |
+|---|---|---|
+| `let` | Local bindings | `(let ((x 5)) (+ x 1))` |
+| `if` | Binary conditional | `(if (> x 0) "yes" "no")` |
+| `cond` | Multi-branch conditional | `(cond ((< x 0) "neg") (else "pos"))` |
+| `match` | Pattern matching | `(match opt ((Some x) x) (None 0))` |
+| `when` | Side-effect on true | `(when flag (println "yes"))` |
+| `unless` | Side-effect on false | `(unless done (continue))` |
+| `fn` | Lambda / closure | `(fn (x) (+ x 1))` |
+| `do` | Explicit sequencing | `(do (step1) (step2) result)` |
+| `set!` | Reassign mutable binding | `(set! x (+ x 1))` |
+| `unsafe` | Unsafe block (for FFI) | `(unsafe (abs -42))` |
+| `ann` | Type assertion | `(ann i32 42)` |
+
+## Modifiers
+
+| Keyword | Purpose | Example |
+|---|---|---|
+| `pub` | Public visibility | `(pub defn spawn ...)` |
+| `mut` | Mutable binding | `(let ((mut x 5)) (set! x 10))` |
+| `else` | Default branch in `cond` | `(cond (...) (else default))` |
+
+## Module System
+
+| Keyword | Purpose | Example |
+|---|---|---|
+| `import` | Module import | `(import math.vec2 (add sub))` |
+| `extern` | Foreign function block | `(extern "C" (defn abs ...))` |
+
+## Operators
+
+| Symbol | Purpose |
 |---|---|
-| `defn` | Function definition |
-| `deftype` | Sum type (enum) definition |
-| `defstruct` | Product type (struct) definition |
-| `defclass` | Typeclass definition |
-| `defmacro` | Macro definition |
-| `instance` | Typeclass instance |
-| `declare` | Separate type declaration |
-| `let` | Local bindings |
-| `if` | Binary conditional |
-| `cond` | Multi-branch conditional |
-| `match` | Pattern matching |
-| `when` | Single-branch conditional (side-effect) |
-| `unless` | Negated single-branch conditional |
-| `fn` | Lambda / closure |
-| `do` | Explicit sequencing block |
-| `set!` | Mutable reassignment |
-| `mut` | Mutable binding modifier |
-| `import` | Module import |
-| `extern` | Foreign function declaration |
-| `unsafe` | Unsafe block (for FFI calls) |
-| `pub` | Public visibility modifier |
-| `ann` | Type annotation / assertion |
 | `->` | Thread-first macro |
 | `->>` | Thread-last macro |
-| `with-arena` | Arena allocation block |
-| `else` | Default branch in `cond` |
+| `?` | Error propagation (postfix on `Result`) |
+| `.field` | Field accessor (prefix dot) |
+
+## Memory
+
+| Keyword | Purpose | Example |
+|---|---|---|
+| `with-arena` | Arena allocation block | `(with-arena frame ...)` |
 
 ## Built-in Types
+
+These identifiers are reserved as type names:
 
 | Type | Description |
 |---|---|
 | `i8`, `i16`, `i32`, `i64` | Signed integers |
 | `u8`, `u16`, `u32`, `u64` | Unsigned integers |
 | `f32`, `f64` | Floating point |
-| `Bool` | Boolean |
+| `Bool` | Boolean (`true` / `false`) |
 | `String` | UTF-8 string |
-| `Unit` | Unit type |
+| `Unit` | Unit type (one value) |
 | `Fn` | Function type constructor |
 | `Vector` | Vector type |
-| `Atom` | Atomic reference type |
-| `Channel` | Channel type |
+| `Atom` | Atomic reference |
+| `Channel` | Typed channel |
 | `Ptr` | Raw pointer (FFI) |
+| `Result` | Error handling (prelude) |
+| `Ordering` | Comparison result (prelude) |
 
-## Literals
+## Built-in Values
 
-| Literal | Example |
-|---|---|
-| `true`, `false` | Boolean literals |
-| Integer | `42`, `-7` |
-| Float | `3.14`, `-0.5` |
-| String | `"hello"` |
-| Keyword | `:name`, `:health` |
-| Type variable | `'a`, `'elem` |
+| Literal | Type | Description |
+|---|---|---|
+| `true` | `Bool` | Boolean true |
+| `false` | `Bool` | Boolean false |
+| `None` | `(Option 'a)` | Option empty variant |
+| `Ok` | Constructor | Result success |
+| `Err` | Constructor | Result error |
+| `Some` | Constructor | Option present |
+| `LT` | `Ordering` | Less than |
+| `EQ` | `Ordering` | Equal |
+| `GT` | `Ordering` | Greater than |
+
+## Naming Conventions
+
+| Convention | Meaning | Example |
+|---|---|---|
+| `kebab-case` | Functions and variables | `spawn-enemy`, `read-file` |
+| `PascalCase` | Types and constructors | `Vec2`, `EnemyState`, `Some` |
+| `:colon-prefix` | Keywords (values) | `:name`, `:health` |
+| `'quote-prefix` | Type variables | `'a`, `'elem` |
+| `suffix!` | Mutating operations | `set!`, `swap!` |
+| `suffix?` | Predicates (return Bool) | `alive?`, `empty?` |

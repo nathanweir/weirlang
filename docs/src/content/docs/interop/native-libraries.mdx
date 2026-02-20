@@ -3,15 +3,11 @@ title: Native Libraries
 description: Building and linking native C libraries with Weir packages.
 ---
 
-Weir packages can include native C source files that are automatically compiled and linked.
+Weir packages can include native C source files that are automatically compiled and linked. This is how Weir integrates with system libraries like OpenGL, GLFW, and audio frameworks.
 
-:::note
-This page is under construction. Full content coming soon.
-:::
+## Declaring Native Code
 
-## Quick Reference
-
-In `weir.pkg`, declare native sources and link libraries:
+In `weir.pkg`, use the `native` section to declare C sources and link libraries:
 
 ```lisp
 (package
@@ -23,6 +19,133 @@ In `weir.pkg`, declare native sources and link libraries:
     (link "glfw" "GL" "m")))
 ```
 
-- **JIT mode**: C sources compiled to `.so`, loaded via `dlopen`
-- **AOT mode**: C sources passed to the system linker
-- Use `--load` flag to manually pre-load shared libraries in JIT mode
+| Field | Description |
+|---|---|
+| `sources` | C source files to compile (relative to `weir.pkg`) |
+| `link` | System libraries to link (`-l` flags) |
+
+## How It Works
+
+The build process depends on the execution mode:
+
+### JIT Mode (`weir run`)
+
+1. All native C sources from all packages are collected
+2. Compiled into a shared library via `cc -shared -fPIC -o tmp/libweir_native.so`
+3. The shared library is loaded via `dlopen` before JIT execution
+4. Symbols are resolved via `dlsym` when extern functions are called
+
+```bash
+cd demos/tetris && weir run
+# Internally: cc -shared -fPIC -o tmp/libweir_native.so gl_helper.c -lglfw -lGL -lm
+# Then: dlopen("tmp/libweir_native.so")
+# Then: JIT compile and run
+```
+
+### AOT Mode (`weir build`)
+
+1. Native C sources are passed as extra arguments to the C compiler
+2. Link libraries are passed as `-l` flags
+3. Everything is linked into a single standalone binary
+
+```bash
+cd demos/tetris && weir build -o ../../tmp/tetris
+# Internally: cc -o tetris program.o gl_helper.c -lglfw -lGL -lm
+```
+
+### Dev Mode (`weir dev`)
+
+Same as JIT mode — the native library is compiled and loaded once at startup.
+
+## Dependency Chains
+
+When an application depends on a library that has native code, the native sources and link flags are collected from all packages in the dependency tree:
+
+```
+demos/tetris/weir.pkg
+  └── deps: weir-gl
+        └── native: gl_helper.c, link: glfw GL m
+```
+
+All native sources and link flags bubble up to the top-level build.
+
+## Manual Approach
+
+Before the package system, native code required manual commands:
+
+```bash
+# Manual AOT:
+weir build demos/tetris.weir -o tmp/tetris --cc-arg gl_helper.c -l glfw -l GL -l m
+
+# Manual JIT:
+cc -shared -fPIC -o tmp/libgl.so gl_helper.c -lglfw -lGL -lm
+weir run demos/tetris.weir --load tmp/libgl.so
+```
+
+The package system makes this declarative — just `weir build` or `weir run`.
+
+## The `--load` Flag
+
+For JIT mode without a package system, you can manually pre-load shared libraries:
+
+```bash
+weir run game.weir --load /usr/lib/libglfw.so --load ./mylib.so
+```
+
+The `--load` flag calls `dlopen` with `RTLD_GLOBAL`, making all symbols available for `dlsym` resolution.
+
+## The `--cc-arg` and `-l` Flags
+
+For AOT builds without a package system:
+
+```bash
+weir build game.weir --cc-arg helper.c --cc-arg audio.c -l glfw -l GL -l openal
+```
+
+`--cc-arg` passes raw arguments to the C compiler. `-l` passes library link flags.
+
+## Example: weir-gl
+
+The `weir-gl` library package provides OpenGL/GLFW bindings:
+
+```
+weir-gl/
+  weir.pkg          # Package manifest
+  lib.weir          # Weir extern "C" declarations
+  gl_helper.c       # C wrapper functions
+```
+
+`gl_helper.c` contains C functions that wrap verbose OpenGL/GLFW APIs into simpler interfaces:
+
+```c
+// gl_helper.c (simplified)
+#include <GLFW/glfw3.h>
+
+static GLFWwindow* window;
+
+int64_t gl_init(int64_t w, int64_t h, const char* title) {
+    glfwInit();
+    window = glfwCreateWindow(w, h, title, NULL, NULL);
+    glfwMakeContextCurrent(window);
+    return window != NULL;
+}
+```
+
+`lib.weir` declares these functions for Weir:
+
+```lisp
+(extern "C"
+  (defn gl_init ((w : i64) (h : i64) (title : String)) : i64)
+  (defn gl_should_close () : i64)
+  (defn gl_begin_frame () : Unit)
+  (defn gl_draw_rect ((x : f64) (y : f64) (w : f64) (h : f64)
+                       (r : f64) (g : f64) (b : f64) (a : f64)) : Unit)
+  (defn gl_end_frame () : Unit)
+  (defn gl_cleanup () : Unit))
+```
+
+Applications then import from the package:
+
+```lisp
+(import weir-gl (gl_init gl_draw_rect gl_cleanup ...))
+```

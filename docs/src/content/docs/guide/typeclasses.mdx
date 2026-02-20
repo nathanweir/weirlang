@@ -3,36 +3,130 @@ title: Typeclasses
 description: Ad-hoc polymorphism with Haskell-style typeclasses in Weir.
 ---
 
-Weir uses Haskell-style typeclasses for ad-hoc polymorphism, with higher-kinded type support and Rust-style coherence rules.
+Weir uses Haskell-style typeclasses for ad-hoc polymorphism — defining shared behavior across different types. Typeclasses support higher-kinded types, multi-parameter definitions, superclass constraints, and default implementations.
 
-:::note
-This page is under construction. Full content coming soon.
-:::
+## Defining a Typeclass
 
-## Quick Reference
+Use `defclass` to define a typeclass with its required methods:
 
 ```lisp
-;; Define a typeclass
 (defclass (Show 'a)
   (show : (Fn ['a] String)))
 
-;; Typeclass with superclass
-(defclass (=> (Eq 'a) (Ord 'a))
-  (<=> : (Fn ['a 'a] Ordering)))
+(defclass (Eq 'a)
+  (equal? : (Fn ['a 'a] Bool)))
+```
 
-;; Higher-kinded typeclass
-(defclass (Functor 'f)
-  (map : (Fn [(Fn ['a] 'b) ('f 'a)] ('f 'b))))
+Each method has a name and a type signature. The type variable (`'a`) represents the type that will implement the class.
 
-;; Instance
+## Implementing Instances
+
+Use `instance` to implement a typeclass for a specific type:
+
+```lisp
 (instance (Show Vec2)
   (defn show (v)
     (str "(" (.x v) ", " (.y v) ")")))
 
-;; Constrained instance
+(instance (Eq Vec2)
+  (defn equal? (a b)
+    (and (= (.x a) (.x b))
+         (= (.y a) (.y b)))))
+```
+
+## Superclass Constraints
+
+A typeclass can require that its instances also implement other typeclasses. Use `=>` prefix syntax:
+
+```lisp
+;; Ord requires Eq
+(defclass (=> (Eq 'a) (Ord 'a))
+  (<=> : (Fn ['a 'a] Ordering)))
+```
+
+Any type implementing `Ord` must also have an `Eq` instance. This is checked at compile time.
+
+## Constrained Functions
+
+Functions can require typeclass constraints on their type parameters:
+
+```lisp
+;; Single constraint
+(declare equal? (=> (Eq 'a) (Fn ['a 'a] Bool)))
+
+;; Multiple constraints
+(declare serialize (=> (Show 'a) (Eq 'a) (Fn ['a] String)))
+```
+
+The compiler verifies that the concrete types used at call sites satisfy all constraints.
+
+## Constrained Instances
+
+Instances can have constraints too — useful for generic type implementations:
+
+```lisp
+;; Show for Option requires Show for the element type
 (instance (=> (Show 'a) (Show (Option 'a)))
   (defn show (opt)
     (match opt
       ((Some x) (str "Some(" (show x) ")"))
       (None "None"))))
 ```
+
+## Higher-Kinded Types
+
+Typeclasses can abstract over type constructors (types that take type parameters), not just concrete types:
+
+```lisp
+;; 'f is a type constructor like Option, List, etc.
+(defclass (Functor 'f)
+  (map : (Fn [(Fn ['a] 'b) ('f 'a)] ('f 'b))))
+
+(instance (Functor Option)
+  (defn map (f opt)
+    (match opt
+      ((Some x) (Some (f x)))
+      (None None))))
+```
+
+Here `'f` has kind `* -> *` — it's a type that takes one type parameter. This enables abstracting over containers, effects, and other parameterized types. HKT support is essential for `Functor`, `Monad`, `Foldable`, and similar abstractions.
+
+## Coherence Rules
+
+Weir uses Rust-style coherence: only the module defining the type **or** the typeclass can define an instance. This prevents conflicting instances:
+
+```lisp
+;; In the module that defines Vec2:
+(instance (Show Vec2) ...)       ;; OK — defines the type
+
+;; In the module that defines Printable:
+(instance (Printable Vec2) ...)  ;; OK — defines the typeclass
+
+;; In a third module:
+(instance (Show Vec2) ...)       ;; ERROR — orphan instance
+```
+
+This is more restrictive than Haskell but prevents a real class of confusing bugs where two different modules define conflicting instances for the same type/class pair.
+
+## The Prelude Typeclass
+
+The `Ord` typeclass is defined in the prelude with instances for all primitive types:
+
+```lisp
+(defclass (Ord 'a)
+  (compare : (Fn ['a 'a] Ordering)))
+
+;; Pre-defined instances:
+;; i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, String
+```
+
+## Design Philosophy
+
+Weir invests in typeclass expressiveness to reduce pressure on the macro system. A simpler, purely syntactic macro system becomes viable when the type system can carry more weight:
+
+| Need | Typeclass Solution | Macro Alternative |
+|---|---|---|
+| Print any type | `(Show 'a)` with `show` method | Complex code-walking macro |
+| Generic container ops | `(Functor 'f)` with `map` | One macro per container type |
+| Ordered comparison | `(Ord 'a)` with `compare` | Macro generating comparison fns |
+| Serialization | `(Serialize 'a)` typeclass | Macro introspecting struct fields |
