@@ -1,1 +1,5 @@
-This project is an attempt at very aggressively pushing Claude Code to do a complex task via an engineering-design oriented workflow. In this workflow, Claude is made to process transcripts of voice memos recorded in `transcripts/`, ingest those into a growing set of design documents in `design/`, and then iterate on these requirements with the developer to build the software.
+More documentation incoming!
+
+This project is an attempt at very aggressively pushing Claude Code to its limits by designing & building an entire programming language, affectionately named simply `weir`. This is admittedly a bespoke, personal ecosystem that combines a number of fun ideas which I hope can together serve as a seriously un-serious local tool for me to do indie game development. That is, the weir lang is specifically written for small-scale game dev scenarios. It's a little more intentional than vibe coding but also much less than if this was aimed at being a widely accepted, shared ecosystem by other devs.
+
+TBD outline the major features of this language when having Claude write docs.
