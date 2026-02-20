@@ -14,6 +14,7 @@ pub const INITIAL_PAGES: u32 = 256; // 16MB
 pub const GLOBAL_HEAP_PTR: u32 = 0;
 pub const GLOBAL_SHADOW_SP: u32 = 1;
 pub const GLOBAL_WASM_STATE: u32 = 2;
+pub const GLOBAL_RNG_STATE: u32 = 3;
 
 /// Names of runtime functions that are imported from JS.
 pub const JS_IMPORTS: &[(&str, &[ValType], &[ValType])] = &[
@@ -476,36 +477,368 @@ pub fn emit_string_length(func: &mut Function) {
 
 /// Emit `weir_i64_to_str(n: i64) -> i32`.
 ///
-/// Simple implementation: just allocates a string buffer and converts.
-/// This is a placeholder — a real implementation would handle all digits.
+/// Converts an i64 integer to a null-terminated decimal string.
+/// Handles negative numbers and zero. Allocates from the GC heap.
 pub fn emit_i64_to_str(func: &mut Function) {
-    // For now, just return a pointer to a static "?" string.
-    // A real implementation would do digit extraction.
-    // This is sufficient to get the pipeline working end-to-end.
+    // local 0 = n (i64)       — parameter
+    // local 1 = buf (i32)     — pointer to 24-byte buffer
+    // local 2 = pos (i32)     — write position (end of buffer, writes backwards)
+    // local 3 = is_neg (i32)  — 1 if negative
+    // local 4 = digit (i64)   — current digit
+    // local 5 = dst (i32)     — final string pointer
+    // local 6 = len (i32)     — string length
+    // local 7 = i (i32)       — copy counter
 
-    // Allocate 24 bytes for the number string
+    // Allocate 24-byte buffer from heap
     func.instruction(&Instruction::GlobalGet(GLOBAL_HEAP_PTR));
+    func.instruction(&Instruction::LocalTee(1)); // buf
     func.instruction(&Instruction::I32Const(24));
     func.instruction(&Instruction::I32Add);
     func.instruction(&Instruction::GlobalSet(GLOBAL_HEAP_PTR));
 
-    // TODO: implement actual digit extraction
-    // For now store "0\0"
-    func.instruction(&Instruction::GlobalGet(GLOBAL_HEAP_PTR));
-    func.instruction(&Instruction::I32Const(24));
-    func.instruction(&Instruction::I32Sub);
+    // pos = buf + 22 (leave room for null terminator at buf+23)
+    func.instruction(&Instruction::LocalGet(1));
+    func.instruction(&Instruction::I32Const(22));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalSet(2)); // pos
+
+    // Store null terminator at buf+23
+    func.instruction(&Instruction::LocalGet(1));
+    func.instruction(&Instruction::I32Const(0));
+    func.instruction(&Instruction::I32Store8(memarg(23)));
+
+    // Check if n == 0
+    func.instruction(&Instruction::LocalGet(0));
+    func.instruction(&Instruction::I64Eqz);
+    func.instruction(&Instruction::If(BlockType::Empty));
+    // n == 0: store "0\0" and return
+    func.instruction(&Instruction::LocalGet(2));
     func.instruction(&Instruction::I32Const(48)); // '0'
     func.instruction(&Instruction::I32Store8(memarg(0)));
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::Return);
+    func.instruction(&Instruction::End);
 
-    func.instruction(&Instruction::GlobalGet(GLOBAL_HEAP_PTR));
-    func.instruction(&Instruction::I32Const(23));
-    func.instruction(&Instruction::I32Sub);
-    func.instruction(&Instruction::I32Const(0)); // null terminator
+    // Check if negative
+    func.instruction(&Instruction::I32Const(0));
+    func.instruction(&Instruction::LocalSet(3)); // is_neg = 0
+    func.instruction(&Instruction::LocalGet(0));
+    func.instruction(&Instruction::I64Const(0));
+    func.instruction(&Instruction::I64LtS);
+    func.instruction(&Instruction::If(BlockType::Empty));
+    func.instruction(&Instruction::I32Const(1));
+    func.instruction(&Instruction::LocalSet(3)); // is_neg = 1
+    func.instruction(&Instruction::I64Const(0));
+    func.instruction(&Instruction::LocalGet(0));
+    func.instruction(&Instruction::I64Sub);
+    func.instruction(&Instruction::LocalSet(0)); // n = -n
+    func.instruction(&Instruction::End);
+
+    // Extract digits in reverse (loop while n > 0)
+    func.instruction(&Instruction::Block(BlockType::Empty));
+    func.instruction(&Instruction::Loop(BlockType::Empty));
+
+    // if n == 0, break
+    func.instruction(&Instruction::LocalGet(0));
+    func.instruction(&Instruction::I64Eqz);
+    func.instruction(&Instruction::BrIf(1));
+
+    // digit = n % 10
+    func.instruction(&Instruction::LocalGet(0));
+    func.instruction(&Instruction::I64Const(10));
+    func.instruction(&Instruction::I64RemU);
+    func.instruction(&Instruction::LocalSet(4));
+
+    // n = n / 10
+    func.instruction(&Instruction::LocalGet(0));
+    func.instruction(&Instruction::I64Const(10));
+    func.instruction(&Instruction::I64DivU);
+    func.instruction(&Instruction::LocalSet(0));
+
+    // buf[pos] = '0' + digit
+    func.instruction(&Instruction::LocalGet(2)); // pos
+    func.instruction(&Instruction::LocalGet(4)); // digit
+    func.instruction(&Instruction::I32WrapI64);
+    func.instruction(&Instruction::I32Const(48)); // '0'
+    func.instruction(&Instruction::I32Add);
     func.instruction(&Instruction::I32Store8(memarg(0)));
 
-    func.instruction(&Instruction::GlobalGet(GLOBAL_HEAP_PTR));
-    func.instruction(&Instruction::I32Const(24));
+    // pos--
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I32Const(1));
     func.instruction(&Instruction::I32Sub);
+    func.instruction(&Instruction::LocalSet(2));
+
+    func.instruction(&Instruction::Br(0)); // continue loop
+    func.instruction(&Instruction::End); // end loop
+    func.instruction(&Instruction::End); // end block
+
+    // If negative, store '-'
+    func.instruction(&Instruction::LocalGet(3)); // is_neg
+    func.instruction(&Instruction::If(BlockType::Empty));
+    func.instruction(&Instruction::LocalGet(2)); // pos
+    func.instruction(&Instruction::I32Const(45)); // '-'
+    func.instruction(&Instruction::I32Store8(memarg(0)));
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I32Const(1));
+    func.instruction(&Instruction::I32Sub);
+    func.instruction(&Instruction::LocalSet(2));
+    func.instruction(&Instruction::End);
+
+    // String starts at pos+1
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I32Const(1));
+    func.instruction(&Instruction::I32Add);
+
+    func.instruction(&Instruction::End);
+}
+
+/// Emit `weir_vec_set_nth(vec: i32, idx: i64, val: i64) -> i32`.
+///
+/// Immutable vector update: allocates a new vector, copies all elements,
+/// replaces the element at idx with val. Returns the new vector pointer.
+pub fn emit_vec_set_nth(func: &mut Function) {
+    // local 0 = vec (i32), local 1 = idx (i64), local 2 = val (i64)
+    // local 3 = len (i64), local 4 = new_vec (i32), local 5 = i (i64)
+
+    // len = vec[0]
+    func.instruction(&Instruction::LocalGet(0));
+    func.instruction(&Instruction::I64Load(memarg(0)));
+    func.instruction(&Instruction::LocalSet(3)); // len
+
+    // Allocate new vector: (1 + len) * 8 bytes — inline bump alloc
+    func.instruction(&Instruction::LocalGet(3)); // len
+    func.instruction(&Instruction::I64Const(1));
+    func.instruction(&Instruction::I64Add);
+    func.instruction(&Instruction::I64Const(8));
+    func.instruction(&Instruction::I64Mul);
+    func.instruction(&Instruction::I32WrapI64);
+    // total_size is on stack
+    func.instruction(&Instruction::GlobalGet(GLOBAL_HEAP_PTR));
+    func.instruction(&Instruction::LocalTee(4)); // new_vec = heap_ptr
+    // heap_ptr += total_size
+    func.instruction(&Instruction::I32Add); // heap_ptr + total_size
+    func.instruction(&Instruction::GlobalSet(GLOBAL_HEAP_PTR));
+
+    // Store length
+    func.instruction(&Instruction::LocalGet(4)); // new_vec
+    func.instruction(&Instruction::LocalGet(3)); // len
+    func.instruction(&Instruction::I64Store(memarg(0)));
+
+    // Copy elements, replacing at idx
+    func.instruction(&Instruction::I64Const(0));
+    func.instruction(&Instruction::LocalSet(5)); // i = 0
+
+    func.instruction(&Instruction::Block(BlockType::Empty));
+    func.instruction(&Instruction::Loop(BlockType::Empty));
+
+    // if i >= len, break
+    func.instruction(&Instruction::LocalGet(5));
+    func.instruction(&Instruction::LocalGet(3));
+    func.instruction(&Instruction::I64GeU);
+    func.instruction(&Instruction::BrIf(1));
+
+    // new_vec[8 + i*8] = (i == idx) ? val : vec[8 + i*8]
+    func.instruction(&Instruction::LocalGet(4)); // new_vec
+    func.instruction(&Instruction::LocalGet(5)); // i
+    func.instruction(&Instruction::I32WrapI64);
+    func.instruction(&Instruction::I32Const(8));
+    func.instruction(&Instruction::I32Mul);
+    func.instruction(&Instruction::I32Add);
+    // ^ destination address = new_vec + 8 + i*8 (we add the base 8 via memarg)
+
+    func.instruction(&Instruction::LocalGet(5)); // i
+    func.instruction(&Instruction::LocalGet(1)); // idx
+    func.instruction(&Instruction::I64Eq);
+    func.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    func.instruction(&Instruction::LocalGet(2)); // val
+    func.instruction(&Instruction::Else);
+    // Load from old vec
+    func.instruction(&Instruction::LocalGet(0)); // vec
+    func.instruction(&Instruction::LocalGet(5)); // i
+    func.instruction(&Instruction::I32WrapI64);
+    func.instruction(&Instruction::I32Const(8));
+    func.instruction(&Instruction::I32Mul);
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::I64Load(memarg(8))); // load vec[8+i*8]
+    func.instruction(&Instruction::End);
+
+    func.instruction(&Instruction::I64Store(memarg(8))); // store to new_vec[8+i*8]
+
+    // i++
+    func.instruction(&Instruction::LocalGet(5));
+    func.instruction(&Instruction::I64Const(1));
+    func.instruction(&Instruction::I64Add);
+    func.instruction(&Instruction::LocalSet(5));
+    func.instruction(&Instruction::Br(0));
+    func.instruction(&Instruction::End); // loop
+    func.instruction(&Instruction::End); // block
+
+    // Return new_vec
+    func.instruction(&Instruction::LocalGet(4));
+    func.instruction(&Instruction::End);
+}
+
+/// Emit `weir_vec_append(vec: i32, val: i64) -> i32`.
+///
+/// Creates a new vector with length+1, copies all elements, appends val.
+pub fn emit_vec_append(func: &mut Function) {
+    // local 0 = vec (i32), local 1 = val (i64)
+    // local 2 = old_len (i64), local 3 = new_vec (i32), local 4 = i (i64)
+
+    // old_len = vec[0]
+    func.instruction(&Instruction::LocalGet(0));
+    func.instruction(&Instruction::I64Load(memarg(0)));
+    func.instruction(&Instruction::LocalSet(2)); // old_len
+
+    // Allocate new vector: (1 + old_len + 1) * 8 = (2 + old_len) * 8
+    func.instruction(&Instruction::LocalGet(2)); // old_len
+    func.instruction(&Instruction::I64Const(2)); // +1 for length slot, +1 for new element
+    func.instruction(&Instruction::I64Add);
+    func.instruction(&Instruction::I64Const(8));
+    func.instruction(&Instruction::I64Mul);
+    func.instruction(&Instruction::I32WrapI64);
+    // total_size on stack
+    func.instruction(&Instruction::GlobalGet(GLOBAL_HEAP_PTR));
+    func.instruction(&Instruction::LocalTee(3)); // new_vec = heap_ptr
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::GlobalSet(GLOBAL_HEAP_PTR));
+
+    // Store new length = old_len + 1
+    func.instruction(&Instruction::LocalGet(3)); // new_vec
+    func.instruction(&Instruction::LocalGet(2)); // old_len
+    func.instruction(&Instruction::I64Const(1));
+    func.instruction(&Instruction::I64Add);
+    func.instruction(&Instruction::I64Store(memarg(0)));
+
+    // Copy old elements
+    func.instruction(&Instruction::I64Const(0));
+    func.instruction(&Instruction::LocalSet(4)); // i = 0
+
+    func.instruction(&Instruction::Block(BlockType::Empty));
+    func.instruction(&Instruction::Loop(BlockType::Empty));
+
+    func.instruction(&Instruction::LocalGet(4));
+    func.instruction(&Instruction::LocalGet(2)); // old_len
+    func.instruction(&Instruction::I64GeU);
+    func.instruction(&Instruction::BrIf(1));
+
+    // new_vec[8 + i*8] = vec[8 + i*8]
+    func.instruction(&Instruction::LocalGet(3)); // new_vec
+    func.instruction(&Instruction::LocalGet(4)); // i
+    func.instruction(&Instruction::I32WrapI64);
+    func.instruction(&Instruction::I32Const(8));
+    func.instruction(&Instruction::I32Mul);
+    func.instruction(&Instruction::I32Add);
+
+    func.instruction(&Instruction::LocalGet(0)); // vec
+    func.instruction(&Instruction::LocalGet(4)); // i
+    func.instruction(&Instruction::I32WrapI64);
+    func.instruction(&Instruction::I32Const(8));
+    func.instruction(&Instruction::I32Mul);
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::I64Load(memarg(8)));
+
+    func.instruction(&Instruction::I64Store(memarg(8)));
+
+    func.instruction(&Instruction::LocalGet(4));
+    func.instruction(&Instruction::I64Const(1));
+    func.instruction(&Instruction::I64Add);
+    func.instruction(&Instruction::LocalSet(4));
+    func.instruction(&Instruction::Br(0));
+    func.instruction(&Instruction::End); // loop
+    func.instruction(&Instruction::End); // block
+
+    // Store val at new_vec[8 + old_len*8]
+    func.instruction(&Instruction::LocalGet(3)); // new_vec
+    func.instruction(&Instruction::LocalGet(2)); // old_len
+    func.instruction(&Instruction::I32WrapI64);
+    func.instruction(&Instruction::I32Const(8));
+    func.instruction(&Instruction::I32Mul);
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalGet(1)); // val
+    func.instruction(&Instruction::I64Store(memarg(8)));
+
+    // Return new_vec
+    func.instruction(&Instruction::LocalGet(3));
+    func.instruction(&Instruction::End);
+}
+
+/// Emit `weir_random_seed(seed: i64)`.
+///
+/// Sets the xorshift64 PRNG state.
+pub fn emit_random_seed(func: &mut Function) {
+    // local 0 = seed (i64)
+    // Store seed in linear memory at SHADOW_STACK_START (RNG state location)
+    func.instruction(&Instruction::I32Const(SHADOW_STACK_START as i32));
+    // Ensure non-zero (xorshift requires non-zero state)
+    func.instruction(&Instruction::LocalGet(0));
+    func.instruction(&Instruction::I64Eqz);
+    func.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    func.instruction(&Instruction::I64Const(0x123456789ABCDEF0u64 as i64));
+    func.instruction(&Instruction::Else);
+    func.instruction(&Instruction::LocalGet(0));
+    func.instruction(&Instruction::End);
+    // Stack: [i32 (addr), i64 (value)] → store
+    func.instruction(&Instruction::I64Store(memarg(0)));
+    func.instruction(&Instruction::End);
+}
+
+/// Emit `weir_random_int(max: i64) -> i64`.
+///
+/// Returns a random integer in [0, max) using xorshift64.
+pub fn emit_random_int(func: &mut Function) {
+    // local 0 = max (i64)
+    // local 1 = state (i64)
+
+    // Load RNG state from linear memory at SHADOW_STACK_START
+    func.instruction(&Instruction::I32Const(SHADOW_STACK_START as i32));
+    func.instruction(&Instruction::I64Load(memarg(0)));
+    func.instruction(&Instruction::LocalTee(1));
+
+    // If state == 0, initialize
+    func.instruction(&Instruction::I64Eqz);
+    func.instruction(&Instruction::If(BlockType::Empty));
+    func.instruction(&Instruction::I64Const(0x123456789ABCDEF0u64 as i64));
+    func.instruction(&Instruction::LocalSet(1));
+    func.instruction(&Instruction::End);
+
+    // xorshift64: state ^= state << 13
+    func.instruction(&Instruction::LocalGet(1));
+    func.instruction(&Instruction::LocalGet(1));
+    func.instruction(&Instruction::I64Const(13));
+    func.instruction(&Instruction::I64Shl);
+    func.instruction(&Instruction::I64Xor);
+    func.instruction(&Instruction::LocalSet(1));
+
+    // state ^= state >> 7
+    func.instruction(&Instruction::LocalGet(1));
+    func.instruction(&Instruction::LocalGet(1));
+    func.instruction(&Instruction::I64Const(7));
+    func.instruction(&Instruction::I64ShrU);
+    func.instruction(&Instruction::I64Xor);
+    func.instruction(&Instruction::LocalSet(1));
+
+    // state ^= state << 17
+    func.instruction(&Instruction::LocalGet(1));
+    func.instruction(&Instruction::LocalGet(1));
+    func.instruction(&Instruction::I64Const(17));
+    func.instruction(&Instruction::I64Shl);
+    func.instruction(&Instruction::I64Xor);
+    func.instruction(&Instruction::LocalSet(1));
+
+    // Store state back
+    func.instruction(&Instruction::I32Const(SHADOW_STACK_START as i32));
+    func.instruction(&Instruction::LocalGet(1));
+    func.instruction(&Instruction::I64Store(memarg(0)));
+
+    // Return (state % max) — ensure positive
+    func.instruction(&Instruction::LocalGet(1));
+    // Make positive: mask off sign bit
+    func.instruction(&Instruction::I64Const(0x7FFFFFFFFFFFFFFFu64 as i64));
+    func.instruction(&Instruction::I64And);
+    func.instruction(&Instruction::LocalGet(0)); // max
+    func.instruction(&Instruction::I64RemU);
 
     func.instruction(&Instruction::End);
 }

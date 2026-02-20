@@ -19,11 +19,13 @@ use weir_ast::{ExprId, Item};
 use weir_typeck::Ty;
 use weir_typeck::TypeCheckResult;
 
+use weir_ast::tco;
+
 use runtime::{
     emit_gc_alloc, emit_gc_str_alloc, emit_gc_str_dup, emit_gc_vec_alloc, emit_i64_to_str,
-    emit_noop, emit_shadow_pop, emit_shadow_push, emit_str_concat, emit_str_eq,
-    emit_string_length, emit_vec_get, emit_vec_len, emit_vec_set, GC_HEAP_START, INITIAL_PAGES,
-    JS_IMPORTS,
+    emit_noop, emit_random_int, emit_random_seed, emit_shadow_pop, emit_shadow_push,
+    emit_str_concat, emit_str_eq, emit_string_length, emit_vec_append, emit_vec_get, emit_vec_len,
+    emit_vec_set, emit_vec_set_nth, GC_HEAP_START, INITIAL_PAGES, JS_IMPORTS,
 };
 use types::{ty_to_wasm, wasm_val_size, TaggedAdt};
 
@@ -136,8 +138,44 @@ const RUNTIME_FNS: &[RuntimeFn] = &[
         name: "weir_i64_to_str",
         params: &[ValType::I64],
         results: &[ValType::I32],
-        extra_locals: &[],
+        extra_locals: &[
+            ValType::I32, // buf
+            ValType::I32, // pos
+            ValType::I32, // is_neg
+            ValType::I64, // digit
+            ValType::I32, // dst
+            ValType::I32, // len
+            ValType::I32, // i
+        ],
         emitter: emit_i64_to_str,
+    },
+    RuntimeFn {
+        name: "weir_vec_set_nth",
+        params: &[ValType::I32, ValType::I64, ValType::I64],
+        results: &[ValType::I32],
+        extra_locals: &[ValType::I64, ValType::I32, ValType::I64],
+        emitter: emit_vec_set_nth,
+    },
+    RuntimeFn {
+        name: "weir_vec_append",
+        params: &[ValType::I32, ValType::I64],
+        results: &[ValType::I32],
+        extra_locals: &[ValType::I64, ValType::I32, ValType::I64],
+        emitter: emit_vec_append,
+    },
+    RuntimeFn {
+        name: "weir_random_seed",
+        params: &[ValType::I64],
+        results: &[],
+        extra_locals: &[],
+        emitter: emit_random_seed,
+    },
+    RuntimeFn {
+        name: "weir_random_int",
+        params: &[ValType::I64],
+        results: &[ValType::I64],
+        extra_locals: &[ValType::I64],
+        emitter: emit_random_int,
     },
     RuntimeFn {
         name: "weir_shadow_push",
@@ -179,6 +217,11 @@ pub struct WasmCompiler<'a> {
     locals: HashMap<SmolStr, u32>,
     next_local: u32,
     local_types: Vec<ValType>,
+
+    // TCO (tail call optimization) state
+    current_fn_name: Option<SmolStr>,
+    tail_positions: HashSet<ExprId>,
+    tco_block_depth: u32,
 
     // String interning
     string_data: Vec<u8>,
@@ -234,6 +277,9 @@ impl<'a> WasmCompiler<'a> {
             locals: HashMap::new(),
             next_local: 0,
             local_types: Vec::new(),
+            current_fn_name: None,
+            tail_positions: HashSet::new(),
+            tco_block_depth: 0,
             string_data: Vec::new(),
             string_offsets: HashMap::new(),
             data_offset: runtime::STATIC_DATA_START,
@@ -558,48 +604,91 @@ impl<'a> WasmCompiler<'a> {
                     )
                 });
 
-                // Helper: set up parameter locals
-                let setup_params = |compiler: &mut Self| {
+                // Detect TCO: check if this function has self-tail-calls
+                let tail_positions = tco::mark_tail_positions(&d.body, &self.ast_module.exprs);
+                let needs_tco = tco::has_self_tail_calls(&d.body, &d.name, &self.ast_module.exprs);
+
+                // Helper: set up parameter locals and TCO state
+                let setup = |compiler: &mut Self| {
                     compiler.reset_locals();
                     for (i, param) in d.params.iter().enumerate() {
                         compiler.locals.insert(param.name.clone(), i as u32);
                     }
                     compiler.next_local = param_count;
+                    if needs_tco {
+                        compiler.current_fn_name = Some(d.name.clone());
+                        compiler.tail_positions = tail_positions.clone();
+                        compiler.tco_block_depth = 0;
+                    } else {
+                        compiler.current_fn_name = None;
+                        compiler.tail_positions.clear();
+                        compiler.tco_block_depth = 0;
+                    }
                 };
 
                 // Pass 1: discover locals
-                setup_params(&mut self);
+                setup(&mut self);
                 let mut dummy = wasm_encoder::Function::new(vec![]);
                 self.compile_body(&body, &mut dummy);
 
                 // Capture the extra locals discovered
-                let extra_locals: Vec<(u32, ValType)> = if self.local_types.len() > param_count as usize {
-                    self.local_types[param_count as usize..]
-                        .iter()
-                        .map(|vt| (1, *vt))
-                        .collect()
-                } else {
-                    vec![]
-                };
+                // Note: local_types does NOT include params (they're implicit),
+                // so we use all entries — each one corresponds to a local beyond
+                // the param_count offset.
+                let extra_locals: Vec<(u32, ValType)> = self.local_types
+                    .iter()
+                    .map(|vt| (1, *vt))
+                    .collect();
 
                 // Pass 2: compile for real with locals declared
-                setup_params(&mut self);
+                setup(&mut self);
                 let mut func = wasm_encoder::Function::new(extra_locals);
-                let result_wt = self.compile_body(&body, &mut func);
 
-                // Fixup return value
-                if let (Some(expected), None) = (expected_result, result_wt) {
-                    match expected {
-                        ValType::I32 => { func.instruction(&wasm_encoder::Instruction::I32Const(0)); }
-                        ValType::I64 => { func.instruction(&wasm_encoder::Instruction::I64Const(0)); }
-                        ValType::F32 => { func.instruction(&wasm_encoder::Instruction::F32Const(0.0)); }
-                        ValType::F64 => { func.instruction(&wasm_encoder::Instruction::F64Const(0.0)); }
-                        _ => {}
+                if needs_tco {
+                    // Wrap body in a loop for tail-call optimization
+                    let block_ty = match expected_result {
+                        Some(vt) => wasm_encoder::BlockType::Result(vt),
+                        None => wasm_encoder::BlockType::Empty,
+                    };
+                    func.instruction(&wasm_encoder::Instruction::Loop(block_ty));
+                    self.tco_block_depth = 0;
+                    let result_wt = self.compile_body(&body, &mut func);
+
+                    // If the body fell through (no tail jump on all paths),
+                    // provide a result for the loop block
+                    if let (Some(expected), None) = (expected_result, result_wt) {
+                        match expected {
+                            ValType::I32 => { func.instruction(&wasm_encoder::Instruction::I32Const(0)); }
+                            ValType::I64 => { func.instruction(&wasm_encoder::Instruction::I64Const(0)); }
+                            ValType::F32 => { func.instruction(&wasm_encoder::Instruction::F32Const(0.0)); }
+                            ValType::F64 => { func.instruction(&wasm_encoder::Instruction::F64Const(0.0)); }
+                            _ => {}
+                        }
+                    } else if expected_result.is_none() && result_wt.is_some() {
+                        func.instruction(&wasm_encoder::Instruction::Drop);
                     }
-                } else if expected_result.is_none() && result_wt.is_some() {
-                    func.instruction(&wasm_encoder::Instruction::Drop);
+                    func.instruction(&wasm_encoder::Instruction::End); // end loop
+                } else {
+                    let result_wt = self.compile_body(&body, &mut func);
+
+                    // Fixup return value
+                    if let (Some(expected), None) = (expected_result, result_wt) {
+                        match expected {
+                            ValType::I32 => { func.instruction(&wasm_encoder::Instruction::I32Const(0)); }
+                            ValType::I64 => { func.instruction(&wasm_encoder::Instruction::I64Const(0)); }
+                            ValType::F32 => { func.instruction(&wasm_encoder::Instruction::F32Const(0.0)); }
+                            ValType::F64 => { func.instruction(&wasm_encoder::Instruction::F64Const(0.0)); }
+                            _ => {}
+                        }
+                    } else if expected_result.is_none() && result_wt.is_some() {
+                        func.instruction(&wasm_encoder::Instruction::Drop);
+                    }
                 }
-                func.instruction(&wasm_encoder::Instruction::End);
+                func.instruction(&wasm_encoder::Instruction::End); // end function
+
+                // Clear TCO state
+                self.current_fn_name = None;
+                self.tail_positions.clear();
 
                 code.function(&func);
             } else {
@@ -777,6 +866,25 @@ mod tests {
         match validator.validate_all(&wasm_bytes) {
             Ok(_) => {}
             Err(e) => {
+                // Dump function bodies with byte ranges to identify the error location
+                let mut fn_idx = 0;
+                for payload in wasmparser::Parser::new(0).parse_all(&wasm_bytes) {
+                    if let Ok(wasmparser::Payload::CodeSectionEntry(body)) = payload {
+                        let range = body.range();
+                        let reader = body.get_operators_reader().unwrap();
+                        let ops: Vec<_> = reader.into_iter().collect();
+                        if e.offset() >= range.start && e.offset() <= range.end {
+                            eprintln!("--- func {} ({} ops, bytes {:#x}..{:#x}) ** ERROR HERE ** ---",
+                                fn_idx, ops.len(), range.start, range.end);
+                            for (i, op) in ops.iter().enumerate() {
+                                if let Ok(op) = op {
+                                    eprintln!("  [{:3}] {:?}", i, op);
+                                }
+                            }
+                        }
+                        fn_idx += 1;
+                    }
+                }
                 panic!("WASM validation failed: {} (offset: {:?})", e, e.offset());
             }
         }
@@ -833,6 +941,154 @@ mod tests {
     }
 
     #[test]
+    fn struct_construction_validates() {
+        // Start simple: single-field struct, inline construction
+        compile_and_validate(r#"
+            (defstruct Point (x : i64))
+            (defn main () : Unit
+              (let ((p (Point 42)))
+                (println (.x p))))
+        "#);
+    }
+
+    #[test]
+    fn struct_two_fields_no_access_validates() {
+        compile_and_validate(r#"
+            (defstruct Point (x : i64) (y : i64))
+            (defn main () : Unit
+              (let ((p (Point 10 20)))
+                (println 0)))
+        "#);
+    }
+
+    #[test]
+    fn struct_two_fields_with_access_validates() {
+        compile_and_validate(r#"
+            (defstruct Point (x : i64) (y : i64))
+            (defn main () : Unit
+              (let ((p (Point 10 20)))
+                (println (.x p))))
+        "#);
+    }
+
+    #[test]
+    fn struct_two_fields_with_fn_validates() {
+        compile_and_validate(r#"
+            (defstruct Point (x : i64) (y : i64))
+            (defn make-point ((x : i64) (y : i64)) : Point
+              (Point x y))
+            (defn main () : Unit
+              (let ((p (make-point 10 20)))
+                (println 0)))
+        "#);
+    }
+
+    #[test]
+    fn struct_with_many_fields_validates() {
+        compile_and_validate(r#"
+            (defstruct GameState
+              (score : i64)
+              (level : i64)
+              (lines : i64)
+              (game-over : i64))
+            (defn make-state () : GameState
+              (GameState 0 1 0 0))
+            (defn add-score ((state : GameState) (pts : i64)) : GameState
+              (GameState
+                (+ (.score state) pts)
+                (.level state)
+                (.lines state)
+                (.game-over state)))
+            (defn main () : Unit
+              (let ((s (make-state))
+                    (s2 (add-score s 100)))
+                (println (.score s2))))
+        "#);
+    }
+
+    #[test]
+    fn vector_builtins_validate() {
+        compile_and_validate(r#"
+            (defn main () : Unit
+              (let ((v [10 20 30 40 50])
+                    (x (nth v 2))
+                    (v2 (set-nth v 1 99))
+                    (v3 (append v 60))
+                    (len (length v)))
+                (println x)
+                (println len)))
+        "#);
+    }
+
+    #[test]
+    fn math_builtins_validate() {
+        compile_and_validate(r#"
+            (defn main () : Unit
+              (let ((a (mod 17 5))
+                    (b (min 3 7))
+                    (c (max 3 7))
+                    (d (random-int 10)))
+                (random-seed 42)
+                (println a)
+                (println b)
+                (println c)
+                (println d)))
+        "#);
+    }
+
+    #[test]
+    fn str_multi_arg_validates() {
+        compile_and_validate(r#"
+            (defn main () : Unit
+              (let ((s (str "Score: " 42))
+                    (s2 (str "" 100))
+                    (s3 (str "Level " 5 " Lines " 20)))
+                (println s)
+                (println s2)
+                (println s3)))
+        "#);
+    }
+
+    #[test]
+    fn mini_tetris_validates() {
+        // A mini version of Tetris patterns to validate struct + vector + builtins together
+        compile_and_validate(r#"
+            (defstruct GameState
+              (board : (Vector i64))
+              (piece : i64)
+              (score : i64)
+              (level : i64)
+              (lines : i64)
+              (game-over : i64))
+
+            (defn make-row ((v : (Vector i64)) (i : i64) (n : i64)) : (Vector i64)
+              (if (= i n) v (make-row (append v 0) (+ i 1) n)))
+
+            (defn make-empty-board () : (Vector i64) (make-row [] 0 100))
+
+            (defn board-get ((board : (Vector i64)) (row : i64) (col : i64)) : i64
+              (nth board (+ (* row 10) col)))
+
+            (defn board-set ((board : (Vector i64)) (row : i64) (col : i64) (val : i64)) : (Vector i64)
+              (set-nth board (+ (* row 10) col) val))
+
+            (defn drop-speed ((level : i64)) : i64
+              (let ((speed (- 500 (* (min level 10) 40)))) (max speed 100)))
+
+            (defn main () : Unit
+              (random-seed 42)
+              (let ((board (make-empty-board))
+                    (state (GameState board (random-int 7) 0 1 0 0))
+                    (b2 (board-set (.board state) 0 0 1))
+                    (val (board-get b2 0 0))
+                    (speed (drop-speed (.level state))))
+                (println (str "Score: " (.score state)))
+                (println (str "Value: " val))
+                (println (str "Speed: " speed))))
+        "#);
+    }
+
+    #[test]
     fn many_instances_validates() {
         compile_and_validate(r#"
             (deftype Ordering LT EQ GT)
@@ -859,5 +1115,99 @@ mod tests {
             (defn main () : Unit
               (println "ok"))
         "#);
+    }
+
+    #[test]
+    fn tco_simple_countdown_validates() {
+        // Simple tail-recursive countdown
+        compile_and_validate(r#"
+            (defn countdown ((n : i64)) : i64
+              (if (= n 0) 0 (countdown (- n 1))))
+            (defn main () : Unit
+              (println (countdown 100)))
+        "#);
+    }
+
+    #[test]
+    fn tco_accumulator_validates() {
+        // Tail-recursive sum with accumulator
+        compile_and_validate(r#"
+            (defn sum-to ((n : i64) (acc : i64)) : i64
+              (if (= n 0) acc (sum-to (- n 1) (+ acc n))))
+            (defn main () : Unit
+              (println (sum-to 100 0)))
+        "#);
+    }
+
+    #[test]
+    fn tco_nested_if_validates() {
+        // TCO with nested if (like Tetris's row-full pattern)
+        compile_and_validate(r#"
+            (defn row-full ((board : (Vector i64)) (col : i64)) : i64
+              (if (= col 10)
+                1
+                (if (= (nth board col) 0) 0 (row-full board (+ col 1)))))
+            (defn main () : Unit
+              (let ((v [1 2 3 4 5 6 7 8 9 10]))
+                (println (row-full v 0))))
+        "#);
+    }
+
+    #[test]
+    fn tco_with_let_validates() {
+        // TCO inside a let body
+        compile_and_validate(r#"
+            (defn make-row ((v : (Vector i64)) (i : i64) (n : i64)) : (Vector i64)
+              (if (= i n) v (make-row (append v 0) (+ i 1) n)))
+            (defn main () : Unit
+              (let ((row (make-row [] 0 10)))
+                (println (nth row 0))))
+        "#);
+    }
+
+    #[test]
+    fn tetris_full_validates() {
+        // End-to-end: compile the full Tetris demo and validate the WASM binary
+        let prelude = include_str!("../../../std/prelude.weir");
+        let opengl_lib = include_str!("/home/nathan/dev/weir-opengl/lib.weir");
+        let tetris_src = include_str!("../../../demos/tetris/tetris.weir");
+        let full = format!("{}\n{}\n{}", prelude, opengl_lib, tetris_src);
+
+        let expanded = weir_macros::expand_for_target(&full, Some(weir_ast::CompileTarget::Wasm));
+        assert!(expanded.errors.is_empty(), "expand errors: {:?}", expanded.errors);
+        let (module, parse_errors) = weir_parser::parse(&expanded.source);
+        assert!(parse_errors.is_empty(), "parse errors: {:?}", parse_errors);
+
+        let type_info = weir_typeck::check(&module);
+        // Allow type errors from import resolution (we just want WASM validation)
+        let wasm_bytes = compile_to_wasm(&module, &type_info).expect("WASM compilation failed");
+
+        let mut validator = wasmparser::Validator::new();
+        if let Err(e) = validator.validate_all(&wasm_bytes) {
+            // Dump error location
+            let mut fn_idx = 0;
+            for payload in wasmparser::Parser::new(0).parse_all(&wasm_bytes) {
+                if let Ok(wasmparser::Payload::CodeSectionEntry(body)) = payload {
+                    let range = body.range();
+                    if e.offset() >= range.start && e.offset() <= range.end {
+                        let reader = body.get_operators_reader().unwrap();
+                        let ops: Vec<_> = reader.into_iter().collect();
+                        eprintln!("--- func {} ({} ops, bytes {:#x}..{:#x}) ** ERROR ** ---",
+                            fn_idx, ops.len(), range.start, range.end);
+                        for (i, op) in ops.iter().enumerate() {
+                            if let Ok(op) = op {
+                                eprintln!("  [{:3}] {:?}", i, op);
+                            }
+                        }
+                    }
+                    fn_idx += 1;
+                }
+            }
+            panic!("Tetris WASM validation failed: {} (offset: {:?})", e, e.offset());
+        }
+
+        // Basic sanity checks
+        assert!(wasm_bytes.len() > 5000, "WASM binary too small: {} bytes", wasm_bytes.len());
+        assert_eq!(&wasm_bytes[..4], b"\x00asm", "Missing WASM magic header");
     }
 }

@@ -92,7 +92,16 @@ fn read_file(file: &std::path::Path) -> String {
 /// Run macro expansion on source, returning the expanded source string.
 /// Exits on expansion errors.
 fn expand_source(source: &str, file: &std::path::Path) -> String {
-    let result = weir_macros::expand(source);
+    expand_source_for_target(source, file, None)
+}
+
+/// Run macro expansion with an optional compile target for resolving `(target ...)` forms.
+fn expand_source_for_target(
+    source: &str,
+    file: &std::path::Path,
+    target: Option<weir_macros::CompileTarget>,
+) -> String {
+    let result = weir_macros::expand_for_target(source, target);
     if !result.errors.is_empty() {
         for error in &result.errors {
             eprintln!(
@@ -134,7 +143,7 @@ struct PackageSource {
 /// 4. Validate imports
 /// 5. Concatenate: prelude + dep sources (topo order) + entry source
 /// 6. Return the expanded concatenated source
-fn resolve_and_concatenate() -> PackageSource {
+fn resolve_and_concatenate_for_target(target: Option<weir_macros::CompileTarget>) -> PackageSource {
     let manifest_path = Path::new("weir.pkg");
     if !manifest_path.exists() {
         eprintln!("error: no weir.pkg manifest found in current directory");
@@ -169,7 +178,7 @@ fn resolve_and_concatenate() -> PackageSource {
         };
 
         // Expand macros on each module individually (without prelude — prelude is prepended once)
-        let expand_result = weir_macros::expand(&source);
+        let expand_result = weir_macros::expand_for_target(&source, target);
         if !expand_result.errors.is_empty() {
             for error in &expand_result.errors {
                 eprintln!(
@@ -384,7 +393,7 @@ fn main() {
                 run_jit(&expanded, &file);
             } else {
                 // Package mode
-                let pkg = resolve_and_concatenate();
+                let pkg = resolve_and_concatenate_for_target(None);
                 load_native_sources(&pkg.native_sources, &pkg.link_libs);
                 run_jit(&pkg.expanded_source, &pkg.display_path);
             }
@@ -406,7 +415,7 @@ fn main() {
                 build_binary(&expanded, &file, &output_path, &cc_args, &link_flags);
             } else {
                 // Package mode
-                let pkg = resolve_and_concatenate();
+                let pkg = resolve_and_concatenate_for_target(None);
                 let output_path = output.unwrap_or_else(|| PathBuf::from(&pkg.package_name));
 
                 let mut all_cc_args = cc_args;
@@ -438,7 +447,7 @@ fn main() {
                 run_dev(&expanded, &file);
             } else {
                 // Package mode
-                let pkg = resolve_and_concatenate();
+                let pkg = resolve_and_concatenate_for_target(None);
                 load_native_sources(&pkg.native_sources, &pkg.link_libs);
                 let watch_path = pkg
                     .entry_path
@@ -487,12 +496,15 @@ fn main() {
             if let Some(file) = file {
                 // Single-file mode
                 let source = with_prelude(&read_file(&file));
-                let expanded = expand_source(&source, &file);
+                let expanded = expand_source_for_target(
+                    &source, &file, Some(weir_macros::CompileTarget::Wasm));
                 let output_dir = output.unwrap_or_else(|| PathBuf::from("web"));
                 build_wasm(&expanded, &file, &output_dir, &[]);
             } else {
-                // Package mode
-                let pkg = resolve_and_concatenate();
+                // Package mode — expand with WASM target to resolve (target ...) forms
+                let pkg = resolve_and_concatenate_for_target(
+                    Some(weir_macros::CompileTarget::Wasm),
+                );
                 let output_dir = output.unwrap_or_else(|| PathBuf::from("web"));
                 build_wasm(
                     &pkg.expanded_source,
@@ -760,8 +772,20 @@ fn build_wasm(
 
     let type_info = weir_typeck::check(&module);
 
-    if !type_info.errors.is_empty() {
-        for error in &type_info.errors {
+    // Filter out errors for WASM-only builtins that the type checker doesn't know about
+    let wasm_builtins = ["wasm-get-state", "wasm-set-state"];
+    let real_errors: Vec<_> = type_info
+        .errors
+        .iter()
+        .filter(|e| {
+            !wasm_builtins
+                .iter()
+                .any(|b| e.message.contains(b))
+        })
+        .collect();
+
+    if !real_errors.is_empty() {
+        for error in &real_errors {
             eprintln!(
                 "{}:{}:{}: type error: {}",
                 display_path.display(),

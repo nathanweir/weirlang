@@ -541,50 +541,81 @@
     ;; Game over overlay
     (if (= (.game-over state) 1) (draw-game-over state))))
 
-;; ── Game loop ───────────────────────────────────────────────────────
+;; ── Game loop (native) ──────────────────────────────────────────────
 
-(defn game-loop ((state : GameState)) : Unit
-  (if (= (unsafe (gl_should_close)) 1)
-    (unsafe (gl_cleanup))
-    (do (unsafe (gl_begin_frame))
-      (let ((s1 (handle-input state))
-        (s2 (maybe-drop s1))
-        ;; Quit on Q or Escape
-        (quit
-          (if (= (unsafe (gl_get_key_pressed (key-q))) 1)
-            1
-            (if (= (unsafe (gl_get_key_pressed (key-escape))) 1) 1 0))))
-        (render s2)
-        ;; Auto-screenshot on frame 2 (after render, before swap)
-        (if (= (.frame s2) 2)
-          (let ((_ (unsafe (gl_screenshot "tmp/tetris_screenshot.bmp"))))
-            (print "")))
-        (unsafe (gl_end_frame))
-        (if (= quit 1)
-          (unsafe (gl_cleanup))
-          (game-loop
+(target
+  (:native
+    (defn game-loop ((state : GameState)) : Unit
+      (if (= (unsafe (gl_should_close)) 1)
+        (unsafe (gl_cleanup))
+        (do (unsafe (gl_begin_frame))
+          (let ((s1 (handle-input state))
+            (s2 (maybe-drop s1))
+            ;; Quit on Q or Escape
+            (quit
+              (if (= (unsafe (gl_get_key_pressed (key-q))) 1)
+                1
+                (if (= (unsafe (gl_get_key_pressed (key-escape))) 1) 1 0))))
+            (render s2)
+            ;; Auto-screenshot on frame 2 (after render, before swap)
+            (if (= (.frame s2) 2)
+              (let ((_ (unsafe (gl_screenshot "tmp/tetris_screenshot.bmp"))))
+                (print "")))
+            (unsafe (gl_end_frame))
+            (if (= quit 1)
+              (unsafe (gl_cleanup))
+              (game-loop
+                (GameState
+                  (.board s2)
+                  (.piece s2)
+                  (.rotation s2)
+                  (.piece-x s2)
+                  (.piece-y s2)
+                  (.next-p s2)
+                  (.score s2)
+                  (.level s2)
+                  (.lines s2)
+                  (.drop-time s2)
+                  (.game-over s2)
+                  (+ (.frame s2) 1)))))))))
+
+  (:wasm
+    ;; WASM: one-frame step function driven by requestAnimationFrame
+    (defn weir-frame () : Unit
+      (let ((state-ptr (wasm-get-state)))
+        ;; state-ptr is the I32 pointer to the GameState struct in linear memory
+        ;; We just process one frame of the game loop
+        (unsafe (gl_begin_frame))
+        (let ((s1 (handle-input state-ptr))
+          (s2 (maybe-drop s1)))
+          (render s2)
+          (unsafe (gl_end_frame))
+          (wasm-set-state
             (GameState
-              (.board s2)
-              (.piece s2)
-              (.rotation s2)
-              (.piece-x s2)
-              (.piece-y s2)
-              (.next-p s2)
-              (.score s2)
-              (.level s2)
-              (.lines s2)
-              (.drop-time s2)
-              (.game-over s2)
+              (.board s2) (.piece s2) (.rotation s2)
+              (.piece-x s2) (.piece-y s2) (.next-p s2)
+              (.score s2) (.level s2) (.lines s2)
+              (.drop-time s2) (.game-over s2)
               (+ (.frame s2) 1))))))))
 
 ;; ── Main ────────────────────────────────────────────────────────────
 
-(defn main ()
-  (unsafe (gl_init 920 1280 "Weir Tetris"))
-  (random-seed (unsafe (gl_time_ms)))
+(defn init-state () : GameState
   (let ((board (make-empty-board))
     (first-piece (random-int 7))
     (next-piece (random-int 7))
     (now (unsafe (gl_time_ms)))
     (state (GameState board first-piece 0 3 0 next-piece 0 1 0 now 0 0)))
-    (game-loop (spawn-piece state))))
+    (spawn-piece state)))
+
+(target
+  (:native
+    (defn main ()
+      (unsafe (gl_init 920 1280 "Weir Tetris"))
+      (random-seed (unsafe (gl_time_ms)))
+      (game-loop (init-state))))
+  (:wasm
+    (defn main ()
+      (unsafe (gl_init 920 1280 "Weir Tetris"))
+      (random-seed (unsafe (gl_time_ms)))
+      (wasm-set-state (init-state)))))
