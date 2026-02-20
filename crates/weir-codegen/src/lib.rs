@@ -4693,7 +4693,7 @@ mod tests {
 
         let tmp_dir = std::env::temp_dir();
         let binary_path = tmp_dir.join("weir_test_aot");
-        build_executable(&module, &type_info, &binary_path, &[]).expect("build_executable failed");
+        build_executable(&module, &type_info, &binary_path, &[], &[]).expect("build_executable failed");
 
         let output = std::process::Command::new(&binary_path)
             .output()
@@ -4723,7 +4723,7 @@ mod tests {
 
         let tmp_dir = std::env::temp_dir();
         let binary_path = tmp_dir.join("weir_test_aot_factorial");
-        build_executable(&module, &type_info, &binary_path, &[]).expect("build_executable failed");
+        build_executable(&module, &type_info, &binary_path, &[], &[]).expect("build_executable failed");
         let output = std::process::Command::new(&binary_path)
             .output()
             .expect("failed to run AOT binary");
@@ -4750,7 +4750,7 @@ mod tests {
 
         let tmp_dir = std::env::temp_dir();
         let binary_path = tmp_dir.join(format!("weir_test_aot_{}", name));
-        build_executable(&module, &type_info, &binary_path, &[]).expect("build_executable failed");
+        build_executable(&module, &type_info, &binary_path, &[], &[]).expect("build_executable failed");
         let output = std::process::Command::new(&binary_path)
             .output()
             .expect("failed to run AOT binary");
@@ -6237,7 +6237,7 @@ mod tests {
 
         let tmp_dir = std::env::temp_dir();
         let binary_path = tmp_dir.join("weir_test_aot_arena");
-        build_executable(&module, &type_info, &binary_path, &[]).expect("build_executable failed");
+        build_executable(&module, &type_info, &binary_path, &[], &[]).expect("build_executable failed");
         let output = std::process::Command::new(&binary_path)
             .output()
             .expect("failed to run AOT binary");
@@ -6327,7 +6327,7 @@ mod tests {
 
         let tmp_dir = std::env::temp_dir();
         let binary_path = tmp_dir.join("weir_test_aot_atom");
-        build_executable(&module, &type_info, &binary_path, &[]).expect("build_executable failed");
+        build_executable(&module, &type_info, &binary_path, &[], &[]).expect("build_executable failed");
         let output = std::process::Command::new(&binary_path)
             .output()
             .expect("failed to run AOT binary");

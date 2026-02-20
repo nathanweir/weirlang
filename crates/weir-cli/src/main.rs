@@ -24,6 +24,9 @@ enum Command {
     Run {
         /// Path to the .weir source file
         file: PathBuf,
+        /// Pre-load a shared library before JIT (makes symbols available via dlsym)
+        #[arg(long = "load")]
+        load: Vec<PathBuf>,
     },
     /// Run a .weir file via the tree-walking interpreter
     Interp {
@@ -45,6 +48,9 @@ enum Command {
         /// Link against a C library (e.g. -l glfw3 -l GL)
         #[arg(short = 'l', long = "link")]
         link: Vec<String>,
+        /// Pass raw arguments to the C compiler (e.g. --cc-arg libs/helper.c)
+        #[arg(long = "cc-arg")]
+        cc_args: Vec<String>,
     },
     /// Run a .weir file with live reload — watches for changes and hot-swaps functions
     Dev {
@@ -154,7 +160,22 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Command::Run { file } => {
+        Command::Run { file, load } => {
+            // Pre-load shared libraries so their symbols are available via dlsym
+            for lib_path in &load {
+                let c_path = std::ffi::CString::new(
+                    lib_path.to_str().unwrap_or_default()
+                ).unwrap();
+                let handle = unsafe {
+                    libc::dlopen(c_path.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL)
+                };
+                if handle.is_null() {
+                    let err = unsafe { std::ffi::CStr::from_ptr(libc::dlerror()) };
+                    eprintln!("error: could not load {}: {}", lib_path.display(), err.to_string_lossy());
+                    std::process::exit(1);
+                }
+            }
+
             let source = with_prelude(&read_file(&file));
             let expanded = expand_source(&source, &file);
 
@@ -197,7 +218,7 @@ fn main() {
                 }
             }
         }
-        Command::Build { file, output, link } => {
+        Command::Build { file, output, link, cc_args } => {
             let source = with_prelude(&read_file(&file));
             let expanded = expand_source(&source, &file);
 
@@ -236,7 +257,7 @@ fn main() {
 
             let link_flags: Vec<String> = link.iter().map(|l| format!("-l{}", l)).collect();
 
-            match weir_codegen::build_executable(&module, &type_info, &output_path, &link_flags) {
+            match weir_codegen::build_executable(&module, &type_info, &output_path, &cc_args, &link_flags) {
                 Ok(()) => {}
                 Err(e) => {
                     eprintln!("{}: build error: {}", file.display(), e);

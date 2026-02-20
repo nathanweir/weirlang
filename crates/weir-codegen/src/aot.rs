@@ -553,6 +553,7 @@ pub fn build_executable(
     module: &weir_ast::Module,
     type_info: &weir_typeck::TypeCheckResult,
     output_path: &Path,
+    cc_args: &[String],
     link_flags: &[String],
 ) -> Result<(), CodegenError> {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -579,8 +580,11 @@ pub fn build_executable(
         .arg("-o")
         .arg(output_path)
         .arg(&obj_path)
-        .arg(&runtime_path)
-        .arg("-lm");
+        .arg(&runtime_path);
+    for arg in cc_args {
+        cc_cmd.arg(arg);
+    }
+    cc_cmd.arg("-lm");
     for flag in link_flags {
         cc_cmd.arg(flag);
     }

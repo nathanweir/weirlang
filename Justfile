@@ -49,3 +49,15 @@ ts-generate:
 # Run tree-sitter test corpus
 ts-test:
     cd tree-sitter-weir && tree-sitter test
+
+# Build the OpenGL Tetris demo
+tetris-build:
+    cargo run --bin weir -- build demos/tetris_gl.weir -o tmp/tetris_gl --cc-arg libs/gl_helper.c -l glfw -l GL -l m
+
+# Run the OpenGL Tetris demo
+tetris: tetris-build
+    ./tmp/tetris_gl
+
+# Convert a BMP screenshot to PNG for viewing (usage: just screenshot tmp/tetris_screenshot.bmp)
+screenshot file:
+    convert {{ file }} -resize 50% {{ without_extension(file) }}.png && echo "Wrote {{ without_extension(file) }}.png"

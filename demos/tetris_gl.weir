@@ -1,0 +1,471 @@
+;; ── OpenGL Tetris ────────────────────────────────────────────────────
+;;
+;; Graphical Tetris demo using GLFW + OpenGL via Weir's CFFI.
+;; Renders in a 400x640 window with 30px cells and a sidebar.
+;;
+;; Controls:
+;;   Arrow keys  — move / rotate / soft-drop
+;;   Space       — hard drop
+;;   Q / Escape  — quit
+
+;; ── CFFI: GL helper bindings ────────────────────────────────────────
+
+(extern "C"
+  (defn gl_init ((w : i64) (h : i64) (title : String)) : i64)
+  (defn gl_should_close () : i64)
+  (defn gl_begin_frame () : Unit)
+  (defn gl_end_frame () : Unit)
+  (defn gl_draw_rect ((x : i64) (y : i64) (w : i64) (h : i64) (color : i64)) : Unit)
+  (defn gl_draw_text ((x : i64) (y : i64) (text : String) (color : i64)) : Unit)
+  (defn gl_get_key_pressed ((key : i64)) : i64)
+  (defn gl_time_ms () : i64)
+  (defn gl_screenshot ((path : String)) : i64)
+  (defn gl_cleanup () : Unit))
+
+;; ── GLFW key codes ──────────────────────────────────────────────────
+
+(defn key-left    () : i64 263)
+(defn key-right   () : i64 262)
+(defn key-up      () : i64 265)
+(defn key-down    () : i64 264)
+(defn key-space   () : i64 32)
+(defn key-q       () : i64 81)
+(defn key-escape  () : i64 256)
+
+;; ── Layout constants ────────────────────────────────────────────────
+
+(defn cell-size   () : i64 60)
+(defn board-left  () : i64 20)
+(defn board-top   () : i64 80)
+(defn sidebar-x   () : i64 650)
+
+;; ── Board constants ─────────────────────────────────────────────────
+
+(defn board-width  () : i64 10)
+(defn board-height () : i64 20)
+(defn board-size   () : i64 200)
+
+;; ── Game state ──────────────────────────────────────────────────────
+
+(defstruct GameState
+  (board     : (Vector i64))
+  (piece     : i64)
+  (rotation  : i64)
+  (piece-x   : i64)
+  (piece-y   : i64)
+  (next-p    : i64)
+  (score     : i64)
+  (level     : i64)
+  (lines     : i64)
+  (drop-time : i64)
+  (game-over : i64)
+  (frame     : i64))
+
+;; ── Piece definitions ───────────────────────────────────────────────
+
+(defn i-piece () : (Vector (Vector i64))
+  [[0 0 0 1 0 2 0 3]
+   [0 0 1 0 2 0 3 0]
+   [0 0 0 1 0 2 0 3]
+   [0 0 1 0 2 0 3 0]])
+
+(defn o-piece () : (Vector (Vector i64))
+  [[0 0 0 1 1 0 1 1]
+   [0 0 0 1 1 0 1 1]
+   [0 0 0 1 1 0 1 1]
+   [0 0 0 1 1 0 1 1]])
+
+(defn t-piece () : (Vector (Vector i64))
+  [[0 0 0 1 0 2 1 1]
+   [0 0 1 0 2 0 1 1]
+   [1 0 1 1 1 2 0 1]
+   [0 0 1 0 2 0 1 (- 0 1)]])
+
+(defn s-piece () : (Vector (Vector i64))
+  [[0 1 0 2 1 0 1 1]
+   [0 0 1 0 1 1 2 1]
+   [0 1 0 2 1 0 1 1]
+   [0 0 1 0 1 1 2 1]])
+
+(defn z-piece () : (Vector (Vector i64))
+  [[0 0 0 1 1 1 1 2]
+   [0 1 1 0 1 1 2 0]
+   [0 0 0 1 1 1 1 2]
+   [0 1 1 0 1 1 2 0]])
+
+(defn j-piece () : (Vector (Vector i64))
+  [[0 0 1 0 1 1 1 2]
+   [0 0 0 1 1 0 2 0]
+   [0 0 0 1 0 2 1 2]
+   [0 0 1 0 2 0 2 (- 0 1)]])
+
+(defn l-piece () : (Vector (Vector i64))
+  [[0 2 1 0 1 1 1 2]
+   [0 0 1 0 2 0 2 1]
+   [0 0 0 1 0 2 1 0]
+   [0 0 0 1 1 1 2 1]])
+
+(defn get-piece-rotations ((kind : i64)) : (Vector (Vector i64))
+  (cond
+    ((= kind 0) (i-piece))
+    ((= kind 1) (o-piece))
+    ((= kind 2) (t-piece))
+    ((= kind 3) (s-piece))
+    ((= kind 4) (z-piece))
+    ((= kind 5) (j-piece))
+    (else       (l-piece))))
+
+(defn piece-cells ((kind : i64) (rot : i64)) : (Vector i64)
+  (nth (get-piece-rotations kind) (mod rot 4)))
+
+;; ── Colors (0xRRGGBB) ──────────────────────────────────────────────
+
+(defn piece-color ((kind : i64)) : i64
+  (cond
+    ((= kind 0) 57053)    ;; 0x00DDDD cyan (I)
+    ((= kind 1) 14540032) ;; 0xDDDD00 yellow (O)
+    ((= kind 2) 14483677) ;; 0xDD00DD magenta (T)
+    ((= kind 3) 56576)    ;; 0x00DD00 green (S)
+    ((= kind 4) 14483456) ;; 0xDD0000 red (Z)
+    ((= kind 5) 221)      ;; 0x0000DD blue (J)
+    (else       14518272)));; 0xDD8800 orange (L)
+
+(defn empty-color () : i64 2763566)     ;; 0x2A2A2E
+(defn border-color () : i64 5592416)    ;; 0x555560
+(defn bg-color () : i64 1710111)        ;; 0x1A1A1F
+(defn text-color () : i64 13421772)     ;; 0xCCCCCC
+(defn title-color () : i64 16777215)    ;; 0xFFFFFF
+(defn dim-color () : i64 8947848)       ;; 0x888888
+(defn gameover-bg () : i64 3342336)     ;; 0x330000
+(defn gameover-text () : i64 16728132)  ;; 0xFF4444
+
+;; ── Board logic ─────────────────────────────────────────────────────
+
+(defn board-get ((board : (Vector i64)) (row : i64) (col : i64)) : i64
+  (nth board (+ (* row 10) col)))
+
+(defn board-set ((board : (Vector i64)) (row : i64) (col : i64) (val : i64)) : (Vector i64)
+  (set-nth board (+ (* row 10) col) val))
+
+(defn make-row ((v : (Vector i64)) (i : i64) (n : i64)) : (Vector i64)
+  (if (= i n) v
+    (make-row (append v 0) (+ i 1) n)))
+
+(defn make-empty-board () : (Vector i64)
+  (make-row [] 0 200))
+
+(defn cell-ok ((board : (Vector i64)) (row : i64) (col : i64)) : i64
+  (if (< col 0) 0
+    (if (>= col 10) 0
+      (if (< row 0) 0
+        (if (>= row 20) 0
+          (if (= (board-get board row col) 0) 1 0))))))
+
+(defn collides ((board : (Vector i64)) (cells : (Vector i64)) (px : i64) (py : i64)) : i64
+  (let ((r0 (+ py (nth cells 0)))
+        (c0 (+ px (nth cells 1)))
+        (r1 (+ py (nth cells 2)))
+        (c1 (+ px (nth cells 3)))
+        (r2 (+ py (nth cells 4)))
+        (c2 (+ px (nth cells 5)))
+        (r3 (+ py (nth cells 6)))
+        (c3 (+ px (nth cells 7))))
+    (if (= (cell-ok board r0 c0) 0) 1
+      (if (= (cell-ok board r1 c1) 0) 1
+        (if (= (cell-ok board r2 c2) 0) 1
+          (if (= (cell-ok board r3 c3) 0) 1
+            0))))))
+
+(defn lock-piece ((board : (Vector i64)) (cells : (Vector i64)) (px : i64) (py : i64) (color : i64)) : (Vector i64)
+  (let ((b1 (board-set board (+ py (nth cells 0)) (+ px (nth cells 1)) color))
+        (b2 (board-set b1    (+ py (nth cells 2)) (+ px (nth cells 3)) color))
+        (b3 (board-set b2    (+ py (nth cells 4)) (+ px (nth cells 5)) color))
+        (b4 (board-set b3    (+ py (nth cells 6)) (+ px (nth cells 7)) color)))
+    b4))
+
+;; ── Line clearing ───────────────────────────────────────────────────
+
+(defn row-full ((board : (Vector i64)) (row : i64) (col : i64)) : i64
+  (if (= col 10) 1
+    (if (= (board-get board row col) 0) 0
+      (row-full board row (+ col 1)))))
+
+(defn copy-row ((board : (Vector i64)) (src-row : i64) (dst-row : i64) (col : i64)) : (Vector i64)
+  (if (= col 10) board
+    (copy-row (board-set board dst-row col (board-get board src-row col))
+              src-row dst-row (+ col 1))))
+
+(defn clear-row ((board : (Vector i64)) (row : i64) (col : i64)) : (Vector i64)
+  (if (= col 10) board
+    (clear-row (board-set board row col 0) row (+ col 1))))
+
+(defn shift-rows-down ((board : (Vector i64)) (row : i64)) : (Vector i64)
+  (if (<= row 0)
+    (clear-row board 0 0)
+    (shift-rows-down (copy-row board (- row 1) row 0) (- row 1))))
+
+(defn clear-lines-helper ((board : (Vector i64)) (row : i64) (cleared : i64)) : (Vector i64)
+  (if (< row 0) board
+    (if (= (row-full board row 0) 1)
+      (clear-lines-helper (shift-rows-down board row) row (+ cleared 1))
+      (clear-lines-helper board (- row 1) cleared))))
+
+(defn count-full-rows ((board : (Vector i64)) (row : i64) (count : i64)) : i64
+  (if (< row 0) count
+    (if (= (row-full board row 0) 1)
+      (count-full-rows board (- row 1) (+ count 1))
+      (count-full-rows board (- row 1) count))))
+
+(defn clear-lines ((board : (Vector i64))) : (Vector i64)
+  (clear-lines-helper board 19 0))
+
+(defn count-cleared ((board : (Vector i64))) : i64
+  (count-full-rows board 19 0))
+
+;; ── Scoring ─────────────────────────────────────────────────────────
+
+(defn line-score ((n : i64) (level : i64)) : i64
+  (let ((base (cond
+                ((= n 1) 100)
+                ((= n 2) 300)
+                ((= n 3) 500)
+                ((= n 4) 800)
+                (else 0))))
+    (* base level)))
+
+(defn drop-speed ((level : i64)) : i64
+  (let ((speed (- 500 (* (min level 10) 40))))
+    (max speed 100)))
+
+;; ── Piece spawning ──────────────────────────────────────────────────
+
+(defn spawn-piece ((state : GameState)) : GameState
+  (let ((kind (.next-p state))
+        (cells (piece-cells kind 0))
+        (new-next (random-int 7))
+        (px 3)
+        (py 0))
+    (if (= (collides (.board state) cells px py) 1)
+      (GameState (.board state) kind 0 px py new-next
+                 (.score state) (.level state) (.lines state)
+                 (.drop-time state) 1 (.frame state))
+      (GameState (.board state) kind 0 px py new-next
+                 (.score state) (.level state) (.lines state)
+                 (.drop-time state) 0 (.frame state)))))
+
+;; ── Movement ────────────────────────────────────────────────────────
+
+(defn try-move ((state : GameState) (dx : i64) (dy : i64)) : GameState
+  (let ((new-x (+ (.piece-x state) dx))
+        (new-y (+ (.piece-y state) dy))
+        (cells (piece-cells (.piece state) (.rotation state))))
+    (if (= (collides (.board state) cells new-x new-y) 0)
+      (GameState (.board state) (.piece state) (.rotation state)
+                 new-x new-y (.next-p state)
+                 (.score state) (.level state) (.lines state)
+                 (.drop-time state) (.game-over state) (.frame state))
+      state)))
+
+(defn try-rotate ((state : GameState)) : GameState
+  (let ((new-rot (mod (+ (.rotation state) 1) 4))
+        (cells (piece-cells (.piece state) new-rot)))
+    (if (= (collides (.board state) cells (.piece-x state) (.piece-y state)) 0)
+      (GameState (.board state) (.piece state) new-rot
+                 (.piece-x state) (.piece-y state) (.next-p state)
+                 (.score state) (.level state) (.lines state)
+                 (.drop-time state) (.game-over state) (.frame state))
+      state)))
+
+(defn lock-and-clear ((state : GameState)) : GameState
+  (let ((cells (piece-cells (.piece state) (.rotation state)))
+        (color (+ (.piece state) 1))
+        (board2 (lock-piece (.board state) cells (.piece-x state) (.piece-y state) color))
+        (n-cleared (count-cleared board2))
+        (board3 (clear-lines board2))
+        (new-lines (+ (.lines state) n-cleared))
+        (new-level (+ 1 (/ new-lines 10)))
+        (new-score (+ (.score state) (line-score n-cleared new-level))))
+    (spawn-piece (GameState board3 0 0 3 0 (.next-p state)
+                            new-score new-level new-lines
+                            (unsafe (gl_time_ms)) (.game-over state) (.frame state)))))
+
+(defn hard-drop-helper ((state : GameState)) : GameState
+  (let ((moved (try-move state 0 1)))
+    (if (= (.piece-y moved) (.piece-y state))
+      (lock-and-clear state)
+      (hard-drop-helper moved))))
+
+(defn hard-drop ((state : GameState)) : GameState
+  (hard-drop-helper state))
+
+(defn tick-drop ((state : GameState) (now : i64)) : GameState
+  (let ((moved (try-move state 0 1)))
+    (if (= (.piece-y moved) (.piece-y state))
+      (lock-and-clear state)
+      (GameState (.board moved) (.piece moved) (.rotation moved)
+                 (.piece-x moved) (.piece-y moved) (.next-p moved)
+                 (.score moved) (.level moved) (.lines moved)
+                 now (.game-over moved) (.frame moved)))))
+
+;; ── Input handling ──────────────────────────────────────────────────
+
+(defn handle-input ((state : GameState)) : GameState
+  (if (= (.game-over state) 1) state
+    (let ((s1 (if (= (unsafe (gl_get_key_pressed (key-left))) 1)
+                (try-move state (- 0 1) 0) state))
+          (s2 (if (= (unsafe (gl_get_key_pressed (key-right))) 1)
+                (try-move s1 1 0) s1))
+          (s3 (if (= (unsafe (gl_get_key_pressed (key-up))) 1)
+                (try-rotate s2) s2))
+          (s4 (if (= (unsafe (gl_get_key_pressed (key-down))) 1)
+                (try-move s3 0 1) s3))
+          (s5 (if (= (unsafe (gl_get_key_pressed (key-space))) 1)
+                (hard-drop s4) s4)))
+      s5)))
+
+(defn maybe-drop ((state : GameState)) : GameState
+  (if (= (.game-over state) 1) state
+    (let ((now (unsafe (gl_time_ms)))
+          (interval (drop-speed (.level state))))
+      (if (> (- now (.drop-time state)) interval)
+        (tick-drop state now)
+        state))))
+
+;; ── Rendering ───────────────────────────────────────────────────────
+
+;; Check if a cell belongs to the active piece
+(defn is-piece-cell ((cells : (Vector i64)) (px : i64) (py : i64) (row : i64) (col : i64)) : i64
+  (let ((r0 (+ py (nth cells 0)))
+        (c0 (+ px (nth cells 1)))
+        (r1 (+ py (nth cells 2)))
+        (c1 (+ px (nth cells 3)))
+        (r2 (+ py (nth cells 4)))
+        (c2 (+ px (nth cells 5)))
+        (r3 (+ py (nth cells 6)))
+        (c3 (+ px (nth cells 7))))
+    (if (and (= row r0) (= col c0)) 1
+      (if (and (= row r1) (= col c1)) 1
+        (if (and (= row r2) (= col c2)) 1
+          (if (and (= row r3) (= col c3)) 1
+            0))))))
+
+;; Draw a single board cell
+(defn draw-cell ((board : (Vector i64)) (cells : (Vector i64)) (px : i64) (py : i64) (piece-kind : i64) (row : i64) (col : i64)) : Unit
+  (let ((sx (+ (board-left) (* col (cell-size))))
+        (sy (+ (board-top) (* row (cell-size))))
+        (cw (- (cell-size) 1))
+        (ch (- (cell-size) 1)))
+    (if (= (is-piece-cell cells px py row col) 1)
+      (unsafe (gl_draw_rect sx sy cw ch (piece-color piece-kind)))
+      (let ((val (board-get board row col)))
+        (if (> val 0)
+          (unsafe (gl_draw_rect sx sy cw ch (piece-color (- val 1))))
+          (unsafe (gl_draw_rect sx sy cw ch (empty-color))))))))
+
+;; Draw all cells in a row
+(defn draw-row-cells ((board : (Vector i64)) (cells : (Vector i64)) (px : i64) (py : i64) (piece-kind : i64) (row : i64) (col : i64)) : Unit
+  (if (< col 10)
+    (do
+      (draw-cell board cells px py piece-kind row col)
+      (draw-row-cells board cells px py piece-kind row (+ col 1)))))
+
+;; Draw all rows
+(defn draw-board-rows ((board : (Vector i64)) (cells : (Vector i64)) (px : i64) (py : i64) (piece-kind : i64) (row : i64)) : Unit
+  (if (< row 20)
+    (do
+      (draw-row-cells board cells px py piece-kind row 0)
+      (draw-board-rows board cells px py piece-kind (+ row 1)))))
+
+;; Draw next piece preview
+(defn draw-preview-cell ((cells : (Vector i64)) (kind : i64) (row : i64) (col : i64) (ox : i64) (oy : i64)) : Unit
+  (let ((sx (+ ox (* col (cell-size))))
+        (sy (+ oy (* row (cell-size))))
+        (cw (- (cell-size) 1))
+        (ch (- (cell-size) 1)))
+    (if (= (is-piece-cell cells 0 0 row col) 1)
+      (unsafe (gl_draw_rect sx sy cw ch (piece-color kind)))
+      (unsafe (gl_draw_rect sx sy cw ch (empty-color))))))
+
+(defn draw-preview-row ((cells : (Vector i64)) (kind : i64) (row : i64) (col : i64) (ox : i64) (oy : i64)) : Unit
+  (if (< col 4)
+    (do
+      (draw-preview-cell cells kind row col ox oy)
+      (draw-preview-row cells kind row (+ col 1) ox oy))))
+
+(defn draw-preview-rows ((cells : (Vector i64)) (kind : i64) (row : i64) (ox : i64) (oy : i64)) : Unit
+  (if (< row 4)
+    (do
+      (draw-preview-row cells kind row 0 ox oy)
+      (draw-preview-rows cells kind (+ row 1) ox oy))))
+
+;; Draw game over overlay
+(defn draw-game-over ((state : GameState)) : Unit
+  (do
+    ;; Dark overlay on board
+    (unsafe (gl_draw_rect (board-left) (+ (board-top) 480) 600 240 (gameover-bg)))
+    (unsafe (gl_draw_text (+ (board-left) 150) (+ (board-top) 540) "GAME OVER" (gameover-text)))
+    (unsafe (gl_draw_text (+ (board-left) 110) (+ (board-top) 590) (str "Score: " (.score state)) (text-color)))
+    (unsafe (gl_draw_text (+ (board-left) 90) (+ (board-top) 640) "Press Q to quit" (dim-color)))))
+
+;; Main render function
+(defn render ((state : GameState)) : Unit
+  (let ((cells (piece-cells (.piece state) (.rotation state)))
+        (next-cells (piece-cells (.next-p state) 0)))
+    ;; Draw board border
+    (unsafe (gl_draw_rect (- (board-left) 2) (- (board-top) 2)
+                          (+ 604 0) (+ 1204 0) (border-color)))
+    ;; Draw board cells
+    (draw-board-rows (.board state) cells (.piece-x state) (.piece-y state) (.piece state) 0)
+    ;; Sidebar
+    (unsafe (gl_draw_text (sidebar-x) 90 "TETRIS" (title-color)))
+    (unsafe (gl_draw_text (sidebar-x) 160 (str "SCORE") (dim-color)))
+    (unsafe (gl_draw_text (sidebar-x) 190 (str "" (.score state)) (text-color)))
+    (unsafe (gl_draw_text (sidebar-x) 250 "LEVEL" (dim-color)))
+    (unsafe (gl_draw_text (sidebar-x) 280 (str "" (.level state)) (text-color)))
+    (unsafe (gl_draw_text (sidebar-x) 340 "LINES" (dim-color)))
+    (unsafe (gl_draw_text (sidebar-x) 370 (str "" (.lines state)) (text-color)))
+    (unsafe (gl_draw_text (sidebar-x) 450 "NEXT" (dim-color)))
+    ;; Next piece preview
+    (draw-preview-rows next-cells (.next-p state) 0 (sidebar-x) 490)
+    ;; Controls hint
+    (unsafe (gl_draw_text 20 1250 "Arrows:move  Space:drop  Q:quit" (dim-color)))
+    ;; Game over overlay
+    (if (= (.game-over state) 1) (draw-game-over state))))
+
+;; ── Game loop ───────────────────────────────────────────────────────
+
+(defn game-loop ((state : GameState)) : Unit
+  (if (= (unsafe (gl_should_close)) 1)
+    (unsafe (gl_cleanup))
+    (do
+      (unsafe (gl_begin_frame))
+      (let ((s1 (handle-input state))
+            (s2 (maybe-drop s1))
+            ;; Quit on Q or Escape
+            (quit (if (= (unsafe (gl_get_key_pressed (key-q))) 1) 1
+                    (if (= (unsafe (gl_get_key_pressed (key-escape))) 1) 1 0))))
+        (render s2)
+        ;; Auto-screenshot on frame 2 (after render, before swap)
+        (if (= (.frame s2) 2)
+          (let ((_ (unsafe (gl_screenshot "tmp/tetris_screenshot.bmp"))))
+            (print "")))
+        (unsafe (gl_end_frame))
+        (if (= quit 1)
+          (unsafe (gl_cleanup))
+          (game-loop (GameState (.board s2) (.piece s2) (.rotation s2)
+                                (.piece-x s2) (.piece-y s2) (.next-p s2)
+                                (.score s2) (.level s2) (.lines s2)
+                                (.drop-time s2) (.game-over s2)
+                                (+ (.frame s2) 1))))))))
+
+;; ── Main ────────────────────────────────────────────────────────────
+
+(defn main ()
+  (unsafe (gl_init 920 1280 "Weir Tetris"))
+  (random-seed (unsafe (gl_time_ms)))
+  (let ((board (make-empty-board))
+        (first-piece (random-int 7))
+        (next-piece (random-int 7))
+        (now (unsafe (gl_time_ms)))
+        (state (GameState board first-piece 0 3 0 next-piece 0 1 0 now 0 0)))
+    (game-loop (spawn-piece state))))

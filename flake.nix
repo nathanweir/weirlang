@@ -41,12 +41,30 @@
             pkgs.tree-sitter
             pkgs.libffi
             pkgs.pkg-config
+            pkgs.glfw
+            pkgs.libGL
+            pkgs.libx11
+            pkgs.libxrandr
+            pkgs.libxinerama
+            pkgs.libxcursor
+            pkgs.libxi
+            pkgs.libxext
+            pkgs.libxkbcommon
           ];
 
           NIX_LD_LIBRARY_PATH = pkgs.lib.optionalString pkgs.stdenv.isLinux (
             pkgs.lib.makeLibraryPath [
               pkgs.stdenv.cc.cc
               pkgs.libffi
+              pkgs.glfw
+              pkgs.libGL
+              pkgs.libx11
+              pkgs.libxrandr
+              pkgs.libxinerama
+              pkgs.libxcursor
+              pkgs.libxi
+              pkgs.libxext
+              pkgs.libxkbcommon
             ]
           );
 
