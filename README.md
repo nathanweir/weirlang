@@ -1,6 +1,6 @@
 # Weir
 
-> **Note:** This project is entirely built with [Claude Code](https://claude.ai/code). It's a personal toy project — fun to explore, but not vetted for production use.
+> **Warning:** Heads-up, this is a fun personal project to drive Claude Code very hard and make a domain-specific programming language. It's a fun personal project, but should probably not be used by anyone.
 
 Weir is a statically typed, Lisp-family programming language targeting native code via [Cranelift](https://cranelift.dev/). It's designed for fast iteration in small-scale game development, combining S-expression syntax with a modern type system and function-level live reloading.
 
