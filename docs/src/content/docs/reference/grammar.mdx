@@ -1,0 +1,20 @@
+---
+title: Grammar
+description: Formal grammar specification for the Weir language.
+---
+
+This page will contain the formal grammar specification for Weir's S-expression syntax.
+
+:::note
+This page is under construction. Full content coming soon.
+:::
+
+## Overview
+
+Weir uses S-expression syntax with extensions for type annotations, collection literals, and keywords. The parser recognizes:
+
+- **Delimiters**: `()` for S-expressions, `[]` for vectors, `{}` for maps
+- **Atoms**: identifiers, numeric literals, string literals, keywords (`:name`), type variables (`'a`)
+- **Special forms**: `defn`, `deftype`, `defstruct`, `defclass`, `instance`, `defmacro`, `let`, `if`, `cond`, `match`, `when`, `unless`, `fn`, `do`, `set!`, `import`, `extern`, `unsafe`
+
+A tree-sitter grammar is available at `tree-sitter-weir/` for syntax highlighting.

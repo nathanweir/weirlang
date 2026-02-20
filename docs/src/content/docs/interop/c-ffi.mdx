@@ -1,0 +1,30 @@
+---
+title: C FFI
+description: Calling C libraries from Weir via extern "C" declarations.
+---
+
+Weir can call C functions directly using `extern "C"` declarations, with safety enforced via `unsafe` blocks.
+
+:::note
+This page is under construction. Full content coming soon.
+:::
+
+## Quick Reference
+
+```lisp
+;; Declare external C functions
+(extern "C"
+  (defn abs ((n : i32)) : i32)
+  (defn SDL_Init ((flags : u32)) : i32))
+
+;; Must use unsafe to call them
+(unsafe
+  (println (abs -42)))
+```
+
+- **`Ty::Ptr`** — raw pointer type for FFI, represented as `i64`
+- **JIT**: symbols resolved via `dlsym` at runtime
+- **AOT**: linked via `cc` with `-l` flags
+- **Interpreter**: dynamic calls via `libffi`
+
+See also: [Native Libraries](/interop/native-libraries/) for building shared libraries.

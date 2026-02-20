@@ -1,0 +1,22 @@
+---
+title: Operator Precedence
+description: Operator precedence and evaluation order in Weir.
+---
+
+Weir uses prefix notation — there is no operator precedence in the traditional sense.
+
+:::note
+This page is under construction. Full content coming soon.
+:::
+
+## Overview
+
+Since Weir uses S-expression syntax, all operations are explicit function calls with parenthesized prefix notation:
+
+```lisp
+(+ (* 2 3) (* 4 5))    ;; 2*3 + 4*5 = 26
+```
+
+There is no ambiguity — the nesting of parentheses fully determines evaluation order. Operator precedence rules from infix languages do not apply.
+
+The built-in operators are: `+`, `-`, `*`, `/`, `mod`, `=`, `!=`, `<`, `>`, `<=`, `>=`, `not`, `and`, `or`.

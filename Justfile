@@ -69,3 +69,11 @@ tetris-dev:
 # Convert a BMP screenshot to PNG for viewing (usage: just screenshot tmp/tetris_screenshot.bmp)
 screenshot file:
     convert {{ file }} -resize 50% {{ without_extension(file) }}.png && echo "Wrote {{ without_extension(file) }}.png"
+
+# Start docs dev server
+docs-dev:
+    cd docs && pnpm run dev
+
+# Build docs site
+docs-build:
+    cd docs && pnpm run build

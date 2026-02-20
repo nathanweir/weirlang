@@ -1,0 +1,61 @@
+---
+title: Introduction
+description: What Weir is, its design philosophy, and goals.
+---
+
+Weir is a statically typed, Lisp-family programming language that compiles to native code via [Cranelift](https://cranelift.dev/). It's designed for fast iteration in small-scale game development — combining the expressive power of S-expressions with a modern type system and function-level live reloading.
+
+## The Name
+
+A **weir** is a low dam built across a river to control water flow. It doesn't block the river — it guides it. Water still flows freely, but the weir shapes where it goes, prevents flooding, and creates predictable behavior downstream.
+
+This is the language's design philosophy in physical form:
+
+- **Controls flow without stopping it** — guard rails that prevent bugs without preventing expressiveness
+- **An engineering structure, not a wall** — practical, purposeful constraints that make the system more useful, not more restrictive
+- **Predictable downstream behavior** — static types, exhaustive matching, and clear error handling mean you know what to expect
+- **The water still flows** — Lisp's expressive power, live reloading, and fast iteration are preserved
+
+## Design Goals
+
+### Guard Rails Are a Feature
+
+The language actively prevents the developer from inadvertently causing bugs through trivial misuse. If the design leans more hand-holdy than typical, that's acceptable — within reason.
+
+- **Hygienic macros** over unhygienic — prevent accidental variable capture
+- **Static types** over dynamic — catch errors before runtime
+- **Immutable by default** — prevent accidental mutation and aliasing bugs
+- **Exhaustive pattern matching** — compiler errors on unhandled cases
+- **Arena escape prevention at compile time** — no dangling references to freed memory
+- **Safe defaults with explicit opt-out** over unsafe defaults with opt-in
+
+### Optimize for the Inner Loop
+
+The primary use case is game development with live iteration. Write code → see it running → adjust → see the adjustment. Compilation speed in dev mode, clear error messages, and immediate feedback matter more than squeezing out the last 5% of release-build performance.
+
+### Expressive Types Reduce Macro Pressure
+
+Investing in type system expressiveness (generics, typeclasses, associated types) reduces the need for complex macros. A simpler, purely syntactic macro system becomes more viable when the type system carries more weight.
+
+## Language Family
+
+Weir draws inspiration from several languages:
+
+| Inspiration | What Weir Borrows |
+|---|---|
+| **Common Lisp** | S-expression syntax, interactive development, keywords |
+| **Carp** | Function type syntax `(Fn [args] return)`, inline type annotations |
+| **Coalton** | Typeclasses in S-expression syntax, HKT support, `.field` accessors |
+| **Haskell** | Typeclass design, algebraic data types, exhaustive matching |
+| **Rust** | Local type inference, coherence rules, memory safety philosophy |
+| **Erlang** | Hot code loading model, start-from-source (no image persistence) |
+
+## Implementation
+
+Weir is implemented in Rust with:
+
+- **Cranelift** for dev-mode JIT compilation (optimized for fast compile times)
+- **AOT compilation** via Cranelift + system linker for release binaries
+- **Tracing GC** (mark-and-sweep) with opt-in arena allocation
+- **LSP server** for editor integration from day one
+- **Tree-sitter grammar** for syntax highlighting

@@ -1,0 +1,36 @@
+---
+title: Structs & Types
+description: Defining structs, sum types, and algebraic data types in Weir.
+---
+
+Weir uses separate forms for product types (`defstruct`) and sum types (`deftype`), following Coalton's pattern.
+
+:::note
+This page is under construction. Full content coming soon.
+:::
+
+## Quick Reference
+
+```lisp
+;; Product type (struct)
+(defstruct Vec2
+  (x : f64)
+  (y : f64))
+
+;; Sum type (enum)
+(deftype (Option 'a)
+  (Some 'a)
+  None)
+
+;; Construction
+(Vec2 1.0 2.0)
+(Some 42)
+
+;; Field access
+(.x my-vec)
+
+;; Pattern matching
+(match opt
+  ((Some val) val)
+  (None 0))
+```

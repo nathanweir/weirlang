@@ -1,0 +1,31 @@
+---
+title: Collections
+description: Lists, vectors, and hash-maps in Weir.
+---
+
+Weir provides vector and hash-map collection types with literal syntax and built-in operations.
+
+:::note
+This page is under construction. Full content coming soon.
+:::
+
+## Quick Reference
+
+### Vectors
+
+```lisp
+[1 2 3 4 5]                     ;; vector literal
+(len [1 2 3])                    ;; => 3
+(nth [10 20 30] 1)               ;; => 20
+(append [1 2] 3)                 ;; => [1 2 3]
+(set-nth [1 2 3] 1 99)           ;; => [1 99 3]
+```
+
+### Hash-Maps
+
+```lisp
+{:name "Alice" :health 100}     ;; map literal
+(len {:a 1 :b 2})                ;; => 2
+```
+
+See [Built-in Functions](/stdlib/builtins/#collections) for full details.

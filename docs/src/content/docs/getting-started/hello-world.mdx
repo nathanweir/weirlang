@@ -1,0 +1,161 @@
+---
+title: Hello World
+description: Write and run your first Weir program.
+---
+
+## Your First Program
+
+Create a file called `hello.weir`:
+
+```lisp
+(defn main ()
+  (println "Hello, World!"))
+```
+
+Run it:
+
+```bash
+weir run hello.weir
+```
+
+Output:
+```
+Hello, World!
+```
+
+Every Weir program starts at the `main` function. `println` is a built-in that prints a value followed by a newline.
+
+## Adding Some Types
+
+Let's make it more interesting. Weir is statically typed — function signatures require explicit type annotations:
+
+```lisp
+(defn greet ((name : String)) : Unit
+  (println (str "Hello, " name "!")))
+
+(defn main ()
+  (greet "World"))
+```
+
+- `(name : String)` — parameter `name` has type `String`
+- `: Unit` — the function returns `Unit` (like `void` — used for side-effecting functions)
+- `str` — concatenates its arguments into a string
+
+## Local Variables
+
+Use `let` to bind local variables. Their types are inferred:
+
+```lisp
+(defn main ()
+  (let ((x 5)
+        (y 10)
+        (sum (+ x y)))
+    (println (str "Sum: " sum))))
+```
+
+`x`, `y`, and `sum` are all inferred as `i64` (the default integer type). No type annotations needed inside function bodies.
+
+## Defining Functions
+
+Functions are defined with `defn`. Parameters and return types are always annotated:
+
+```lisp
+(defn factorial ((n : i64)) : i64
+  (if (<= n 1)
+    1
+    (* n (factorial (- n 1)))))
+
+(defn main ()
+  (println (str "5! = " (factorial 5)))
+  (println (str "10! = " (factorial 10))))
+```
+
+Output:
+```
+5! = 120
+10! = 3628800
+```
+
+## Algebraic Data Types
+
+Define sum types with `deftype` and use pattern matching:
+
+```lisp
+(deftype (Option 'a)
+  (Some 'a)
+  None)
+
+(defn safe-div ((a : i64) (b : i64)) : (Option i64)
+  (if (= b 0)
+    None
+    (Some (/ a b))))
+
+(defn show-result ((result : (Option i64))) : String
+  (match result
+    ((Some val) (str "Result: " val))
+    (None "Error: division by zero")))
+
+(defn main ()
+  (println (show-result (safe-div 10 3)))
+  (println (show-result (safe-div 10 0))))
+```
+
+Output:
+```
+Result: 3
+Error: division by zero
+```
+
+Pattern matching is **exhaustive** — if you forget to handle `None`, the compiler gives an error.
+
+## Structs
+
+Define product types with `defstruct`:
+
+```lisp
+(defstruct Vec2
+  (x : f64)
+  (y : f64))
+
+(defn distance ((a : Vec2) (b : Vec2)) : f64
+  (sqrt (+ (* (- (.x b) (.x a)) (- (.x b) (.x a)))
+           (* (- (.y b) (.y a)) (- (.y b) (.y a))))))
+
+(defn main ()
+  (let ((a (Vec2 0.0 0.0))
+        (b (Vec2 3.0 4.0)))
+    (println (str "Distance: " (distance a b)))))
+```
+
+Output:
+```
+Distance: 5
+```
+
+- `Vec2 0.0 0.0` — construct a struct positionally
+- `.x`, `.y` — field accessor functions (Coalton-style)
+
+## Closures and Higher-Order Functions
+
+```lisp
+(defn make-greeter ((prefix : String)) : (Fn [String] String)
+  (fn (name) (str prefix " " name "!")))
+
+(defn main ()
+  (let ((hello (make-greeter "Hello"))
+        (bye (make-greeter "Goodbye")))
+    (println (hello "World"))
+    (println (bye "World"))))
+```
+
+Output:
+```
+Hello World!
+Goodbye World!
+```
+
+## Next Steps
+
+- [CLI Reference](/getting-started/cli-reference/) — all available commands
+- [Syntax Guide](/guide/syntax/) — full syntax overview
+- [Built-in Functions](/stdlib/builtins/) — complete standard library reference

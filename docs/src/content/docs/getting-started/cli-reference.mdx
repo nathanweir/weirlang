@@ -1,0 +1,128 @@
+---
+title: CLI Reference
+description: All Weir CLI commands and options.
+---
+
+The `weir` CLI is the main interface for compiling and running Weir programs. It supports both single-file mode (pass a `.weir` file) and package mode (discover `weir.pkg` in the current directory).
+
+## Commands
+
+### `weir run [file]`
+
+Compile and run a Weir program via Cranelift JIT.
+
+```bash
+weir run hello.weir              # single file
+weir run                         # package mode (reads weir.pkg)
+weir run --load libfoo.so        # pre-load a shared library
+```
+
+| Option | Description |
+|---|---|
+| `file` | Path to `.weir` source file. Omit to use `weir.pkg`. |
+| `--load <path>` | Pre-load a shared library (makes symbols available via `dlsym`). Repeatable. |
+
+### `weir build [file]`
+
+Compile a Weir program to a standalone native binary via AOT compilation.
+
+```bash
+weir build hello.weir                    # outputs ./hello
+weir build hello.weir -o bin/hello       # custom output path
+weir build -l glfw -l GL                 # link C libraries
+weir build --cc-arg helper.c             # pass extra files to the C compiler
+weir build                               # package mode
+```
+
+| Option | Description |
+|---|---|
+| `file` | Path to `.weir` source file. Omit to use `weir.pkg`. |
+| `-o`, `--output <path>` | Output binary path. Defaults to source file stem or package name. |
+| `-l`, `--link <lib>` | Link against a C library (e.g. `-l glfw`). Repeatable. |
+| `--cc-arg <arg>` | Pass raw arguments to the C compiler. Repeatable. |
+
+### `weir dev [file]`
+
+Run a Weir program with live reloading. Watches for file changes and hot-swaps functions without restarting.
+
+```bash
+weir dev game.weir               # watch single file
+weir dev                         # package mode
+weir dev --load libfoo.so        # pre-load libraries
+```
+
+| Option | Description |
+|---|---|
+| `file` | Path to `.weir` source file. Omit to use `weir.pkg`. |
+| `--load <path>` | Pre-load a shared library. Repeatable. |
+
+When a file changes:
+1. The source is re-read, re-lexed, re-parsed, and re-typechecked
+2. Changed functions are recompiled via Cranelift
+3. Function pointers are swapped in the running program
+4. Execution continues with the new code
+
+If the new code has errors, the old version keeps running and errors are reported.
+
+### `weir check <file>`
+
+Type-check a Weir file without running it.
+
+```bash
+weir check hello.weir
+```
+
+Outputs `OK — no type errors` on success, or type errors with locations on failure.
+
+### `weir parse <file>`
+
+Parse a Weir file and dump the AST. Useful for debugging the parser.
+
+```bash
+weir parse hello.weir
+```
+
+### `weir interp <file>`
+
+Run a Weir file via the tree-walking interpreter. Slower than JIT, but useful for debugging and testing.
+
+```bash
+weir interp hello.weir
+```
+
+### `weir expand <file>`
+
+Expand macros and print the resulting source. Like `cargo expand` for Rust.
+
+```bash
+weir expand hello.weir
+```
+
+### `weir lsp`
+
+Start the Weir Language Server Protocol server. Typically invoked by an editor, not directly.
+
+```bash
+weir lsp
+```
+
+## Package Mode
+
+When `run`, `build`, or `dev` are invoked without a file argument, the CLI looks for a `weir.pkg` manifest in the current directory:
+
+```bash
+cd demos/tetris
+weir run                         # discovers weir.pkg, resolves deps, runs via JIT
+weir build -o ../../tmp/tetris   # AOT compile the package
+weir dev                         # dev mode with live reload
+```
+
+The package system:
+1. Parses `weir.pkg` for metadata, sources, and dependencies
+2. Recursively resolves path-based dependencies
+3. Topologically sorts the dependency graph
+4. Validates import statements against actual module exports
+5. Compiles native C sources (if any) into a shared library
+6. Concatenates all sources and runs the standard pipeline
+
+See [Package System](/concepts/package-system/) for details.

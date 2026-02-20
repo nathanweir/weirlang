@@ -1,0 +1,70 @@
+---
+title: Reserved Words
+description: Keywords and reserved identifiers in Weir.
+---
+
+This page lists all reserved words and special identifiers in Weir.
+
+:::note
+This page is under construction. Full content coming soon.
+:::
+
+## Special Forms
+
+These identifiers are recognized by the parser as special forms and cannot be used as variable or function names:
+
+| Keyword | Purpose |
+|---|---|
+| `defn` | Function definition |
+| `deftype` | Sum type (enum) definition |
+| `defstruct` | Product type (struct) definition |
+| `defclass` | Typeclass definition |
+| `defmacro` | Macro definition |
+| `instance` | Typeclass instance |
+| `declare` | Separate type declaration |
+| `let` | Local bindings |
+| `if` | Binary conditional |
+| `cond` | Multi-branch conditional |
+| `match` | Pattern matching |
+| `when` | Single-branch conditional (side-effect) |
+| `unless` | Negated single-branch conditional |
+| `fn` | Lambda / closure |
+| `do` | Explicit sequencing block |
+| `set!` | Mutable reassignment |
+| `mut` | Mutable binding modifier |
+| `import` | Module import |
+| `extern` | Foreign function declaration |
+| `unsafe` | Unsafe block (for FFI calls) |
+| `pub` | Public visibility modifier |
+| `ann` | Type annotation / assertion |
+| `->` | Thread-first macro |
+| `->>` | Thread-last macro |
+| `with-arena` | Arena allocation block |
+| `else` | Default branch in `cond` |
+
+## Built-in Types
+
+| Type | Description |
+|---|---|
+| `i8`, `i16`, `i32`, `i64` | Signed integers |
+| `u8`, `u16`, `u32`, `u64` | Unsigned integers |
+| `f32`, `f64` | Floating point |
+| `Bool` | Boolean |
+| `String` | UTF-8 string |
+| `Unit` | Unit type |
+| `Fn` | Function type constructor |
+| `Vector` | Vector type |
+| `Atom` | Atomic reference type |
+| `Channel` | Channel type |
+| `Ptr` | Raw pointer (FFI) |
+
+## Literals
+
+| Literal | Example |
+|---|---|
+| `true`, `false` | Boolean literals |
+| Integer | `42`, `-7` |
+| Float | `3.14`, `-0.5` |
+| String | `"hello"` |
+| Keyword | `:name`, `:health` |
+| Type variable | `'a`, `'elem` |

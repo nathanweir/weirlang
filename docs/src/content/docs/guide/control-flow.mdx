@@ -1,0 +1,31 @@
+---
+title: Control Flow
+description: Conditionals, branching, and looping in Weir.
+---
+
+Weir provides several control flow forms: `if`, `cond`, `match`, `when`, and `unless`.
+
+:::note
+This page is under construction. Full content coming soon.
+:::
+
+## Quick Reference
+
+- **`if`** — Binary conditional. Else branch required when result is used.
+- **`cond`** — Multi-branch conditional with required `else`.
+- **`match`** — Pattern matching with exhaustiveness checking.
+- **`when` / `unless`** — Single-branch side-effecting forms (return `Unit`).
+- **`do`** — Explicit sequencing block for multi-expression positions.
+
+```lisp
+(if (> x 0) "positive" "non-positive")
+
+(cond
+  ((< health 0) (die))
+  ((< health 20) (flee))
+  (else (attack)))
+
+(when (key-pressed? :escape)
+  (open-menu)
+  (pause-game))
+```

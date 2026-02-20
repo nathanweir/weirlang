@@ -1,5 +1,81 @@
-⚠️ Heads-up: this repo is entirely Claude Code generated. It's a toy personal project that, while amusing, probably shouldn't be used in any serious capacity by anyone.
+# Weir
 
-This project is an attempt at very aggressively pushing Claude Code to its limits by designing & building an entire programming language, affectionately named simply `weir`. This is admittedly a bespoke, personal ecosystem that combines a number of fun ideas which I hope can together serve as a seriously un-serious local tool for me to do indie game development. That is, the weir lang is specifically written for small-scale game dev scenarios. It's a little more intentional than vibe coding but also much less than if this was aimed at being a widely accepted, shared ecosystem by other devs.
+> **Note:** This project is entirely built with [Claude Code](https://claude.ai/code). It's a personal toy project — fun to explore, but not vetted for production use.
 
-TBD outline the major features of this language when having Claude write docs.
+Weir is a statically typed, Lisp-family programming language targeting native code via [Cranelift](https://cranelift.dev/). It's designed for fast iteration in small-scale game development, combining S-expression syntax with a modern type system and function-level live reloading.
+
+## Key Features
+
+- **S-expression syntax** with type annotations, collection literals (`[]`, `{}`), and threading macros (`->`, `->>`)
+- **Declarative static types** — explicit function signatures, locally inferred locals, algebraic data types, exhaustive pattern matching
+- **Typeclasses** with higher-kinded types, multi-parameter support, and coherence rules
+- **Hygienic macros** — purely syntactic, can generate type definitions and typeclass instances
+- **Native compilation** — Cranelift JIT for dev mode, AOT compilation for release binaries
+- **Live reloading** — function-level hot-swap in dev mode with cascade recompilation
+- **Tracing GC** with opt-in arena allocation for hot paths
+- **Package system** — `weir.pkg` manifests, path-based dependencies, native C source compilation
+- **C FFI** — `extern "C"` declarations with `unsafe` blocks
+
+## Current Status
+
+Working today:
+
+- **Compiler pipeline**: lexer, parser, macro expander, type checker, Cranelift codegen
+- **Three execution modes**: JIT (`weir run`), AOT (`weir build`), tree-walking interpreter (`weir interp`)
+- **Dev mode**: `weir dev` with file watching and function-level live reload
+- **Package system**: multi-package projects with dependency resolution and native code support
+- **OpenGL Tetris demo**: full game built with Weir + GLFW/OpenGL via C FFI (`just tetris`)
+- **LSP server**: diagnostics, hover, completion, go-to-definition, document symbols
+- **Zed extension**: syntax highlighting and LSP integration
+- **647 tests** across the workspace
+
+## Getting Started
+
+Requires [Nix](https://nixos.org/) with flakes enabled:
+
+```bash
+git clone <repo-url> && cd weirlang
+nix develop                        # activate dev environment
+just test                          # run all tests
+```
+
+Run a single file:
+```bash
+weir run examples/hello.weir       # JIT compile and run
+weir build examples/hello.weir     # AOT compile to binary
+weir dev examples/hello.weir       # dev mode with live reload
+```
+
+Run a package project:
+```bash
+cd demos/tetris && weir run        # discovers weir.pkg, resolves deps, runs via JIT
+```
+
+## Project Structure
+
+```
+crates/
+  weir-lexer/       Tokenizer
+  weir-parser/      S-expression parser → AST
+  weir-macros/      Macro expander
+  weir-typeck/      Type checker (local inference, typeclasses, ADTs)
+  weir-codegen/     Cranelift JIT/AOT backend + dev mode live reload
+  weir-interp/      Tree-walking interpreter
+  weir-runtime/     GC, arenas, runtime support
+  weir-pkg/         Package system (manifest parsing, dependency resolution)
+  weir-cli/         CLI frontend (clap)
+  weir-lsp/         Language Server Protocol implementation
+  weir-ast/         AST types, pretty printer, TCO analysis
+design/             Language design documents
+std/                Standard library (prelude)
+demos/              Demo projects (tetris)
+docs/               Documentation website (Astro + Starlight)
+```
+
+## Documentation
+
+See [`docs/`](docs/) for the full documentation site, or run `just docs-dev` to browse locally.
+
+## License
+
+Personal project. No license specified.

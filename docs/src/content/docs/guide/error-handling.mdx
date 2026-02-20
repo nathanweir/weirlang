@@ -1,0 +1,29 @@
+---
+title: Error Handling
+description: Result types, the ? operator, and error patterns in Weir.
+---
+
+Weir uses the `Result` type for error handling. Errors are values visible in type signatures, and the `?` operator provides ergonomic propagation.
+
+:::note
+This page is under construction. Full content coming soon.
+:::
+
+## Quick Reference
+
+```lisp
+;; Function that can fail
+(defn load-level ((path : String)) : (Result Level IOError)
+  (let ((data (read-file path)?)
+        (entities (parse-entities data)?))
+    (Ok (Level entities))))
+
+;; Handle the result
+(match (load-level "level1.weir")
+  ((Ok level) (start level))
+  ((Err e) (show-error e)))
+```
+
+The `?` operator on `(Result 'a 'err)`:
+- If `(Ok val)` — unwraps to `val`, continues
+- If `(Err e)` — immediately returns `(Err e)` from the enclosing function

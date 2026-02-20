@@ -1,0 +1,170 @@
+---
+title: Data Types
+description: Primitive types, algebraic data types, structs, and type aliases in Weir.
+---
+
+Weir has a rich type system with primitive types, algebraic data types (sum types and product types), and generic type parameters.
+
+## Primitive Types
+
+### Numeric Types
+
+| Type | Description | Default? |
+|---|---|---|
+| `i8`, `i16`, `i32`, `i64` | Signed integers | `i64` for integer literals |
+| `u8`, `u16`, `u32`, `u64` | Unsigned integers | — |
+| `f32`, `f64` | Floating point | `f64` for float literals |
+
+Numeric conversions are explicit — no implicit widening or narrowing:
+
+```lisp
+(to-f64 42)          ;; i64 → f64
+(to-i32 3.14)        ;; f64 → i32
+(ann f32 3.14)       ;; constrain a literal to f32
+```
+
+### Other Primitives
+
+| Type | Description |
+|---|---|
+| `Bool` | `true` or `false` |
+| `String` | UTF-8 string |
+| `Unit` | The type with one value — for side-effecting functions |
+
+`Unit` is a real type, not `void`. A `(List Unit)` is valid, and functions returning `Unit` are regular functions:
+
+```lisp
+(defn greet ((name : String)) : Unit
+  (println (str "Hello, " name "!")))
+```
+
+## Sum Types (deftype)
+
+Sum types (tagged unions / enums) are defined with `deftype`:
+
+```lisp
+;; Simple enum
+(deftype EnemyState
+  Idle
+  (Patrol Vec2 Vec2)
+  (Chase i64)
+  Dead)
+
+;; Generic sum type
+(deftype (Option 'a)
+  (Some 'a)
+  None)
+
+(deftype (Result 'ok 'err)
+  (Ok 'ok)
+  (Err 'err))
+```
+
+Constructors are functions:
+
+```lisp
+(Some 42)            ;; => (Option i64)
+None                 ;; => (Option 'a)
+(Ok "success")       ;; => (Result String 'err)
+(Err "failed")       ;; => (Result 'ok String)
+```
+
+### Pattern Matching
+
+Pattern matching on sum types is exhaustive — all variants must be handled:
+
+```lisp
+(match enemy-state
+  ((Patrol start end) (move-between start end))
+  ((Chase target-id) (pursue target-id))
+  (Idle (stand-still))
+  (Dead (remove-entity)))
+```
+
+Missing a variant is a compile error. Use `_` as a wildcard to handle remaining cases:
+
+```lisp
+(match enemy-state
+  (Dead (remove-entity))
+  (_ (update-ai entity)))
+```
+
+## Product Types (defstruct)
+
+Structs are defined with `defstruct`. Fields always have names and types:
+
+```lisp
+(defstruct Vec2
+  (x : f64)
+  (y : f64))
+
+(defstruct Enemy
+  (pos : Vec2)
+  (health : i32)
+  (state : EnemyState))
+```
+
+### Construction
+
+The type name is automatically a constructor. Supports positional and named arguments:
+
+```lisp
+;; Positional
+(Vec2 1.0 2.0)
+
+;; Named (keyword arguments)
+(Enemy :pos (Vec2 0.0 0.0) :health 100 :state Idle)
+
+;; Mixed (positional first, then named)
+(Enemy (Vec2 0.0 0.0) :health 100 :state Idle)
+```
+
+### Field Access
+
+`.field` is a first-class accessor function (Coalton-style):
+
+```lisp
+(.pos enemy)              ;; access pos field
+(.x (.pos enemy))         ;; nested access
+
+;; .field is composable with higher-order functions
+(map .pos enemies)        ;; extract all positions
+(filter (fn (e) (> (.health e) 0)) enemies)
+```
+
+### Struct Destructuring
+
+Structs can be destructured in `let` and `match` using keyword syntax:
+
+```lisp
+(let (({:x :y} my-vec))
+  (+ x y))
+
+;; With renamed bindings
+(defn distance (({:x ax :y ay} : Vec2) ({:x bx :y by} : Vec2)) : f64
+  (sqrt (+ (* (- bx ax) (- bx ax)) (* (- by ay) (- by ay)))))
+
+;; Partial destructuring
+(let (({:health} enemy))
+  (> health 0))
+```
+
+## Type Annotations (ann)
+
+`ann` is an inline type assertion — it constrains inference, not a cast:
+
+```lisp
+(ann i32 42)                              ;; constrain to i32
+(ann f32 (* delta speed))                 ;; constrain arithmetic result
+(ann (List Enemy) (filter alive? entities))  ;; pin polymorphic return
+```
+
+If the expression can't be the asserted type, it's a compile error — no runtime conversion happens.
+
+## The Prelude
+
+The following types are automatically in scope for all modules (no import needed):
+
+- `Result` (`Ok`, `Err`) — for error handling
+- `Ordering` (`LT`, `EQ`, `GT`) — for comparisons
+- `Ord` typeclass with instances for all numeric types and `String`

@@ -1,0 +1,226 @@
+---
+title: Syntax
+description: Weir's S-expression syntax, type annotations, and conventions.
+---
+
+Weir uses S-expression syntax from the Lisp family, extended with type annotations, collection literals, and modern ergonomics.
+
+## S-Expressions
+
+Everything is an expression. Function calls, special forms, and definitions all use parenthesized prefix notation:
+
+```lisp
+(+ 1 2)                          ;; function call
+(if (> x 0) "positive" "non-positive")  ;; conditional
+(defn add ((x : i32) (y : i32)) : i32   ;; definition
+  (+ x y))
+```
+
+## Comments
+
+Line comments start with `;`:
+
+```lisp
+;; This is a comment
+(+ 1 2)  ;; inline comment
+```
+
+Docstrings are the first expression in a definition body:
+
+```lisp
+(defn add ((x : i32) (y : i32)) : i32
+  "Add two integers."
+  (+ x y))
+```
+
+## Type Annotations
+
+### Inline (preferred)
+
+Parameters are annotated with `(name : Type)`, return type follows the parameter list:
+
+```lisp
+(defn add ((x : i32) (y : i32)) : i32
+  (+ x y))
+
+(defn map ((f : (Fn ['a] 'b)) (xs : (List 'a))) : (List 'b)
+  ...)
+```
+
+### Separate declarations
+
+For complex signatures, use `declare`:
+
+```lisp
+(declare transform
+  (=> (Functor 'f)
+      (Fn [(Fn ['a] 'b) ('f 'a)] ('f 'b))))
+(defn transform (func container)
+  (map func container))
+```
+
+When both are present, they must agree — a mismatch is a compile error.
+
+## Function Types
+
+Carp-style `Fn` with brackets separating arguments from return type:
+
+```lisp
+(Fn [i32 String] Bool)                    ;; takes i32 and String, returns Bool
+(Fn [] Unit)                              ;; takes no args, returns Unit
+(Fn [(List 'a) (Fn ['a] 'b)] (List 'b))  ;; higher-order
+```
+
+## Type Variables
+
+Quote-prefixed lowercase, OCaml-style: `'a`, `'b`, `'elem`:
+
+```lisp
+(deftype (Option 'a)
+  (Some 'a)
+  None)
+
+(deftype (Result 'ok 'err)
+  (Ok 'ok)
+  (Err 'err))
+```
+
+## Keywords
+
+Colon-prefixed symbols used as values (distinct from type variables):
+
+```lisp
+{:name "Alice" :health 100}
+(spawn-enemy :pos (Vec2 0.0 0.0) :health 50)
+```
+
+No ambiguity — `:keyword` is a value, `'a` is a type variable. Different prefix, different context.
+
+## Collection Literals
+
+Square brackets for arrays/vectors, curly braces for maps:
+
+```lisp
+;; Vector
+[1 2 3 4 5]
+["hello" "world"]
+
+;; Map (keywords as keys)
+{:name "Alice"
+ :health 100
+ :pos (Vec2 0.0 0.0)}
+
+;; Empty
+[]
+{}
+```
+
+## Numeric Types
+
+| Category | Types |
+|---|---|
+| Signed integers | `i8`, `i16`, `i32`, `i64` |
+| Unsigned integers | `u8`, `u16`, `u32`, `u64` |
+| Floating point | `f32`, `f64` |
+
+Unadorned integer literals default to `i64`, float literals to `f64`. Use `ann` to disambiguate:
+
+```lisp
+(let ((x 42))              ;; x : i64
+     ((y 3.14))            ;; y : f64
+     ((z (ann f32 3.14)))  ;; z : f32
+  ...)
+```
+
+## Operators
+
+Weir has no infix operators. All operations use prefix notation:
+
+```lisp
+(+ 1 2)           ;; addition (variadic)
+(- 10 3)          ;; subtraction
+(* 2 3 4)         ;; multiplication (variadic)
+(/ 10 3)          ;; division
+(mod 10 3)        ;; modulo
+(= x y)           ;; equality
+(!= x y)          ;; inequality
+(< x y)           ;; less than
+(> x y)           ;; greater than
+(<= x y)          ;; less than or equal
+(>= x y)          ;; greater than or equal
+(and a b c)       ;; logical and (variadic)
+(or a b c)        ;; logical or (variadic)
+(not x)           ;; logical not
+```
+
+## String Formatting
+
+`str` concatenates values into a string:
+
+```lisp
+(str "Hello, " name "!")       ;; => "Hello, World!"
+(str "x = " x ", y = " y)     ;; => "x = 5, y = 10"
+```
+
+## Threading Macros
+
+`->` (thread-first) inserts the previous result as the first argument:
+
+```lisp
+(-> enemy .pos .x)
+;; equivalent to: (.x (.pos enemy))
+
+(-> world
+    .entities
+    (filter alive?)
+    (map .pos))
+```
+
+`->>` (thread-last) inserts as the last argument:
+
+```lisp
+(->> (range 100)
+     (filter even?)
+     (map square)
+     (take 10))
+```
+
+## Visibility
+
+Definitions are private by default. Use `pub` to export:
+
+```lisp
+(pub defn spawn-enemy (...) ...)    ;; public
+(pub deftype Enemy ...)             ;; public
+(defn internal-helper (...) ...)    ;; private
+```
+
+## Modules and Imports
+
+File = module. Imports are top-level only:
+
+```lisp
+;; Import specific items
+(import game.entities (Enemy spawn-enemy))
+
+;; Import with alias
+(import math.vec2 :as v)
+;; then: (v.add a b)
+
+;; Import everything (discouraged)
+(import math.vec2 :all)
+```
+
+Circular imports are disallowed. The compiler builds a dependency DAG from imports and compiles in topological order.
+
+## Comparison with Other Lisps
+
+| Feature | Common Lisp | Clojure | Weir |
+|---|---|---|---|
+| Types | Dynamic | Dynamic | Static (declarative) |
+| Macros | Unhygienic | Limited | Hygienic |
+| Mutation | Default | Discouraged | Explicit `mut` |
+| Pattern matching | Via library | Via `core.match` | Built-in, exhaustive |
+| Compilation | Native (SBCL) | JVM bytecode | Native (Cranelift) |
+| Live reload | Image-based | REPL | Function-level hot-swap |
+| Collections | `()` lists | `[]` `{}` `#{}` | `()` `[]` `{}` |

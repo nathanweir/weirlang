@@ -38,6 +38,7 @@
             pkgs.just
             pkgs.cargo-insta
             pkgs.nodejs
+            pkgs.pnpm
             pkgs.tree-sitter
             pkgs.libffi
             pkgs.pkg-config

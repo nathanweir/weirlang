@@ -1,0 +1,38 @@
+---
+title: Typeclasses
+description: Ad-hoc polymorphism with Haskell-style typeclasses in Weir.
+---
+
+Weir uses Haskell-style typeclasses for ad-hoc polymorphism, with higher-kinded type support and Rust-style coherence rules.
+
+:::note
+This page is under construction. Full content coming soon.
+:::
+
+## Quick Reference
+
+```lisp
+;; Define a typeclass
+(defclass (Show 'a)
+  (show : (Fn ['a] String)))
+
+;; Typeclass with superclass
+(defclass (=> (Eq 'a) (Ord 'a))
+  (<=> : (Fn ['a 'a] Ordering)))
+
+;; Higher-kinded typeclass
+(defclass (Functor 'f)
+  (map : (Fn [(Fn ['a] 'b) ('f 'a)] ('f 'b))))
+
+;; Instance
+(instance (Show Vec2)
+  (defn show (v)
+    (str "(" (.x v) ", " (.y v) ")")))
+
+;; Constrained instance
+(instance (=> (Show 'a) (Show (Option 'a)))
+  (defn show (opt)
+    (match opt
+      ((Some x) (str "Some(" (show x) ")"))
+      (None "None"))))
+```

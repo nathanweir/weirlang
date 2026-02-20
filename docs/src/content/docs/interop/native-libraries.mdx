@@ -1,0 +1,28 @@
+---
+title: Native Libraries
+description: Building and linking native C libraries with Weir packages.
+---
+
+Weir packages can include native C source files that are automatically compiled and linked.
+
+:::note
+This page is under construction. Full content coming soon.
+:::
+
+## Quick Reference
+
+In `weir.pkg`, declare native sources and link libraries:
+
+```lisp
+(package
+  (name "weir-gl")
+  (version "0.1.0")
+  (sources "lib.weir")
+  (native
+    (sources "gl_helper.c")
+    (link "glfw" "GL" "m")))
+```
+
+- **JIT mode**: C sources compiled to `.so`, loaded via `dlopen`
+- **AOT mode**: C sources passed to the system linker
+- Use `--load` flag to manually pre-load shared libraries in JIT mode

@@ -1,0 +1,35 @@
+---
+title: Pattern Matching
+description: Match expressions, destructuring, and exhaustiveness in Weir.
+---
+
+Weir has built-in pattern matching with compile-time exhaustiveness checking.
+
+:::note
+This page is under construction. Full content coming soon.
+:::
+
+## Quick Reference
+
+Pattern matching uses the `match` form. Each case is wrapped in its own parens, and all variants of a sum type must be handled:
+
+```lisp
+(match option-val
+  ((Some x) (use x))
+  (None (default-value)))
+
+(match enemy-state
+  ((Patrol start end) (move-between start end))
+  ((Chase target-id) (pursue target-id))
+  (Idle (stand-still))
+  (Dead (remove-entity)))
+```
+
+Struct destructuring uses keyword syntax:
+
+```lisp
+(let (({:x :y} my-vec))
+  (+ x y))
+```
+
+Irrefutable patterns (always match) work in `let` and function params. Refutable patterns (may not match) require `match`.

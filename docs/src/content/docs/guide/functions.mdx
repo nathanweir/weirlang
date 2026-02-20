@@ -1,0 +1,175 @@
+---
+title: Functions
+description: Function definitions, closures, recursion, and higher-order functions in Weir.
+---
+
+## Defining Functions
+
+Functions are defined with `defn`. Parameter types and return type are always explicit:
+
+```lisp
+(defn add ((x : i32) (y : i32)) : i32
+  (+ x y))
+```
+
+Functions without a meaningful return value use `Unit`:
+
+```lisp
+(defn greet ((name : String)) : Unit
+  (println (str "Hello, " name "!")))
+```
+
+### Multi-expression Bodies
+
+Function bodies implicitly sequence multiple expressions. The last expression is the return value:
+
+```lisp
+(defn process ((x : i64)) : i64
+  (println (str "Processing: " x))
+  (let ((doubled (* x 2)))
+    (println (str "Doubled: " doubled))
+    doubled))  ;; return value
+```
+
+### Named Arguments
+
+Callers can optionally use keyword syntax to name arguments. The definition is always positional:
+
+```lisp
+(defn spawn-enemy ((pos : Vec2) (health : i32) (state : EnemyState)) : Enemy
+  ...)
+
+;; All valid call styles:
+(spawn-enemy (Vec2 0.0 0.0) 50 Idle)                          ;; positional
+(spawn-enemy :pos (Vec2 0.0 0.0) :health 50 :state Idle)      ;; named
+(spawn-enemy :health 50 :pos (Vec2 0.0 0.0) :state Idle)      ;; named, any order
+(spawn-enemy (Vec2 0.0 0.0) :health 50 :state Idle)           ;; mixed
+```
+
+The compiler verifies keyword names match parameter names at compile time.
+
+## Closures / Lambdas
+
+Lambda syntax mirrors `defn` without the name. Type annotations are optional (usually inferred):
+
+```lisp
+;; Type-inferred (common)
+(fn (x) (+ x 1))
+
+;; Type-annotated
+(fn ((x : i32)) : i32 (+ x 1))
+
+;; Multi-arg
+(fn ((x : i32) (y : i32)) (+ x y))
+
+;; Multi-expression body
+(fn (e)
+  (println (.name e))
+  (.health e))
+```
+
+### Capture Semantics
+
+Closures capture by reference — the closure shares the variable with its enclosing scope:
+
+```lisp
+(let ((mut x 5))
+  (let ((f (fn () x)))
+    (set! x 10)
+    (f)))           ;; => 10
+```
+
+### Higher-Order Functions
+
+Functions are first-class values with types:
+
+```lisp
+(defn make-adder ((n : i64)) : (Fn [i64] i64)
+  (fn (x) (+ x n)))
+
+(defn apply-twice ((f : (Fn [i64] i64)) (x : i64)) : i64
+  (f (f x)))
+
+(defn main ()
+  (let ((add5 (make-adder 5)))
+    (println (apply-twice add5 10))))  ;; => 20
+```
+
+## Recursion
+
+Functions can call themselves recursively:
+
+```lisp
+(defn factorial ((n : i64)) : i64
+  (if (<= n 1)
+    1
+    (* n (factorial (- n 1)))))
+
+(defn fib ((n : i64)) : i64
+  (if (<= n 1)
+    n
+    (+ (fib (- n 1)) (fib (- n 2)))))
+```
+
+### Tail-Call Optimization
+
+Self-recursive calls in tail position are automatically optimized into loops. This means deep recursion doesn't overflow the stack:
+
+```lisp
+(defn count-down ((n : i64)) : i64
+  (if (= n 0) 0 (count-down (- n 1))))
+
+(defn main ()
+  (println (count-down 1000000)))  ;; works — no stack overflow
+```
+
+Tail positions are:
+- The body of a `defn`
+- The then/else branches of an `if` in tail position
+- The last expression in a `let` body in tail position
+- Branch results of `cond`/`match` in tail position
+
+## Mutability
+
+Weir is immutable by default. Use `mut` to make a binding reassignable:
+
+```lisp
+;; Immutable (default)
+(let ((x 5))
+  (+ x 1))        ;; x cannot be reassigned
+
+;; Mutable — explicit opt-in
+(let ((mut x 5))
+  (set! x (+ x 1))
+  x)               ;; => 6
+```
+
+There are no mutable references — functions cannot modify the caller's data. Use functional struct update to create modified copies:
+
+```lisp
+(defn damage ((e : Enemy) (amount : i32)) : Enemy
+  (update e :health (- (.health e) amount)))
+```
+
+## Separate Type Declarations
+
+For complex signatures, use `declare` separately from the definition:
+
+```lisp
+(declare transform
+  (=> (Functor 'f)
+      (Fn [(Fn ['a] 'b) ('f 'a)] ('f 'b))))
+(defn transform (func container)
+  (map func container))
+```
+
+When both inline annotations and a `declare` are present, they must agree.
+
+## Public Functions
+
+Functions are private by default. Use `pub` to make them accessible from other modules:
+
+```lisp
+(pub defn spawn-enemy ((pos : Vec2) (health : i32)) : Enemy
+  ...)
+```

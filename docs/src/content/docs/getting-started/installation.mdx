@@ -1,0 +1,85 @@
+---
+title: Installation
+description: How to set up a Weir development environment.
+---
+
+Weir uses [Nix](https://nixos.org/) with flakes to manage all dependencies. This ensures a reproducible build environment regardless of your system.
+
+## Prerequisites
+
+Install Nix with flakes enabled. If you don't have Nix yet:
+
+```bash
+# Install Nix (multi-user recommended)
+sh <(curl -L https://nixos.org/nix/install) --daemon
+
+# Enable flakes (add to ~/.config/nix/nix.conf)
+experimental-features = nix-command flakes
+```
+
+## Clone and Enter
+
+```bash
+git clone <repo-url>
+cd weirlang
+```
+
+Activate the development environment:
+
+```bash
+nix develop
+```
+
+This provides all build tools: Rust toolchain, Cranelift, libffi, pkg-config, and everything else needed to build the compiler.
+
+:::tip
+If you use [direnv](https://direnv.net/), entering the project directory automatically activates the Nix environment — no manual `nix develop` needed.
+:::
+
+## Verify the Setup
+
+Build the compiler and run all tests:
+
+```bash
+just test
+```
+
+You should see all tests pass (currently 647). You can also build the compiler directly:
+
+```bash
+just build
+```
+
+## Available Commands
+
+Run `just` to see all available recipes:
+
+| Command | Description |
+|---|---|
+| `just build` | Build all crates |
+| `just test` | Run all tests |
+| `just check` | Run clippy, check formatting, and run tests |
+| `just fmt` | Format all code |
+| `just run <file>` | Run a `.weir` file |
+| `just tetris` | Build and run the OpenGL Tetris demo |
+| `just docs-dev` | Start docs dev server |
+| `just docs-build` | Build docs site |
+
+## Editor Setup
+
+### Zed
+
+A Zed extension is available at `/home/nathan/dev/zed-weir` providing:
+
+- Syntax highlighting via tree-sitter
+- LSP integration (diagnostics, hover, completion, go-to-definition)
+
+### Other Editors
+
+The Weir LSP server can be started with:
+
+```bash
+weir lsp
+```
+
+Any editor with LSP support can connect to it for diagnostics, completion, hover information, and navigation.

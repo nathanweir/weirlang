@@ -1,0 +1,28 @@
+---
+title: Macros
+description: Hygienic, purely syntactic macros in Weir.
+---
+
+Weir's macro system is purely syntactic — macros transform S-expressions into S-expressions without type knowledge. They are hygienic by default.
+
+:::note
+This page is under construction. Full content coming soon.
+:::
+
+## Quick Reference
+
+Macros operate in the pipeline as: `parse → macro expand → type check → compile`
+
+Key properties:
+- **Purely syntactic** — transform S-expressions without querying types
+- **Hygienic by default** — no accidental variable capture
+- **Can generate types** — macros can emit `deftype`, `defstruct`, and `instance` forms
+- **Cascade-aware** — macro redefinition triggers re-expansion of all call sites
+
+```lisp
+(defmacro defsystem (name component-type &body body)
+  `(defn ,name ((entities : (List ,component-type))) : Unit
+     (for-each entities (fn (e) ,@body))))
+```
+
+Use `weir expand` to inspect macro output.

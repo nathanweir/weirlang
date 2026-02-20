@@ -1,0 +1,272 @@
+---
+title: Built-in Functions
+description: Complete reference of all built-in functions in Weir.
+---
+
+All built-in functions are automatically available without imports.
+
+## Arithmetic
+
+| Function | Signature | Description |
+|---|---|---|
+| `+` | `(Fn ['a 'a ...] 'a)` | Addition (variadic) |
+| `-` | `(Fn ['a] 'a)` or `(Fn ['a 'a ...] 'a)` | Unary negation or subtraction |
+| `*` | `(Fn ['a 'a ...] 'a)` | Multiplication (variadic) |
+| `/` | `(Fn ['a 'a] 'a)` | Division |
+| `mod` | `(Fn ['a 'a] 'a)` | Modulo |
+
+Arithmetic operators are polymorphic over numeric types. The operands are unified — all must be the same type.
+
+```lisp
+(+ 1 2 3)          ;; => 6
+(- 10 3)           ;; => 7
+(- 5)              ;; => -5 (unary negation)
+(* 2 3 4)          ;; => 24
+(/ 10 3)           ;; => 3
+(mod 10 3)         ;; => 1
+```
+
+## Comparison
+
+| Function | Signature | Description |
+|---|---|---|
+| `=` | `(Fn ['a 'a] Bool)` | Equality |
+| `!=` | `(Fn ['a 'a] Bool)` | Inequality |
+| `<` | `(Fn ['a 'a] Bool)` | Less than |
+| `>` | `(Fn ['a 'a] Bool)` | Greater than |
+| `<=` | `(Fn ['a 'a] Bool)` | Less than or equal |
+| `>=` | `(Fn ['a 'a] Bool)` | Greater than or equal |
+
+```lisp
+(= 1 1)            ;; => true
+(!= 1 2)           ;; => true
+(< 3 5)            ;; => true
+(>= 5 5)           ;; => true
+```
+
+## Logical
+
+| Function | Signature | Description |
+|---|---|---|
+| `not` | `(Fn [Bool] Bool)` | Logical NOT |
+| `and` | `(Fn [Bool ...] Bool)` | Logical AND (variadic) |
+| `or` | `(Fn [Bool ...] Bool)` | Logical OR (variadic) |
+
+```lisp
+(not true)          ;; => false
+(and true true)     ;; => true
+(or false true)     ;; => true
+```
+
+## I/O
+
+| Function | Signature | Description |
+|---|---|---|
+| `println` | `(Fn ['a] Unit)` | Print a value followed by a newline |
+| `print` | `(Fn ['a] Unit)` | Print a value without a newline |
+| `str` | `(Fn ['a ...] String)` | Concatenate values into a string |
+
+```lisp
+(println "Hello")           ;; prints: Hello\n
+(print "no newline")        ;; prints: no newline
+(str "x = " x ", y = " y)  ;; => "x = 5, y = 10"
+(println)                   ;; prints a blank line
+```
+
+## Collections
+
+| Function | Signature | Description |
+|---|---|---|
+| `len` | `(Fn ['a] i64)` | Length of a vector, map, or string |
+| `nth` | `(Fn [(Vector 'a) i64] 'a)` | Get element at index |
+| `append` | `(Fn [(Vector 'a) 'a] (Vector 'a))` | Append element to vector |
+| `set-nth` | `(Fn [(Vector 'a) i64 'a] (Vector 'a))` | Return new vector with element at index replaced |
+
+```lisp
+(len [1 2 3])               ;; => 3
+(len "hello")               ;; => 5
+(nth [10 20 30] 1)          ;; => 20
+(append [1 2] 3)            ;; => [1 2 3]
+(set-nth [1 2 3] 1 99)      ;; => [1 99 3]
+```
+
+## Math — Unary
+
+All take a single `f64` and return `f64`:
+
+| Function | Description |
+|---|---|
+| `sqrt` | Square root |
+| `floor` | Floor (round down) |
+| `ceil` | Ceiling (round up) |
+| `round` | Round to nearest integer |
+| `sin` | Sine |
+| `cos` | Cosine |
+| `tan` | Tangent |
+| `asin` | Arcsine |
+| `acos` | Arccosine |
+| `atan` | Arctangent |
+| `exp` | e^x |
+| `log` | Natural logarithm |
+
+```lisp
+(sqrt 25.0)         ;; => 5.0
+(floor 3.7)         ;; => 3.0
+(ceil 3.2)          ;; => 4.0
+(sin 0.0)           ;; => 0.0
+(cos 0.0)           ;; => 1.0
+```
+
+## Math — Binary
+
+| Function | Signature | Description |
+|---|---|---|
+| `pow` | `(Fn [f64 f64] f64)` | x raised to the power y |
+| `atan2` | `(Fn [f64 f64] f64)` | Two-argument arctangent |
+
+```lisp
+(pow 2.0 10.0)      ;; => 1024.0
+(atan2 1.0 1.0)     ;; => 0.7853981633974483
+```
+
+## Math — Polymorphic
+
+| Function | Signature | Description |
+|---|---|---|
+| `abs` | `(Fn ['a] 'a)` | Absolute value (any numeric type) |
+| `min` | `(Fn ['a 'a] 'a)` | Minimum of two values |
+| `max` | `(Fn ['a 'a] 'a)` | Maximum of two values |
+
+```lisp
+(abs -42)            ;; => 42
+(min 3 7)            ;; => 3
+(max 3 7)            ;; => 7
+```
+
+## Type Conversion
+
+| Function | Signature | Description |
+|---|---|---|
+| `to-f64` | `(Fn ['a] f64)` | Convert to f64 |
+| `to-i64` | `(Fn ['a] i64)` | Convert to i64 |
+| `to-f32` | `(Fn ['a] f32)` | Convert to f32 |
+| `to-i32` | `(Fn ['a] i32)` | Convert to i32 |
+
+```lisp
+(to-f64 42)          ;; => 42.0
+(to-i64 3.14)        ;; => 3
+(to-f32 3.14)        ;; => 3.14 (narrowed)
+```
+
+## String Operations
+
+| Function | Signature | Description |
+|---|---|---|
+| `string-length` | `(Fn [String] i64)` | Length of string |
+| `substring` | `(Fn [String i64 i64] String)` | Extract substring (start, end) |
+| `string-ref` | `(Fn [String i64] i64)` | Get character code at index |
+| `string-contains` | `(Fn [String String] Bool)` | Check if string contains substring |
+| `string-upcase` | `(Fn [String] String)` | Convert to uppercase |
+| `string-downcase` | `(Fn [String] String)` | Convert to lowercase |
+| `string-trim` | `(Fn [String] String)` | Trim whitespace from both ends |
+| `char-to-string` | `(Fn [i64] String)` | Convert character code to string |
+
+```lisp
+(string-length "hello")            ;; => 5
+(substring "hello world" 0 5)      ;; => "hello"
+(string-ref "hello" 0)             ;; => 104 (ASCII 'h')
+(string-contains "hello" "ell")    ;; => true
+(string-upcase "hello")            ;; => "HELLO"
+(string-downcase "HELLO")          ;; => "hello"
+(string-trim "  hello  ")          ;; => "hello"
+(char-to-string 65)                ;; => "A"
+```
+
+## Random
+
+| Function | Signature | Description |
+|---|---|---|
+| `random` | `(Fn [] f64)` | Random float in [0, 1) |
+| `random-int` | `(Fn [i64] i64)` | Random integer in [0, n) |
+| `random-seed` | `(Fn [i64] Unit)` | Seed the random number generator |
+
+```lisp
+(random)              ;; => 0.7234... (varies)
+(random-int 100)      ;; => 42 (varies, in [0, 100))
+(random-seed 12345)   ;; set seed for reproducibility
+```
+
+## File I/O
+
+| Function | Signature | Description |
+|---|---|---|
+| `read-file` | `(Fn [String] String)` | Read entire file contents |
+| `write-file` | `(Fn [String String] Unit)` | Write string to file |
+
+```lisp
+(let ((contents (read-file "data.txt")))
+  (println contents))
+
+(write-file "output.txt" "Hello, file!")
+```
+
+## Time and Sleep
+
+| Function | Signature | Description |
+|---|---|---|
+| `sleep` | `(Fn [i64] Unit)` | Sleep for N milliseconds |
+| `time-ms` | `(Fn [] i64)` | Current time in milliseconds |
+
+```lisp
+(let ((start (time-ms)))
+  (sleep 100)
+  (println (str "Elapsed: " (- (time-ms) start) "ms")))
+```
+
+## Reflection
+
+| Function | Signature | Description |
+|---|---|---|
+| `type-of` | `(Fn ['a] String)` | Get the type name of a value at runtime |
+
+```lisp
+(type-of 42)          ;; => "i64"
+(type-of "hello")     ;; => "String"
+```
+
+## Concurrency
+
+### Atoms
+
+| Function | Signature | Description |
+|---|---|---|
+| `atom` | `(Fn ['a] (Atom 'a))` | Create an atomic reference |
+| `deref` | `(Fn [(Atom 'a)] 'a)` | Read the current value |
+
+```lisp
+(let ((counter (atom 0)))
+  (println (deref counter)))   ;; => 0
+```
+
+### Channels
+
+| Function | Signature | Description |
+|---|---|---|
+| `channel` | `(Fn [] (Channel 'a))` | Create a typed channel |
+| `send` | `(Fn [(Channel 'a) 'a] Unit)` | Send a value on a channel |
+| `recv` | `(Fn [(Channel 'a)] 'a)` | Receive a value from a channel |
+
+### Parallel Iteration
+
+| Function | Signature | Description |
+|---|---|---|
+| `par-map` | `(Fn [(Fn ['a] 'b) (Vector 'a)] (Vector 'b))` | Parallel map over a vector |
+| `par-for-each` | `(Fn [(Fn ['a] Unit) (Vector 'a)] Unit)` | Parallel for-each over a vector |
+
+## Terminal I/O
+
+| Function | Signature | Description |
+|---|---|---|
+| `term-init` | `(Fn [] Unit)` | Initialize terminal raw mode |
+| `term-restore` | `(Fn [] Unit)` | Restore terminal to normal mode |
+| `read-key` | `(Fn [] i64)` | Read a single keypress (returns key code) |

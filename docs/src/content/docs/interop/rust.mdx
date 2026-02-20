@@ -1,0 +1,23 @@
+---
+title: Rust Integration
+description: How Weir's runtime is implemented in Rust and how Rust functions are exposed.
+---
+
+Weir's runtime, standard library, and compiler are implemented in Rust. Safe Rust functions are exposed to Weir code without requiring `unsafe`.
+
+:::note
+This page is under construction. Full content coming soon.
+:::
+
+## Quick Reference
+
+The standard library and runtime are Rust-implemented. Functions like `println`, `str`, `len`, and math operations are Rust functions linked into the runtime. They don't require `unsafe` — the Rust compiler already enforces safety.
+
+```lisp
+;; These are safe — implemented in Rust
+(println "Hello")
+(let ((v [1 2 3]))
+  (println (len v)))
+```
+
+Only `extern "C"` functions (external C libraries) require `unsafe` blocks.

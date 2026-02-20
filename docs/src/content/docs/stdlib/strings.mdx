@@ -1,0 +1,26 @@
+---
+title: String Operations
+description: String manipulation functions in Weir.
+---
+
+Weir provides built-in string operations for common text manipulation tasks.
+
+:::note
+This page is under construction. Full content coming soon.
+:::
+
+## Quick Reference
+
+| Function | Signature | Description |
+|---|---|---|
+| `str` | `(Fn ['a ...] String)` | Concatenate values into a string |
+| `string-length` | `(Fn [String] i64)` | Length of string |
+| `substring` | `(Fn [String i64 i64] String)` | Extract substring (start, end) |
+| `string-ref` | `(Fn [String i64] i64)` | Get character code at index |
+| `string-contains` | `(Fn [String String] Bool)` | Check if string contains substring |
+| `string-upcase` | `(Fn [String] String)` | Convert to uppercase |
+| `string-downcase` | `(Fn [String] String)` | Convert to lowercase |
+| `string-trim` | `(Fn [String] String)` | Trim whitespace |
+| `char-to-string` | `(Fn [i64] String)` | Convert character code to string |
+
+See [Built-in Functions](/stdlib/builtins/#string-operations) for full details and examples.

@@ -1,0 +1,93 @@
+---
+title: Weir Language
+description: A statically typed Lisp for native game development with live reloading.
+template: splash
+hero:
+  tagline: A statically typed Lisp targeting native code via Cranelift — designed for fast iteration in game development.
+  actions:
+    - text: Get Started
+      link: /getting-started/introduction/
+      icon: right-arrow
+    - text: View on GitHub
+      link: https://github.com/nathanlc/weirlang
+      variant: minimal
+      icon: external
+---
+
+import { Card, CardGrid } from "@astrojs/starlight/components";
+
+## Why Weir?
+
+A **weir** is a low dam built across a river to control water flow. It doesn't block the river — it guides it. Weir the language follows the same principle: guard rails that prevent bugs without preventing expressiveness.
+
+<CardGrid stagger>
+  <Card title="S-Expression Syntax" icon="seti:lisp">
+    Lisp-family syntax with modern ergonomics — type annotations, collection
+    literals (`[]`, `{}`), threading macros (`->`, `->>`), and keywords (`:name`).
+  </Card>
+  <Card title="Static Types" icon="approve-check">
+    Declarative static typing with local inference. Explicit function signatures,
+    inferred locals, algebraic data types, and exhaustive pattern matching.
+  </Card>
+  <Card title="Live Reloading" icon="rocket">
+    Function-level hot-swap in dev mode. Edit code, see changes instantly —
+    the runtime patches function pointers without restarting your program.
+  </Card>
+  <Card title="Native Performance" icon="star">
+    Cranelift JIT for dev mode (fast compilation), AOT compilation for release
+    binaries. Tracing GC with opt-in arena allocation for hot paths.
+  </Card>
+  <Card title="Package System" icon="open-book">
+    `weir.pkg` manifests with path-based dependencies, native C source
+    compilation, and automatic dependency resolution.
+  </Card>
+  <Card title="C FFI" icon="setting">
+    Call C libraries directly via `extern "C"` declarations. Build games with
+    GLFW, OpenGL, SDL, and more — with `unsafe` blocks for safety.
+  </Card>
+</CardGrid>
+
+## What It Looks Like
+
+```lisp
+;; Define a struct
+(defstruct Vec2
+  (x : f64)
+  (y : f64))
+
+;; Define a sum type
+(deftype EnemyState
+  Idle
+  (Patrol Vec2 Vec2)
+  (Chase i64)
+  Dead)
+
+;; Function with type annotations
+(defn spawn-wave ((n : i32) (origin : Vec2)) : (List Enemy)
+  (map (fn (i)
+         (Enemy
+           :pos (Vec2 (* (to-f64 i) 32.0) (.y origin))
+           :health 100
+           :state Idle))
+       (range n)))
+
+;; Pattern matching is exhaustive
+(match enemy-state
+  ((Patrol start end) (move-between start end))
+  ((Chase target-id) (pursue target-id))
+  (Idle (stand-still))
+  (Dead (remove-entity)))
+```
+
+## Current Status
+
+Weir is under active development. What works today:
+
+- Full compiler pipeline: lexer → parser → macro expander → type checker → Cranelift codegen
+- Three execution modes: JIT, AOT, and interpreter
+- Dev mode with file watching and live reload
+- Package system with multi-package projects
+- OpenGL Tetris demo (GLFW + OpenGL via C FFI)
+- LSP server with diagnostics, hover, completion, and go-to-definition
+- Zed editor extension with syntax highlighting
+- 647 tests across the workspace
