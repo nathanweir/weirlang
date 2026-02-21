@@ -577,6 +577,76 @@ int64_t weir_mutvec_len(int64_t ptr) {
     return data[1];
 }
 
+/* ── MutMap (mutable hash map, linear scan) ── */
+/* Layout: [capacity: i64, length: i64, k0, v0, k1, v1, ...] */
+
+#define MUTMAP_INITIAL_CAPACITY 16
+
+int64_t weir_mutmap_create(void) {
+    int64_t cap = MUTMAP_INITIAL_CAPACITY;
+    size_t total = (size_t)(2 + cap * 2) * 8;
+    int64_t *data = (int64_t*)calloc(1, total);
+    data[0] = cap;
+    data[1] = 0;
+    return (int64_t)(intptr_t)data;
+}
+
+int64_t weir_mutmap_set(int64_t ptr, int64_t key, int64_t val) {
+    int64_t *data = (int64_t*)(intptr_t)ptr;
+    int64_t cap = data[0];
+    int64_t len = data[1];
+    /* Check if key exists */
+    for (int64_t i = 0; i < len; i++) {
+        if (data[2 + i * 2] == key) {
+            data[2 + i * 2 + 1] = val;
+            return ptr;
+        }
+    }
+    /* Insert new entry */
+    if (len >= cap) {
+        int64_t new_cap = cap * 2;
+        size_t old_total = (size_t)(2 + cap * 2) * 8;
+        size_t new_total = (size_t)(2 + new_cap * 2) * 8;
+        data = (int64_t*)realloc(data, new_total);
+        memset((char*)data + old_total, 0, new_total - old_total);
+        data[0] = new_cap;
+    }
+    data[1] = len + 1;
+    data[2 + len * 2] = key;
+    data[2 + len * 2 + 1] = val;
+    return (int64_t)(intptr_t)data;
+}
+
+int64_t weir_mutmap_get(int64_t ptr, int64_t key) {
+    int64_t *data = (int64_t*)(intptr_t)ptr;
+    int64_t len = data[1];
+    for (int64_t i = 0; i < len; i++) {
+        if (data[2 + i * 2] == key)
+            return data[2 + i * 2 + 1];
+    }
+    return 0;
+}
+
+void weir_mutmap_remove(int64_t ptr, int64_t key) {
+    int64_t *data = (int64_t*)(intptr_t)ptr;
+    int64_t len = data[1];
+    for (int64_t i = 0; i < len; i++) {
+        if (data[2 + i * 2] == key) {
+            if (i < len - 1) {
+                data[2 + i * 2] = data[2 + (len - 1) * 2];
+                data[2 + i * 2 + 1] = data[2 + (len - 1) * 2 + 1];
+            }
+            data[1] = len - 1;
+            return;
+        }
+    }
+}
+
+int64_t weir_mutmap_len(int64_t ptr) {
+    int64_t *data = (int64_t*)(intptr_t)ptr;
+    return data[1];
+}
+
 extern void __weir_init_globals(void) __attribute__((weak));
 int main(void) {
     if (__weir_init_globals) __weir_init_globals();

@@ -59,6 +59,14 @@ When completing features or phases, always update `design/implementation-plan.md
 - Update test counts if mentioned
 - Add notes about what was implemented if the description was aspirational
 
+## Advguild Port
+
+Active port of the Adventurer's Guild game from Common Lisp to Weir:
+- **CL source**: `/home/nathan/dev/advguild` (original Common Lisp implementation)
+- **Weir port**: `/home/nathan/dev/advguild` (same repo, Weir files in `src/*.weir`)
+- **Port plan**: `design/advguild-port.md` — phased migration roadmap
+- **Phase workflow**: implement phase, code review, fix issues, commit
+
 ## Documentation Site Maintenance
 
 When implementing language changes (new syntax, new features, changed semantics), update the docs site in `docs/src/content/docs/` as a finishing step:

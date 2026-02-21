@@ -3262,12 +3262,18 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                     let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
                     let call = self.builder.ins().call(func_ref, &[map_ptr, key_w, val_w]);
                     let new_ptr = self.builder.inst_results(call)[0];
-                    // Update variable
+                    // Update variable (local or global)
                     let place_expr = &self.ast_module.exprs[args[0].value];
                     if let ExprKind::Var(vname) = &place_expr.kind {
                         if let Some((var, _)) = self.vars.get(vname) {
                             let var = *var;
                             self.builder.def_var(var, new_ptr);
+                        } else if let Some((data_id, _)) = self.globals.get(vname) {
+                            // Global variable: store new pointer back
+                            let data_id = *data_id;
+                            let gv = self.module.declare_data_in_func(data_id, self.builder.func);
+                            let addr = self.builder.ins().global_value(types::I64, gv);
+                            self.builder.ins().store(MemFlags::trusted(), new_ptr, addr, 0);
                         }
                     }
                     return Ok(None);
