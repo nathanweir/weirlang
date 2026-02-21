@@ -217,6 +217,18 @@ impl<'a> TokenCollector<'a> {
                         }
                     }
                 }
+                Item::Defglobal(g) => {
+                    self.push_keyword_at_form_start(*item_span, "defglobal");
+                    self.push(
+                        g.name_span.start,
+                        g.name_span.end - g.name_span.start,
+                        TK_VARIABLE,
+                    );
+                    if let Some(type_ann) = g.type_ann {
+                        self.collect_type_expr(type_ann);
+                    }
+                    self.collect_expr(g.value);
+                }
                 _ => {}
             }
         }
@@ -379,6 +391,31 @@ impl<'a> TokenCollector<'a> {
                 self.push_keyword_at_form_start(expr.span, "target");
                 for (_name, expr) in branches {
                     self.collect_expr(*expr);
+                }
+            }
+            ExprKind::For { var_span, init, condition, body, .. } => {
+                self.push_keyword_at_form_start(expr.span, "for");
+                self.push(
+                    var_span.start,
+                    var_span.end - var_span.start,
+                    TK_VARIABLE,
+                );
+                self.collect_expr(*init);
+                self.collect_expr(*condition);
+                for &e in body {
+                    self.collect_expr(e);
+                }
+            }
+            ExprKind::ForEach { var_span, iter, body, .. } => {
+                self.push_keyword_at_form_start(expr.span, "for-each");
+                self.push(
+                    var_span.start,
+                    var_span.end - var_span.start,
+                    TK_VARIABLE,
+                );
+                self.collect_expr(*iter);
+                for &e in body {
+                    self.collect_expr(e);
                 }
             }
             ExprKind::FieldAccess(_) => {}

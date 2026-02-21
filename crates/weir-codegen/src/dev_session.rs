@@ -141,6 +141,7 @@ fn compile_dev_module(
     let jit_module = JITModule::new(builder);
     let mut compiler = Compiler::new(ast_module, type_info, jit_module);
     compiler.declare_runtime_helpers()?;
+    compiler.declare_globals()?;
     compiler.declare_user_functions(Linkage::Local)?;
 
     let table_data_id = compiler
@@ -158,6 +159,7 @@ fn compile_dev_module(
         Some(table_data_id),
         dirty_set,
     )?;
+    compiler.compile_global_inits()?;
 
     compiler
         .module

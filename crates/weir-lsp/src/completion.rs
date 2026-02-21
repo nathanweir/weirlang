@@ -111,6 +111,14 @@ pub fn completions(
                     });
                 }
             }
+            Item::Defglobal(g) => {
+                items.push(CompletionItem {
+                    label: g.name.to_string(),
+                    kind: Some(CompletionItemKind::VARIABLE),
+                    detail: Some("global".into()),
+                    ..Default::default()
+                });
+            }
             _ => {}
         }
     }

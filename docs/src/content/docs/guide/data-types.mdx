@@ -15,11 +15,13 @@ Weir has a rich type system with primitive types, algebraic data types (sum type
 | `u8`, `u16`, `u32`, `u64` | Unsigned integers | — |
 | `f32`, `f64` | Floating point | `f64` for float literals |
 
-Numeric conversions are explicit — no implicit widening or narrowing:
+Numeric conversions are explicit — no implicit widening or narrowing. You can use the type name as a cast function, or the `to-*` builtins:
 
 ```lisp
-(to-f64 42)          ;; i64 → f64
-(to-i32 3.14)        ;; f64 → i32
+(f64 42)             ;; i64 → f64 (type-name-as-cast)
+(i32 3.14)           ;; f64 → i32
+(to-f64 42)          ;; equivalent long form
+(to-i32 3.14)        ;; equivalent long form
 (ann f32 3.14)       ;; constrain a literal to f32
 ```
 
@@ -132,6 +134,26 @@ The type name is automatically a constructor. Supports positional and named argu
 (filter (fn (e) (> (.health e) 0)) enemies)
 ```
 
+### Field Mutation
+
+Individual struct fields can be mutated in place with `set!` — the binding must be `mut`:
+
+```lisp
+(let ((mut enemy (Enemy :pos (Vec2 0.0 0.0) :health 100 :state Idle)))
+  (set! (.health enemy) (- (.health enemy) 25))
+  (set! (.state enemy) (Chase 42))
+  (println (.health enemy)))  ;; => 75
+```
+
+This is equivalent to updating the struct in place — no copy is made. The type checker verifies the field exists and the value type matches.
+
+Attempting to mutate a field on an immutable binding is a compile error:
+
+```lisp
+(let ((enemy (Enemy :pos (Vec2 0.0 0.0) :health 100 :state Idle)))
+  (set! (.health enemy) 50))  ;; ERROR: cannot mutate field of immutable binding 'enemy'
+```
+
 ### Struct Destructuring
 
 Structs can be destructured in `let` and `match` using keyword syntax:
@@ -160,6 +182,52 @@ Structs can be destructured in `let` and `match` using keyword syntax:
 ```
 
 If the expression can't be the asserted type, it's a compile error — no runtime conversion happens.
+
+## Mutable Collections
+
+Weir provides mutable collection types for in-place mutation. These are not `Shareable` — they cannot cross process boundaries.
+
+### MutVec
+
+A mutable, growable vector:
+
+```lisp
+(let ((mut v (mut-vec)))
+  (push! v 10)
+  (push! v 20)
+  (push! v 30)
+  (println (len v))     ;; 3
+  (println (nth v 0))   ;; 10
+  (println (pop! v)))   ;; 30
+```
+
+| Builtin | Signature | Description |
+|---------|-----------|-------------|
+| `mut-vec` | `() → (MutVec 'a)` | Create an empty mutable vector |
+| `push!` | `(MutVec 'a) 'a → Unit` | Append element (may reallocate) |
+| `pop!` | `(MutVec 'a) → 'a` | Remove and return last element |
+| `len` | `(MutVec 'a) → i64` | Number of elements |
+| `nth` | `(MutVec 'a) i64 → 'a` | Get element at index |
+
+### MutMap
+
+A mutable key-value map:
+
+```lisp
+(let ((mut m (mut-map)))
+  (map-set! m "name" "Alice")
+  (map-set! m "age" "30")
+  (println (map-get m "name"))   ;; Alice
+  (map-remove! m "age"))
+```
+
+| Builtin | Signature | Description |
+|---------|-----------|-------------|
+| `mut-map` | `() → (MutMap 'k 'v)` | Create an empty mutable map |
+| `map-set!` | `(MutMap 'k 'v) 'k 'v → Unit` | Insert or update a key-value pair |
+| `map-get` | `(MutMap 'k 'v) 'k → 'v` | Look up a value by key |
+| `map-remove!` | `(MutMap 'k 'v) 'k → Unit` | Remove a key-value pair |
+| `len` | `(MutMap 'k 'v) → i64` | Number of entries |
 
 ## The Prelude
 

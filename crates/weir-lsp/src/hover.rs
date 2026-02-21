@@ -123,6 +123,15 @@ pub fn hover_item_at(
             {
                 (Some(format!("**class** `{}`", d.name)), d.name_span)
             }
+            weir_ast::Item::Defglobal(g)
+                if g.name_span.start <= offset && offset < g.name_span.end =>
+            {
+                let mut_str = if g.is_mut { "mut " } else { "" };
+                (
+                    Some(format!("**{}global** `{}`", mut_str, g.name)),
+                    g.name_span,
+                )
+            }
             _ => (None, weir_ast::Span::new(0, 0)),
         };
 

@@ -213,6 +213,25 @@ File = module. Imports are top-level only:
 
 Circular imports are disallowed. The compiler builds a dependency DAG from imports and compiles in topological order.
 
+## Loops
+
+```lisp
+;; Counted for loop (increments by 1)
+(for (i 0 (< i 10))
+  (println i))
+
+;; Collection iteration
+(for-each (elem my-vector)
+  (process elem))
+```
+
+## Global Bindings
+
+```lisp
+(defglobal *max-health* : i32 100)        ;; immutable
+(defglobal mut *score* : i64 0)           ;; mutable (set! allowed)
+```
+
 ## Comparison with Other Lisps
 
 | Feature | Common Lisp | Clojure | Weir |

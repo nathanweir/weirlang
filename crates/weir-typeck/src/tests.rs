@@ -1384,3 +1384,208 @@ use super::*;
                (unsafe (atoi p)))",
         );
     }
+
+    // ── Mutability enforcement ──────────────────────────────────
+
+    #[test]
+    fn set_bang_immutable_binding_error() {
+        let msg = check_err(
+            "(defn main ()
+               (let ((x 0))
+                 (set! x 5)))",
+        );
+        assert!(msg.contains("cannot mutate immutable binding"), "got: {}", msg);
+    }
+
+    #[test]
+    fn set_bang_mutable_binding_ok() {
+        check_ok(
+            "(defn main ()
+               (let ((mut x 0))
+                 (set! x 5)))",
+        );
+    }
+
+    #[test]
+    fn set_bang_immutable_param_error() {
+        let msg = check_err(
+            "(defn foo ((x : i32)) : Unit
+               (set! x 5))",
+        );
+        assert!(msg.contains("cannot mutate immutable binding"), "got: {}", msg);
+    }
+
+    #[test]
+    fn set_bang_mutable_param_ok() {
+        check_ok(
+            "(defn foo ((mut x : i32)) : Unit
+               (set! x 5))",
+        );
+    }
+
+    // ── Struct field assignment ─────────────────────────────────
+
+    #[test]
+    fn struct_field_set_ok() {
+        check_ok(
+            "(defstruct Point (x : i32) (y : i32))
+             (defn main ()
+               (let ((mut p (Point :x 1 :y 2)))
+                 (set! (.x p) 10)))",
+        );
+    }
+
+    #[test]
+    fn struct_field_set_immutable_error() {
+        let msg = check_err(
+            "(defstruct Point (x : i32) (y : i32))
+             (defn main ()
+               (let ((p (Point :x 1 :y 2)))
+                 (set! (.x p) 10)))",
+        );
+        assert!(msg.contains("cannot mutate field of immutable binding"), "got: {}", msg);
+    }
+
+    #[test]
+    fn struct_field_set_type_mismatch() {
+        let msg = check_err(
+            "(defstruct Point (x : i32) (y : i32))
+             (defn main ()
+               (let ((mut p (Point :x 1 :y 2)))
+                 (set! (.x p) \"hello\")))",
+        );
+        assert!(msg.contains("type mismatch") || msg.contains("cannot unify"), "got: {}", msg);
+    }
+
+    #[test]
+    fn struct_field_set_nonexistent_field() {
+        let msg = check_err(
+            "(defstruct Point (x : i32) (y : i32))
+             (defn main ()
+               (let ((mut p (Point :x 1 :y 2)))
+                 (set! (.z p) 10)))",
+        );
+        assert!(msg.contains("no field 'z'"), "got: {}", msg);
+    }
+
+    // ── For / ForEach ──────────────────────────────────────────────
+
+    #[test]
+    fn for_loop_basic() {
+        check_ok(
+            "(defn main () : Unit
+               (for (i 0 (< i 10))
+                 (println i)))",
+        );
+    }
+
+    #[test]
+    fn for_loop_condition_must_be_bool() {
+        let msg = check_err(
+            "(defn main ()
+               (for (i 0 42)
+                 (println i)))",
+        );
+        assert!(msg.contains("Bool") || msg.contains("unify"), "got: {}", msg);
+    }
+
+    #[test]
+    fn for_each_basic() {
+        check_ok(
+            "(defn main () : Unit
+               (let ((xs [1 2 3]))
+                 (for-each (x xs)
+                   (println x))))",
+        );
+    }
+
+    #[test]
+    fn for_each_requires_vector() {
+        let msg = check_err(
+            "(defn main ()
+               (for-each (x 42)
+                 (println x)))",
+        );
+        assert!(msg.contains("Vector") || msg.contains("for-each"), "got: {}", msg);
+    }
+
+    // ── Type-name-as-cast ──────────────────────────────────────────
+
+    #[test]
+    fn type_cast_f64() {
+        check_ok(
+            "(defn main () : f64
+               (f64 42))",
+        );
+    }
+
+    #[test]
+    fn type_cast_i32() {
+        check_ok(
+            "(defn main () : i32
+               (i32 3.14))",
+        );
+    }
+
+    #[test]
+    fn type_cast_wrong_arity() {
+        let msg = check_err(
+            "(defn main ()
+               (f64 1 2))",
+        );
+        assert!(msg.contains("1 argument") || msg.contains("arity") || msg.contains("argument"), "got: {}", msg);
+    }
+
+    // ── Defglobal ──────────────────────────────────────────────────
+
+    #[test]
+    fn defglobal_immutable() {
+        check_ok(
+            "(defglobal *x* : i64 42)
+             (defn main () : Unit
+               (println *x*))",
+        );
+    }
+
+    #[test]
+    fn defglobal_mutable() {
+        check_ok(
+            "(defglobal mut *x* : i64 0)
+             (defn main () : Unit
+               (set! *x* 10)
+               (println *x*))",
+        );
+    }
+
+    #[test]
+    fn defglobal_immutable_set_rejected() {
+        let msg = check_err(
+            "(defglobal *x* : i64 42)
+             (defn main ()
+               (set! *x* 10))",
+        );
+        assert!(msg.contains("immutable") || msg.contains("mutable") || msg.contains("cannot"), "got: {}", msg);
+    }
+
+    // ── MutVec / MutMap ────────────────────────────────────────────
+
+    #[test]
+    fn mutvec_basic() {
+        check_ok(
+            "(defn main () : Unit
+               (let ((mut v (mut-vec)))
+                 (push! v 1)
+                 (push! v 2)
+                 (println (len v))))",
+        );
+    }
+
+    #[test]
+    fn mutmap_basic() {
+        check_ok(
+            "(defn main () : Unit
+               (let ((mut m (mut-map)))
+                 (map-set! m 1 2)
+                 (println (map-get m 1))))",
+        );
+    }

@@ -1,0 +1,17 @@
+;; Integration test: struct field mutation via set!
+
+(defstruct Point
+  (x : i32)
+  (y : i32))
+
+(defn main () : Unit
+  ;; Create mutable struct, mutate a field, read back
+  (let ((mut p (Point :x 1 :y 2)))
+    (set! (.x p) 42)
+    (println (.x p))
+    (println (.y p))
+
+    ;; Mutate the other field
+    (set! (.y p) 99)
+    (println (.x p))
+    (println (.y p))))

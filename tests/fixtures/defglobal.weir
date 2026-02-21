@@ -1,0 +1,13 @@
+;; Test defglobal (immutable and mutable)
+
+(defglobal *max-count* : i64 5)
+(defglobal mut *counter* : i64 0)
+
+(defn main () : Unit
+  ;; Read immutable global
+  (println *max-count*)
+
+  ;; Read and mutate mutable global
+  (for (i 0 (< i *max-count*))
+    (set! *counter* (+ *counter* 1)))
+  (println *counter*))

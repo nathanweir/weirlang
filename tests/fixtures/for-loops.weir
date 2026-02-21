@@ -1,0 +1,24 @@
+;; Test for-loops and for-each
+
+(defn main () : Unit
+  ;; Basic for loop: count from 0 to 4
+  (for (i 0 (< i 5))
+    (println i))
+
+  ;; For loop with accumulation via mutable binding
+  (let ((mut sum 0))
+    (for (i 0 (< i 10))
+      (set! sum (+ sum i)))
+    (println sum))
+
+  ;; For-each over a vector
+  (let ((xs [10 20 30]))
+    (for-each (x xs)
+      (println x)))
+
+  ;; Nested for loops
+  (let ((mut total 0))
+    (for (i 0 (< i 3))
+      (for (j 0 (< j 3))
+        (set! total (+ total 1))))
+    (println total)))

@@ -37,6 +37,9 @@ pub(crate) struct TypeChecker<'a> {
     // Scope stack for variable types
     scopes: Vec<HashMap<SmolStr, Ty>>,
 
+    // Scope stack for mutable variable names
+    mut_vars: Vec<HashSet<SmolStr>>,
+
     // Type parameter scope: maps 'a → Ty::Var(id) during resolution
     type_param_scope: HashMap<SmolStr, Ty>,
 
@@ -88,6 +91,7 @@ impl<'a> TypeChecker<'a> {
             deferred_constraints: Vec::new(),
             type_kinds: HashMap::new(),
             scopes: vec![HashMap::new()],
+            mut_vars: vec![HashSet::new()],
             type_param_scope: HashMap::new(),
             errors: Vec::new(),
             expr_types: ArenaMap::default(),
@@ -216,6 +220,8 @@ impl<'a> TypeChecker<'a> {
             ),
             Ty::Vector(elem) => Ty::Vector(Box::new(self.apply(elem))),
             Ty::Map(k, v) => Ty::Map(Box::new(self.apply(k)), Box::new(self.apply(v))),
+            Ty::MutVec(elem) => Ty::MutVec(Box::new(self.apply(elem))),
+            Ty::MutMap(k, v) => Ty::MutMap(Box::new(self.apply(k)), Box::new(self.apply(v))),
             Ty::App(func, args) => {
                 let applied_func = self.apply(func);
                 let applied_args: Vec<Ty> = args.iter().map(|a| self.apply(a)).collect();
@@ -277,6 +283,11 @@ impl<'a> TypeChecker<'a> {
 
             (Ty::Vector(e1), Ty::Vector(e2)) => self.unify(e1, e2, span),
             (Ty::Map(k1, v1), Ty::Map(k2, v2)) => {
+                self.unify(k1, k2, span);
+                self.unify(v1, v2, span);
+            }
+            (Ty::MutVec(e1), Ty::MutVec(e2)) => self.unify(e1, e2, span),
+            (Ty::MutMap(k1, v1), Ty::MutMap(k2, v2)) => {
                 self.unify(k1, k2, span);
                 self.unify(v1, v2, span);
             }
@@ -345,6 +356,8 @@ impl<'a> TypeChecker<'a> {
             }
             Ty::Vector(e) => self.occurs_in(var, e),
             Ty::Map(k, v) => self.occurs_in(var, k) || self.occurs_in(var, v),
+            Ty::MutVec(e) => self.occurs_in(var, e),
+            Ty::MutMap(k, v) => self.occurs_in(var, k) || self.occurs_in(var, v),
             Ty::App(func, args) => {
                 self.occurs_in(var, func) || args.iter().any(|a| self.occurs_in(var, a))
             }
@@ -455,6 +468,11 @@ impl<'a> TypeChecker<'a> {
                 Box::new(self.subst_vars(k, mapping)),
                 Box::new(self.subst_vars(v, mapping)),
             ),
+            Ty::MutVec(e) => Ty::MutVec(Box::new(self.subst_vars(e, mapping))),
+            Ty::MutMap(k, v) => Ty::MutMap(
+                Box::new(self.subst_vars(k, mapping)),
+                Box::new(self.subst_vars(v, mapping)),
+            ),
             Ty::App(func, args) => Ty::App(
                 Box::new(self.subst_vars(func, mapping)),
                 args.iter().map(|a| self.subst_vars(a, mapping)).collect(),
@@ -467,16 +485,31 @@ impl<'a> TypeChecker<'a> {
 
     fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
+        self.mut_vars.push(HashSet::new());
         self.var_provenance.push(HashMap::new());
     }
 
     fn pop_scope(&mut self) {
         self.scopes.pop();
+        self.mut_vars.pop();
         self.var_provenance.pop();
     }
 
     fn define_var(&mut self, name: SmolStr, ty: Ty) {
         self.scopes.last_mut().unwrap().insert(name, ty);
+    }
+
+    fn define_mut(&mut self, name: SmolStr) {
+        self.mut_vars.last_mut().unwrap().insert(name);
+    }
+
+    fn is_var_mut(&self, name: &str) -> bool {
+        for scope in self.mut_vars.iter().rev() {
+            if scope.contains(name) {
+                return true;
+            }
+        }
+        false
     }
 
     fn lookup_var(&self, name: &str) -> Option<Ty> {
@@ -538,6 +571,15 @@ impl<'a> TypeChecker<'a> {
                         }
                         if name == "Map" && arg_tys.len() == 2 {
                             return Ty::Map(
+                                Box::new(arg_tys[0].clone()),
+                                Box::new(arg_tys[1].clone()),
+                            );
+                        }
+                        if name == "MutVec" && arg_tys.len() == 1 {
+                            return Ty::MutVec(Box::new(arg_tys[0].clone()));
+                        }
+                        if name == "MutMap" && arg_tys.len() == 2 {
+                            return Ty::MutMap(
                                 Box::new(arg_tys[0].clone()),
                                 Box::new(arg_tys[1].clone()),
                             );
@@ -672,6 +714,13 @@ impl<'a> TypeChecker<'a> {
         for item in &items {
             if let Item::Instance(d) = item {
                 self.collect_instance(d);
+            }
+        }
+
+        // Pass 5.5: defglobal definitions
+        for item in &items {
+            if let Item::Defglobal(g) = item {
+                self.collect_defglobal(g);
             }
         }
 
@@ -1210,7 +1259,7 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             Ty::Fn(_, _) => TyKind::Star,
-            Ty::Vector(_) | Ty::Map(_, _) | Ty::Atom(_) | Ty::Channel(_) => TyKind::Star,
+            Ty::Vector(_) | Ty::Map(_, _) | Ty::MutVec(_) | Ty::MutMap(_, _) | Ty::Atom(_) | Ty::Channel(_) => TyKind::Star,
             Ty::Var(_) => TyKind::Star,   // type variables default to kind `*`
             Ty::App(_, _) => TyKind::Star, // applied HKT is kind `*`
         }
@@ -1253,6 +1302,10 @@ impl<'a> TypeChecker<'a> {
             }
             Ty::Vector(e) => self.infer_var_arity(var_id, e),
             Ty::Map(k, v) => self
+                .infer_var_arity(var_id, k)
+                .max(self.infer_var_arity(var_id, v)),
+            Ty::MutVec(e) => self.infer_var_arity(var_id, e),
+            Ty::MutMap(k, v) => self
                 .infer_var_arity(var_id, k)
                 .max(self.infer_var_arity(var_id, v)),
             _ => 0,
@@ -1313,6 +1366,24 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    fn collect_defglobal(&mut self, g: &Defglobal) {
+        let saved = self.type_param_scope.clone();
+        self.type_param_scope.clear();
+
+        let ty = if let Some(ann_id) = g.type_ann {
+            self.resolve_type_expr(ann_id)
+        } else {
+            self.fresh_var()
+        };
+
+        self.define_var(g.name.clone(), ty.clone());
+        if g.is_mut {
+            self.define_mut(g.name.clone());
+        }
+
+        self.type_param_scope = saved;
+    }
+
     fn register_builtin_schemes(&mut self) {
         // Builtins use fresh vars at each call site, handled in check_call
         // We just need to register names so they don't show as "undefined"
@@ -1320,6 +1391,7 @@ impl<'a> TypeChecker<'a> {
             "+", "-", "*", "/", "mod", "<", ">", "<=", ">=", "=", "!=", "not", "and", "or",
             "println", "print", "str", "len", "nth", "append", "set-nth", "type-of",
             "sleep", "time-ms", "term-init", "term-restore", "read-key",
+            "mut-vec", "push!", "pop!", "mut-map", "map-set!", "map-get", "map-remove!",
         ];
         for name in builtins {
             self.scopes[0].insert(
@@ -1338,6 +1410,10 @@ impl<'a> TypeChecker<'a> {
             .insert(SmolStr::new("Atom"), TyKind::from_param_count(1));
         self.type_kinds
             .insert(SmolStr::new("Channel"), TyKind::from_param_count(1));
+        self.type_kinds
+            .insert(SmolStr::new("MutVec"), TyKind::from_param_count(1));
+        self.type_kinds
+            .insert(SmolStr::new("MutMap"), TyKind::from_param_count(2));
     }
 
     fn register_shareable_typeclass(&mut self) {
@@ -1403,6 +1479,27 @@ impl<'a> TypeChecker<'a> {
             self.define_var(name.clone(), Ty::Fn(vec![], Box::new(Ty::Unit))); // placeholder
         }
 
+        // Check defglobal init expressions
+        let globals: Vec<_> = self
+            .module
+            .items
+            .iter()
+            .filter_map(|(item, _)| {
+                if let Item::Defglobal(g) = item {
+                    Some(g.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for g in &globals {
+            let val_ty = self.check_expr(g.value);
+            if let Some(var_ty) = self.lookup_var(&g.name) {
+                self.unify(&val_ty, &var_ty, g.span);
+            }
+        }
+
         // Check each top-level function
         let items: Vec<_> = self
             .module
@@ -1463,6 +1560,9 @@ impl<'a> TypeChecker<'a> {
         // Bind parameters
         for (param, ty) in d.params.iter().zip(scheme.param_types.iter()) {
             self.define_var(param.name.clone(), ty.clone());
+            if param.is_mut {
+                self.define_mut(param.name.clone());
+            }
         }
 
         // Check body
@@ -1610,7 +1710,7 @@ impl<'a> TypeChecker<'a> {
     // ── Arena provenance ───────────────────────────────────────
 
     fn is_heap_type(&self, ty: &Ty) -> bool {
-        matches!(ty, Ty::Str | Ty::Vector(_) | Ty::Fn(_, _) | Ty::Map(_, _) | Ty::Con(_, _))
+        matches!(ty, Ty::Str | Ty::Vector(_) | Ty::Fn(_, _) | Ty::Map(_, _) | Ty::MutVec(_) | Ty::MutMap(_, _) | Ty::Con(_, _))
     }
 
     fn compute_provenance(&self, expr_id: ExprId, ty: &Ty) -> u32 {
@@ -1723,6 +1823,9 @@ impl<'a> TypeChecker<'a> {
                         self.define_var(b.name.clone(), ann_ty);
                     } else {
                         self.define_var(b.name.clone(), val_ty);
+                    }
+                    if b.is_mut {
+                        self.define_mut(b.name.clone());
                     }
                     // Track arena provenance for the binding
                     if self.arena_depth > 0 {
@@ -1854,6 +1957,71 @@ impl<'a> TypeChecker<'a> {
             ExprKind::Do { body } => self.check_body(body),
 
             ExprKind::SetBang { place, value } => {
+                let place_expr = &self.module.exprs[*place];
+
+                // Field assignment: (set! (.field obj) value)
+                if let ExprKind::Call { func, args } = &place_expr.kind {
+                    let func_id = *func;
+                    let args = args.clone();
+                    let func_expr = &self.module.exprs[func_id];
+                    if let ExprKind::FieldAccess(field) = &func_expr.kind {
+                        let field = field.clone();
+                        // Verify the target object is a mutable variable
+                        if let Some(arg) = args.first() {
+                            let obj_expr = &self.module.exprs[arg.value];
+                            if let ExprKind::Var(name) = &obj_expr.kind {
+                                if !self.is_var_mut(name) {
+                                    self.error(
+                                        format!("cannot mutate field of immutable binding '{}'", name),
+                                        span,
+                                    );
+                                }
+                            }
+                        }
+                        // Type-check the object and resolve field type
+                        let obj_ty = if !args.is_empty() {
+                            self.check_expr(args[0].value)
+                        } else {
+                            self.error("field assignment requires an object argument".to_string(), span);
+                            return Ty::Error;
+                        };
+                        let field_ty = self.check_field_access(&obj_ty, &field, span);
+                        let val_ty = self.check_expr(*value);
+                        self.unify(&field_ty, &val_ty, span);
+
+                        // Arena escape check for field assignment
+                        if self.arena_depth > 0 {
+                            let val_prov = self.expr_provenance.get(*value).copied().unwrap_or(0);
+                            if val_prov > 0 {
+                                if let Some(arg) = args.first() {
+                                    let obj_expr = &self.module.exprs[arg.value];
+                                    if let ExprKind::Var(name) = &obj_expr.kind {
+                                        let target_prov = self.lookup_provenance(name);
+                                        if target_prov < val_prov {
+                                            self.error(
+                                                "cannot assign arena-allocated value to outer variable".to_string(),
+                                                span,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        return Ty::Unit;
+                    }
+                }
+
+                // Variable assignment: (set! x value)
+                if let ExprKind::Var(name) = &place_expr.kind {
+                    if !self.is_var_mut(name) {
+                        self.error(
+                            format!("cannot mutate immutable binding '{}'", name),
+                            span,
+                        );
+                    }
+                }
+
                 let place_ty = self.check_expr(*place);
                 let val_ty = self.check_expr(*value);
                 self.unify(&place_ty, &val_ty, span);
@@ -2067,6 +2235,56 @@ impl<'a> TypeChecker<'a> {
                 }
                 result_ty
             }
+
+            ExprKind::For { var, init, condition, body, .. } => {
+                let var = var.clone();
+                let init = *init;
+                let condition = *condition;
+                let body = body.clone();
+
+                let init_ty = self.check_expr(init);
+                self.push_scope();
+                self.define_var(var.clone(), init_ty);
+                self.define_mut(var);
+                let cond_ty = self.check_expr(condition);
+                self.unify(&cond_ty, &Ty::Bool, span);
+                self.check_body(&body);
+                self.pop_scope();
+                Ty::Unit
+            }
+
+            ExprKind::ForEach { var, iter, body, .. } => {
+                let var = var.clone();
+                let iter = *iter;
+                let body = body.clone();
+
+                let iter_ty = self.check_expr(iter);
+                let applied = self.apply(&iter_ty);
+                let elem_ty = match &applied {
+                    Ty::Vector(elem) => *elem.clone(),
+                    Ty::MutVec(elem) => *elem.clone(),
+                    Ty::Var(_) => {
+                        // Constrain to Vector
+                        let elem = self.fresh_var();
+                        let vec_ty = Ty::Vector(Box::new(elem.clone()));
+                        self.unify(&iter_ty, &vec_ty, span);
+                        elem
+                    }
+                    _ => {
+                        self.error(
+                            format!("for-each requires a Vector or MutVec, got {}", applied),
+                            span,
+                        );
+                        self.fresh_var()
+                    }
+                };
+                self.push_scope();
+                self.define_var(var.clone(), elem_ty);
+                self.define_mut(var);
+                self.check_body(&body);
+                self.pop_scope();
+                Ty::Unit
+            }
         }
     }
 
@@ -2087,6 +2305,36 @@ impl<'a> TypeChecker<'a> {
             let field = field.clone();
             let obj_ty = self.check_expr(args[0].value);
             return self.check_field_access(&obj_ty, &field, span);
+        }
+
+        // Type-name-as-cast: (f64 x), (i32 x), etc.
+        if let ExprKind::Var(name) = &func_expr.kind {
+            if Self::is_numeric_type_name(name) {
+                if args.len() != 1 {
+                    self.error(
+                        format!("type cast {} requires exactly 1 argument", name),
+                        span,
+                    );
+                    return Ty::Error;
+                }
+                let _arg_ty = self.check_expr(args[0].value);
+                let ret_ty = match name.as_str() {
+                    "f64" => Ty::F64,
+                    "f32" => Ty::F32,
+                    "i64" => Ty::I64,
+                    "i32" => Ty::I32,
+                    "i16" => Ty::I16,
+                    "i8" => Ty::I8,
+                    "u64" => Ty::U64,
+                    "u32" => Ty::U32,
+                    "u16" => Ty::U16,
+                    "u8" => Ty::U8,
+                    _ => unreachable!(),
+                };
+                let func_ty = Ty::Fn(vec![_arg_ty], Box::new(ret_ty.clone()));
+                self.expr_types.insert(func_id, func_ty);
+                return ret_ty;
+            }
         }
 
         // Check for comparison operators (<, >, <=, >=) — these defer an Ord constraint
@@ -2638,6 +2886,14 @@ impl<'a> TypeChecker<'a> {
                 | "term-init"
                 | "term-restore"
                 | "read-key"
+                // Mutable collections
+                | "mut-vec"
+                | "push!"
+                | "pop!"
+                | "mut-map"
+                | "map-set!"
+                | "map-get"
+                | "map-remove!"
         )
     }
 
@@ -2730,10 +2986,11 @@ impl<'a> TypeChecker<'a> {
                     self.error("nth requires 2 arguments", span);
                     return Ty::Error;
                 }
-                if let Ty::Vector(elem) = &self.apply(&arg_tys[0]) {
-                    *elem.clone()
-                } else {
-                    self.fresh_var()
+                let applied = self.apply(&arg_tys[0]);
+                match &applied {
+                    Ty::Vector(elem) => *elem.clone(),
+                    Ty::MutVec(elem) => *elem.clone(),
+                    _ => self.fresh_var(),
                 }
             }
             "append" => {
@@ -3050,6 +3307,83 @@ impl<'a> TypeChecker<'a> {
                 Ty::I64
             }
 
+            // ── Mutable collections ──
+            "mut-vec" => {
+                if !arg_tys.is_empty() {
+                    self.error("mut-vec takes no arguments", span);
+                    return Ty::Error;
+                }
+                let elem = self.fresh_var();
+                Ty::MutVec(Box::new(elem))
+            }
+            "push!" => {
+                if arg_tys.len() != 2 {
+                    self.error("push! requires exactly 2 arguments (mutvec, element)", span);
+                    return Ty::Error;
+                }
+                let elem = self.fresh_var();
+                let mv_ty = Ty::MutVec(Box::new(elem.clone()));
+                self.unify(&arg_tys[0], &mv_ty, span);
+                self.unify(&arg_tys[1], &elem, span);
+                Ty::Unit
+            }
+            "pop!" => {
+                if arg_tys.len() != 1 {
+                    self.error("pop! requires exactly 1 argument (mutvec)", span);
+                    return Ty::Error;
+                }
+                let elem = self.fresh_var();
+                let mv_ty = Ty::MutVec(Box::new(elem.clone()));
+                self.unify(&arg_tys[0], &mv_ty, span);
+                elem
+            }
+            "mut-map" => {
+                if !arg_tys.is_empty() {
+                    self.error("mut-map takes no arguments", span);
+                    return Ty::Error;
+                }
+                let k = self.fresh_var();
+                let v = self.fresh_var();
+                Ty::MutMap(Box::new(k), Box::new(v))
+            }
+            "map-set!" => {
+                if arg_tys.len() != 3 {
+                    self.error("map-set! requires exactly 3 arguments (mutmap, key, value)", span);
+                    return Ty::Error;
+                }
+                let k = self.fresh_var();
+                let v = self.fresh_var();
+                let mm_ty = Ty::MutMap(Box::new(k.clone()), Box::new(v.clone()));
+                self.unify(&arg_tys[0], &mm_ty, span);
+                self.unify(&arg_tys[1], &k, span);
+                self.unify(&arg_tys[2], &v, span);
+                Ty::Unit
+            }
+            "map-get" => {
+                if arg_tys.len() != 2 {
+                    self.error("map-get requires exactly 2 arguments (mutmap, key)", span);
+                    return Ty::Error;
+                }
+                let k = self.fresh_var();
+                let v = self.fresh_var();
+                let mm_ty = Ty::MutMap(Box::new(k.clone()), Box::new(v.clone()));
+                self.unify(&arg_tys[0], &mm_ty, span);
+                self.unify(&arg_tys[1], &k, span);
+                v
+            }
+            "map-remove!" => {
+                if arg_tys.len() != 2 {
+                    self.error("map-remove! requires exactly 2 arguments (mutmap, key)", span);
+                    return Ty::Error;
+                }
+                let k = self.fresh_var();
+                let v = self.fresh_var();
+                let mm_ty = Ty::MutMap(Box::new(k.clone()), Box::new(v));
+                self.unify(&arg_tys[0], &mm_ty, span);
+                self.unify(&arg_tys[1], &k, span);
+                Ty::Unit
+            }
+
             _ => {
                 self.error(format!("unknown builtin '{}'", name), span);
                 Ty::Error
@@ -3058,6 +3392,13 @@ impl<'a> TypeChecker<'a> {
     }
 
     // ── Numeric defaulting ───────────────────────────────────────
+
+    fn is_numeric_type_name(name: &str) -> bool {
+        matches!(
+            name,
+            "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "f32" | "f64"
+        )
+    }
 
     fn default_numeric_vars(&mut self) {
         for i in 0..self.subst.len() {

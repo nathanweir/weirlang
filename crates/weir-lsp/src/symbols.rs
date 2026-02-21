@@ -128,6 +128,19 @@ pub fn document_symbols(module: &Module, line_index: &LineIndex) -> Vec<Document
                     },
                 });
             }
+            Item::Defglobal(g) => {
+                let selection_range = line_index.span_to_range(g.name_span);
+                symbols.push(DocumentSymbol {
+                    name: g.name.to_string(),
+                    detail: Some(if g.is_mut { "mut global" } else { "global" }.into()),
+                    kind: SymbolKind::VARIABLE,
+                    tags: None,
+                    deprecated: None,
+                    range,
+                    selection_range,
+                    children: None,
+                });
+            }
             _ => {}
         }
     }

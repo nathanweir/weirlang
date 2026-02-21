@@ -58,3 +58,12 @@ When completing features or phases, always update `design/implementation-plan.md
 - Mark completed items with `[x]`
 - Update test counts if mentioned
 - Add notes about what was implemented if the description was aspirational
+
+## Documentation Site Maintenance
+
+When implementing language changes (new syntax, new features, changed semantics), update the docs site in `docs/src/content/docs/` as a finishing step:
+- `guide/syntax.mdx` — Syntax changes, new forms, new operators
+- `guide/data-types.mdx` — Type system changes, new types, struct features
+- `guide/functions.mdx` — Function features, mutability, closures
+- `stdlib/builtins.mdx` — New builtins or standard library changes
+- `concepts/` — Architecture/compilation pipeline changes

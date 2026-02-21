@@ -174,6 +174,14 @@ fn extract_symbols(uri: &Url, text: &str) -> (Vec<WorkspaceSymbol>, LineIndex) {
                     });
                 }
             }
+            Item::Defglobal(g) => {
+                symbols.push(WorkspaceSymbol {
+                    name: g.name.to_string(),
+                    kind: SymbolKind::LetBinding,
+                    name_span: g.name_span,
+                    uri: uri.clone(),
+                });
+            }
             _ => {}
         }
     }

@@ -12,6 +12,9 @@ use weir_runtime::{
     weir_gc_suppress, weir_gc_unsuppress, weir_gc_vec_alloc, weir_par_for_each, weir_par_map,
     weir_shadow_pop, weir_shadow_push, weir_thread_join, weir_thread_spawn, weir_vec_append,
     weir_vec_get, weir_vec_len, weir_vec_set,
+    weir_mutvec_create, weir_mutvec_push, weir_mutvec_pop, weir_mutvec_get, weir_mutvec_set,
+    weir_mutvec_len, weir_mutmap_create, weir_mutmap_set, weir_mutmap_get, weir_mutmap_remove,
+    weir_mutmap_len,
 };
 
 std::thread_local! {
@@ -395,4 +398,16 @@ pub(crate) fn register_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol("weir_term_init", weir_term_init as *const u8);
     builder.symbol("weir_term_restore", weir_term_restore as *const u8);
     builder.symbol("weir_read_key", weir_read_key as *const u8);
+    // MutVec / MutMap
+    builder.symbol("weir_mutvec_create", weir_mutvec_create as *const u8);
+    builder.symbol("weir_mutvec_push", weir_mutvec_push as *const u8);
+    builder.symbol("weir_mutvec_pop", weir_mutvec_pop as *const u8);
+    builder.symbol("weir_mutvec_get", weir_mutvec_get as *const u8);
+    builder.symbol("weir_mutvec_set", weir_mutvec_set as *const u8);
+    builder.symbol("weir_mutvec_len", weir_mutvec_len as *const u8);
+    builder.symbol("weir_mutmap_create", weir_mutmap_create as *const u8);
+    builder.symbol("weir_mutmap_set", weir_mutmap_set as *const u8);
+    builder.symbol("weir_mutmap_get", weir_mutmap_get as *const u8);
+    builder.symbol("weir_mutmap_remove", weir_mutmap_remove as *const u8);
+    builder.symbol("weir_mutmap_len", weir_mutmap_len as *const u8);
 }

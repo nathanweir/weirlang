@@ -635,6 +635,225 @@ pub extern "C" fn weir_par_for_each(closure_ptr: i64, vec_ptr: i64) {
     }
 }
 
+// ── MutVec (mutable vector with capacity) ───────────────────────
+//
+// Layout: [capacity: i64, length: i64, elem_0, elem_1, ...]
+// Uses raw allocation (not GC-managed). The caller is responsible for
+// keeping the pointer alive. This is safe because MutVec is not
+// Shareable and has single-owner semantics.
+
+const MUTVEC_INITIAL_CAPACITY: i64 = 8;
+
+/// Create a new empty MutVec with initial capacity 8.
+#[unsafe(no_mangle)]
+pub extern "C" fn weir_mutvec_create() -> i64 {
+    let capacity = MUTVEC_INITIAL_CAPACITY;
+    let total_bytes = ((2 + capacity) * 8) as usize;
+    let layout = Layout::from_size_align(total_bytes, 8).unwrap();
+    let raw = unsafe { alloc::alloc_zeroed(layout) };
+    if raw.is_null() {
+        alloc::handle_alloc_error(layout);
+    }
+    let data = raw as *mut i64;
+    unsafe {
+        *data = capacity;        // slot 0: capacity
+        *data.add(1) = 0;        // slot 1: length
+    }
+    raw as i64
+}
+
+/// Push an element onto a MutVec. Returns the (possibly new) pointer.
+#[unsafe(no_mangle)]
+pub extern "C" fn weir_mutvec_push(ptr: i64, val: i64) -> i64 {
+    let data = ptr as *mut i64;
+    let capacity = unsafe { *data };
+    let length = unsafe { *data.add(1) };
+
+    if length >= capacity {
+        // Grow: double capacity
+        let new_capacity = capacity * 2;
+        let old_total = ((2 + capacity) * 8) as usize;
+        let new_total = ((2 + new_capacity) * 8) as usize;
+        let old_layout = Layout::from_size_align(old_total, 8).unwrap();
+        let new_raw = unsafe { alloc::realloc(ptr as *mut u8, old_layout, new_total) };
+        if new_raw.is_null() {
+            let new_layout = Layout::from_size_align(new_total, 8).unwrap();
+            alloc::handle_alloc_error(new_layout);
+        }
+        // Zero the new portion
+        unsafe {
+            ptr::write_bytes(new_raw.add(old_total), 0, new_total - old_total);
+        }
+        let new_data = new_raw as *mut i64;
+        unsafe {
+            *new_data = new_capacity;
+            *new_data.add(1) = length + 1;
+            *new_data.add(2 + length as usize) = val;
+        }
+        new_raw as i64
+    } else {
+        unsafe {
+            *data.add(1) = length + 1;
+            *data.add(2 + length as usize) = val;
+        }
+        ptr
+    }
+}
+
+/// Pop the last element from a MutVec. Returns the element value.
+#[unsafe(no_mangle)]
+pub extern "C" fn weir_mutvec_pop(ptr: i64) -> i64 {
+    let data = ptr as *mut i64;
+    let length = unsafe { *data.add(1) };
+    if length <= 0 {
+        return 0; // empty vec
+    }
+    let val = unsafe { *data.add(2 + (length - 1) as usize) };
+    unsafe { *data.add(1) = length - 1; }
+    val
+}
+
+/// Get an element from a MutVec at the given index.
+#[unsafe(no_mangle)]
+pub extern "C" fn weir_mutvec_get(ptr: i64, idx: i64) -> i64 {
+    let data = ptr as *const i64;
+    unsafe { *data.add(2 + idx as usize) }
+}
+
+/// Set an element in a MutVec at the given index.
+#[unsafe(no_mangle)]
+pub extern "C" fn weir_mutvec_set(ptr: i64, idx: i64, val: i64) {
+    let data = ptr as *mut i64;
+    unsafe { *data.add(2 + idx as usize) = val; }
+}
+
+/// Get the length of a MutVec.
+#[unsafe(no_mangle)]
+pub extern "C" fn weir_mutvec_len(ptr: i64) -> i64 {
+    let data = ptr as *const i64;
+    unsafe { *data.add(1) }
+}
+
+// ── MutMap (mutable map with linear scan) ────────────────────────
+//
+// Layout: [capacity: i64, length: i64, key_0, val_0, key_1, val_1, ...]
+// Each entry is a (key, value) pair occupying 2 slots.
+// Uses raw allocation. Linear scan for lookup — fine for game-sized maps.
+
+const MUTMAP_INITIAL_CAPACITY: i64 = 16; // number of entries
+
+/// Create a new empty MutMap.
+#[unsafe(no_mangle)]
+pub extern "C" fn weir_mutmap_create() -> i64 {
+    let capacity = MUTMAP_INITIAL_CAPACITY;
+    let total_bytes = ((2 + capacity * 2) * 8) as usize;
+    let layout = Layout::from_size_align(total_bytes, 8).unwrap();
+    let raw = unsafe { alloc::alloc_zeroed(layout) };
+    if raw.is_null() {
+        alloc::handle_alloc_error(layout);
+    }
+    let data = raw as *mut i64;
+    unsafe {
+        *data = capacity;         // slot 0: capacity (# of entries)
+        *data.add(1) = 0;         // slot 1: length (# of entries)
+    }
+    raw as i64
+}
+
+/// Insert or update a key-value pair. Returns the (possibly new) pointer.
+#[unsafe(no_mangle)]
+pub extern "C" fn weir_mutmap_set(ptr: i64, key: i64, val: i64) -> i64 {
+    let data = ptr as *mut i64;
+    let capacity = unsafe { *data };
+    let length = unsafe { *data.add(1) };
+
+    // Check if key already exists (linear scan)
+    for i in 0..length as usize {
+        let k = unsafe { *data.add(2 + i * 2) };
+        if k == key {
+            // Update existing entry
+            unsafe { *data.add(2 + i * 2 + 1) = val; }
+            return ptr;
+        }
+    }
+
+    // Need to insert new entry
+    if length >= capacity {
+        // Grow: double capacity
+        let new_capacity = capacity * 2;
+        let old_total = ((2 + capacity * 2) * 8) as usize;
+        let new_total = ((2 + new_capacity * 2) * 8) as usize;
+        let old_layout = Layout::from_size_align(old_total, 8).unwrap();
+        let new_raw = unsafe { alloc::realloc(ptr as *mut u8, old_layout, new_total) };
+        if new_raw.is_null() {
+            let new_layout = Layout::from_size_align(new_total, 8).unwrap();
+            alloc::handle_alloc_error(new_layout);
+        }
+        unsafe {
+            ptr::write_bytes(new_raw.add(old_total), 0, new_total - old_total);
+        }
+        let new_data = new_raw as *mut i64;
+        unsafe {
+            *new_data = new_capacity;
+            *new_data.add(1) = length + 1;
+            *new_data.add(2 + length as usize * 2) = key;
+            *new_data.add(2 + length as usize * 2 + 1) = val;
+        }
+        new_raw as i64
+    } else {
+        unsafe {
+            *data.add(1) = length + 1;
+            *data.add(2 + length as usize * 2) = key;
+            *data.add(2 + length as usize * 2 + 1) = val;
+        }
+        ptr
+    }
+}
+
+/// Get a value from a MutMap by key. Returns 0 if not found.
+#[unsafe(no_mangle)]
+pub extern "C" fn weir_mutmap_get(ptr: i64, key: i64) -> i64 {
+    let data = ptr as *const i64;
+    let length = unsafe { *data.add(1) };
+    for i in 0..length as usize {
+        let k = unsafe { *data.add(2 + i * 2) };
+        if k == key {
+            return unsafe { *data.add(2 + i * 2 + 1) };
+        }
+    }
+    0 // not found
+}
+
+/// Remove an entry from a MutMap by key.
+#[unsafe(no_mangle)]
+pub extern "C" fn weir_mutmap_remove(ptr: i64, key: i64) {
+    let data = ptr as *mut i64;
+    let length = unsafe { *data.add(1) } as usize;
+    for i in 0..length {
+        let k = unsafe { *data.add(2 + i * 2) };
+        if k == key {
+            // Swap with last entry
+            if i < length - 1 {
+                let last_key = unsafe { *data.add(2 + (length - 1) * 2) };
+                let last_val = unsafe { *data.add(2 + (length - 1) * 2 + 1) };
+                unsafe {
+                    *data.add(2 + i * 2) = last_key;
+                    *data.add(2 + i * 2 + 1) = last_val;
+                }
+            }
+            unsafe { *data.add(1) = (length - 1) as i64; }
+            return;
+        }
+    }
+}
+
+/// Get the number of entries in a MutMap.
+#[unsafe(no_mangle)]
+pub extern "C" fn weir_mutmap_len(ptr: i64) -> i64 {
+    let data = ptr as *const i64;
+    unsafe { *data.add(1) }
+}
+
 // ── Reset (for testing) ─────────────────────────────────────────
 
 /// Reset the GC heap (free everything). Used for test isolation.

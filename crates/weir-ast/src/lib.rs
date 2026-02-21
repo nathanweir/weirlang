@@ -69,6 +69,7 @@ pub enum Item {
     Import(Import),
     Declare(Declare),
     ExternC(ExternC),
+    Defglobal(Defglobal),
 }
 
 /// Function definition: `(defn name (params) : return-type body...)`
@@ -209,6 +210,18 @@ pub struct ExternC {
     pub span: Span,
 }
 
+/// Global binding: `(defglobal name : type value)` or `(defglobal mut name : type value)`
+#[derive(Debug, Clone)]
+pub struct Defglobal {
+    pub name: SmolStr,
+    pub name_span: Span,
+    pub type_ann: Option<TypeExprId>,
+    pub value: ExprId,
+    pub is_mut: bool,
+    pub is_pub: bool,
+    pub span: Span,
+}
+
 // ── Expressions ───────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -291,6 +304,21 @@ pub enum ExprKind {
     /// Platform conditional: `(target (:native expr) (:wasm expr))`
     Target {
         branches: Vec<(SmolStr, ExprId)>,
+    },
+    /// Counted for loop: `(for (var init condition) body...)`
+    For {
+        var: SmolStr,
+        var_span: Span,
+        init: ExprId,
+        condition: ExprId,
+        body: Vec<ExprId>,
+    },
+    /// Collection iteration: `(for-each (var collection) body...)`
+    ForEach {
+        var: SmolStr,
+        var_span: Span,
+        iter: ExprId,
+        body: Vec<ExprId>,
     },
 }
 
@@ -438,6 +466,7 @@ impl<'a> PrettyPrinter<'a> {
             Item::Import(d) => self.print_import(d),
             Item::Declare(d) => self.print_declare(d),
             Item::ExternC(d) => self.print_extern_c(d),
+            Item::Defglobal(d) => self.print_defglobal(d),
         }
     }
 
@@ -641,6 +670,20 @@ impl<'a> PrettyPrinter<'a> {
         }
         self.indent -= 1;
         self.writeln(")");
+    }
+
+    fn print_defglobal(&mut self, d: &Defglobal) {
+        let pub_str = if d.is_pub { " pub" } else { "" };
+        let mut_str = if d.is_mut { " mut" } else { "" };
+        self.write_indent();
+        self.buf.push_str(&format!("(defglobal{}{} {}", pub_str, mut_str, d.name));
+        if let Some(t) = d.type_ann {
+            self.buf.push_str(" : ");
+            self.print_type_expr(t);
+        }
+        self.buf.push_str(" = ");
+        self.print_expr(d.value);
+        self.buf.push_str(")\n");
     }
 
     fn print_expr(&mut self, id: ExprId) {
@@ -891,6 +934,32 @@ impl<'a> PrettyPrinter<'a> {
                     self.buf.push(' ');
                     self.print_expr(*expr);
                     self.buf.push(')');
+                }
+                self.buf.push(')');
+            }
+            ExprKind::For { var, init, condition, body, .. } => {
+                self.buf.push_str("(for (");
+                self.buf.push_str(var);
+                self.buf.push(' ');
+                self.print_expr(*init);
+                self.buf.push(' ');
+                self.print_expr(*condition);
+                self.buf.push(')');
+                for &e in body {
+                    self.buf.push(' ');
+                    self.print_expr(e);
+                }
+                self.buf.push(')');
+            }
+            ExprKind::ForEach { var, iter, body, .. } => {
+                self.buf.push_str("(for-each (");
+                self.buf.push_str(var);
+                self.buf.push(' ');
+                self.print_expr(*iter);
+                self.buf.push(')');
+                for &e in body {
+                    self.buf.push(' ');
+                    self.print_expr(e);
                 }
                 self.buf.push(')');
             }

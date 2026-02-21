@@ -144,7 +144,14 @@ Weir is immutable by default. Use `mut` to make a binding reassignable:
   x)               ;; => 6
 ```
 
-There are no mutable references — functions cannot modify the caller's data. Use functional struct update to create modified copies:
+Struct fields can also be mutated in place if the binding is `mut`:
+
+```lisp
+(let ((mut enemy (Enemy :pos (Vec2 0.0 0.0) :health 100 :state Idle)))
+  (set! (.health enemy) (- (.health enemy) 25)))
+```
+
+This is purely local mutation — there are no mutable references. Functions cannot modify the caller's data. For functional-style updates, create modified copies:
 
 ```lisp
 (defn damage ((e : Enemy) (amount : i32)) : Enemy
@@ -173,3 +180,55 @@ Functions are private by default. Use `pub` to make them accessible from other m
 (pub defn spawn-enemy ((pos : Vec2) (health : i32)) : Enemy
   ...)
 ```
+
+## Loops
+
+### for (Counted Loop)
+
+`for` iterates a variable from an initial value while a condition holds, incrementing by 1 each iteration:
+
+```lisp
+;; Print 0 through 4
+(for (i 0 (< i 5))
+  (println i))
+
+;; Accumulate a sum
+(let ((mut sum 0))
+  (for (i 0 (< i 100))
+    (set! sum (+ sum i)))
+  (println sum))
+```
+
+The loop variable is implicitly `mut`. `for` returns `Unit`.
+
+### for-each (Collection Iteration)
+
+`for-each` iterates over the elements of a vector:
+
+```lisp
+(let ((enemies [enemy1 enemy2 enemy3]))
+  (for-each (e enemies)
+    (update-enemy! e)))
+```
+
+The iteration variable is bound to each element in order. `for-each` returns `Unit`.
+
+## Global Bindings (defglobal)
+
+`defglobal` defines a top-level binding, either immutable or mutable:
+
+```lisp
+;; Immutable global
+(defglobal *max-enemies* : i32 100)
+
+;; Mutable global
+(defglobal mut *camera-x* : f64 0.0)
+```
+
+Mutable globals can be modified with `set!`:
+
+```lisp
+(set! *camera-x* (+ *camera-x* (* speed delta)))
+```
+
+Immutable globals cannot be mutated — the compiler enforces this statically.

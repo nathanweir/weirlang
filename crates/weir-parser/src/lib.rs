@@ -209,6 +209,9 @@ impl Parser {
         } else if self.check_symbol("extern") {
             self.advance();
             self.parse_extern_c().map(Item::ExternC)
+        } else if self.check_symbol("defglobal") {
+            self.advance();
+            self.parse_defglobal(is_pub).map(Item::Defglobal)
         } else {
             let span = self.peek_span();
             self.error(
@@ -720,6 +723,33 @@ impl Parser {
         })
     }
 
+    // ── defglobal ─────────────────────────────────────────────────
+
+    fn parse_defglobal(&mut self, is_pub: bool) -> Option<Defglobal> {
+        let start = self.peek_span();
+        let is_mut = self.eat_symbol("mut");
+        let (name, name_span) = self.expect_symbol()?;
+
+        let type_ann = if self.eat(&Token::Colon) {
+            Some(self.parse_type_expr()?)
+        } else {
+            None
+        };
+
+        let value = self.parse_expr()?;
+
+        let end = self.peek_span();
+        Some(Defglobal {
+            name,
+            name_span,
+            type_ann,
+            value,
+            is_mut,
+            is_pub,
+            span: start.merge(end),
+        })
+    }
+
     // ── Expressions ───────────────────────────────────────────────
 
     fn try_parse_expr(&mut self) -> Option<ExprId> {
@@ -872,6 +902,12 @@ impl Parser {
         } else if self.check_symbol("target") {
             self.advance();
             self.parse_target_body(start)
+        } else if self.check_symbol("for") {
+            self.advance();
+            self.parse_for_body(start)
+        } else if self.check_symbol("for-each") {
+            self.advance();
+            self.parse_for_each_body(start)
         } else {
             self.parse_call_body(start)
         };
@@ -1152,6 +1188,46 @@ impl Parser {
             return None;
         }
         Some(ExprKind::Target { branches })
+    }
+
+    fn parse_for_body(&mut self, _start: Span) -> Option<ExprKind> {
+        // (for (var init condition) body...)
+        self.expect(&Token::LParen)?;
+        let (var, var_span) = self.expect_symbol()?;
+        let init = self.parse_expr()?;
+        let condition = self.parse_expr()?;
+        self.expect(&Token::RParen)?;
+
+        let mut body = Vec::new();
+        while !self.at_end() && !self.check(&Token::RParen) {
+            body.push(self.parse_expr()?);
+        }
+        Some(ExprKind::For {
+            var,
+            var_span,
+            init,
+            condition,
+            body,
+        })
+    }
+
+    fn parse_for_each_body(&mut self, _start: Span) -> Option<ExprKind> {
+        // (for-each (var collection) body...)
+        self.expect(&Token::LParen)?;
+        let (var, var_span) = self.expect_symbol()?;
+        let iter = self.parse_expr()?;
+        self.expect(&Token::RParen)?;
+
+        let mut body = Vec::new();
+        while !self.at_end() && !self.check(&Token::RParen) {
+            body.push(self.parse_expr()?);
+        }
+        Some(ExprKind::ForEach {
+            var,
+            var_span,
+            iter,
+            body,
+        })
     }
 
     fn parse_call_body(&mut self, _start: Span) -> Option<ExprKind> {

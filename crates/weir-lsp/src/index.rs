@@ -347,6 +347,16 @@ impl<'a> IndexBuilder<'a> {
                         );
                     }
                 }
+                Item::Defglobal(g) => {
+                    self.add_scope_def(
+                        module_scope,
+                        &g.name,
+                        SymbolKind::LetBinding,
+                        g.name_span,
+                        *item_span,
+                        None,
+                    );
+                }
                 _ => {}
             }
         }
@@ -361,6 +371,9 @@ impl<'a> IndexBuilder<'a> {
                     for method in &inst.methods {
                         self.walk_defn(method, module_scope, method.span);
                     }
+                }
+                Item::Defglobal(g) => {
+                    self.walk_expr(g.value, module_scope);
                 }
                 _ => {}
             }
@@ -514,6 +527,39 @@ impl<'a> IndexBuilder<'a> {
             ExprKind::Target { branches } => {
                 for (_name, expr) in branches {
                     self.walk_expr(*expr, scope);
+                }
+            }
+            ExprKind::For { var, var_span, init, condition, body, .. } => {
+                let for_span = expr_span;
+                let for_scope = self.push_scope(ScopeKind::Let, for_span, Some(scope));
+                self.walk_expr(*init, for_scope);
+                self.add_scope_def(
+                    for_scope,
+                    var,
+                    SymbolKind::LetBinding,
+                    *var_span,
+                    *var_span,
+                    None,
+                );
+                self.walk_expr(*condition, for_scope);
+                for &e in body {
+                    self.walk_expr(e, for_scope);
+                }
+            }
+            ExprKind::ForEach { var, var_span, iter, body, .. } => {
+                let foreach_span = expr_span;
+                let foreach_scope = self.push_scope(ScopeKind::Let, foreach_span, Some(scope));
+                self.walk_expr(*iter, foreach_scope);
+                self.add_scope_def(
+                    foreach_scope,
+                    var,
+                    SymbolKind::LetBinding,
+                    *var_span,
+                    *var_span,
+                    None,
+                );
+                for &e in body {
+                    self.walk_expr(e, foreach_scope);
                 }
             }
             ExprKind::Lit(_) | ExprKind::FieldAccess(_) => {}

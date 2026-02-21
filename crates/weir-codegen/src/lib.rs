@@ -63,6 +63,8 @@ pub(crate) fn ty_to_cl_with(
         Ty::Ptr => Some(types::I64), // raw pointer (FFI), same size as i64
         Ty::Str => Some(types::I64), // pointer to null-terminated C string
         Ty::Vector(_) => Some(types::I64), // pointer to heap [len, elem_0, ...]
+        Ty::MutVec(_) => Some(types::I64), // pointer to [capacity, len, elem_0, ...]
+        Ty::MutMap(_, _) => Some(types::I64), // pointer to [capacity, len, k0, v0, ...]
         Ty::Fn(_, _) => Some(types::I64), // pointer to heap closure object
         Ty::Unit => None, // void — no value
         Ty::Con(name, _) => {
@@ -151,8 +153,10 @@ pub fn compile_and_run(
 
     let mut compiler = Compiler::new(module, type_info, jit_module);
     compiler.declare_runtime_helpers()?;
+    compiler.declare_globals()?;
     compiler.declare_user_functions(Linkage::Local)?;
     compiler.compile_user_functions()?;
+    compiler.compile_global_inits()?;
     compiler
         .module
         .finalize_definitions()
@@ -243,6 +247,8 @@ pub(crate) struct Compiler<'a, M: Module> {
     struct_names: HashSet<SmolStr>,
     /// Counter for generating unique lambda names
     lambda_counter: usize,
+    /// Defglobal data storage: name -> (DataId, type)
+    globals: HashMap<SmolStr, (DataId, Ty)>,
 }
 
 impl<'a, M: Module> Compiler<'a, M> {
@@ -305,6 +311,7 @@ impl<'a, M: Module> Compiler<'a, M> {
             constructor_tags,
             struct_names,
             lambda_counter: 0,
+            globals: HashMap::new(),
         }
     }
 
@@ -399,6 +406,19 @@ impl<'a, M: Module> Compiler<'a, M> {
             ("term_init",    "weir_term_init",     &[],                        None),
             ("term_restore", "weir_term_restore",  &[],                        None),
             ("read_key",     "weir_read_key",      &[],                        Some(types::I64)),
+            // MutVec
+            ("mutvec_create","weir_mutvec_create",  &[],                                       Some(types::I64)),
+            ("mutvec_push",  "weir_mutvec_push",    &[types::I64, types::I64],                 Some(types::I64)),
+            ("mutvec_pop",   "weir_mutvec_pop",     &[types::I64],                             Some(types::I64)),
+            ("mutvec_get",   "weir_mutvec_get",     &[types::I64, types::I64],                 Some(types::I64)),
+            ("mutvec_set",   "weir_mutvec_set",     &[types::I64, types::I64, types::I64],     None),
+            ("mutvec_len",   "weir_mutvec_len",     &[types::I64],                             Some(types::I64)),
+            // MutMap
+            ("mutmap_create","weir_mutmap_create",  &[],                                       Some(types::I64)),
+            ("mutmap_set",   "weir_mutmap_set",     &[types::I64, types::I64, types::I64],     Some(types::I64)),
+            ("mutmap_get",   "weir_mutmap_get",     &[types::I64, types::I64],                 Some(types::I64)),
+            ("mutmap_remove","weir_mutmap_remove",  &[types::I64, types::I64],                 None),
+            ("mutmap_len",   "weir_mutmap_len",     &[types::I64],                             Some(types::I64)),
         ];
 
         for &(key, symbol, params, ret) in helpers {
@@ -424,6 +444,134 @@ impl<'a, M: Module> Compiler<'a, M> {
 
     fn ty_cl(&self, ty: &Ty) -> Option<Type> {
         ty_to_cl_with(ty, Some(&self.tagged_adts), Some(&self.struct_names))
+    }
+
+    /// Declare storage for defglobal items (8-byte writable data sections).
+    pub(crate) fn declare_globals(&mut self) -> Result<(), CodegenError> {
+        for (item, _) in &self.ast_module.items {
+            if let Item::Defglobal(g) = item {
+                let ty = self.type_info.expr_types.get(g.value).cloned().unwrap_or(Ty::I64);
+                let data_id = self.module
+                    .declare_data(&g.name, Linkage::Local, true, false)
+                    .map_err(|e| CodegenError::new(format!("declare global '{}': {}", g.name, e)))?;
+                let mut data_desc = DataDescription::new();
+                data_desc.define_zeroinit(8);
+                self.module
+                    .define_data(data_id, &data_desc)
+                    .map_err(|e| CodegenError::new(format!("define global '{}': {}", g.name, e)))?;
+                self.globals.insert(g.name.clone(), (data_id, ty));
+            }
+        }
+        Ok(())
+    }
+
+    /// Compile init expressions for defglobal items and store results into their data sections.
+    /// Generates a `__weir_init_globals` function that runs before main.
+    pub(crate) fn compile_global_inits(&mut self) -> Result<(), CodegenError> {
+        // Collect defglobal items
+        let defglobals: Vec<Defglobal> = self
+            .ast_module
+            .items
+            .iter()
+            .filter_map(|(item, _)| {
+                if let Item::Defglobal(g) = item {
+                    Some(g.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if defglobals.is_empty() {
+            return Ok(());
+        }
+
+        // Declare the init function: () -> void
+        let mut sig = self.module.make_signature();
+        sig.call_conv = CallConv::SystemV;
+        let init_id = self
+            .module
+            .declare_function("__weir_init_globals", Linkage::Export, &sig)
+            .map_err(|e| CodegenError::new(format!("declare __weir_init_globals: {}", e)))?;
+
+        let mut func =
+            Function::with_name_signature(cranelift_codegen::ir::UserFuncName::default(), sig);
+        let mut fb_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut func, &mut fb_ctx);
+
+        let entry_block = builder.create_block();
+        builder.switch_to_block(entry_block);
+        builder.seal_block(entry_block);
+
+        {
+            let mut fn_ctx = FnCompileCtx {
+                builder: &mut builder,
+                ast_module: self.ast_module,
+                type_info: self.type_info,
+                user_fns: &self.user_fns,
+                runtime_fns: &self.runtime_fns,
+                module: &mut self.module,
+                vars: HashMap::new(),
+                fn_table_slots: None,
+                table_data_id: None,
+                tagged_adts: &self.tagged_adts,
+                constructor_tags: &self.constructor_tags,
+                struct_names: &self.struct_names,
+                globals: &self.globals,
+                pending_lambdas: Vec::new(),
+                lambda_counter: &mut self.lambda_counter,
+                type_subst: HashMap::new(),
+                shadow_depth: 0,
+                arena_stack: Vec::new(),
+                current_fn_name: None,
+                loop_header: None,
+                tail_positions: HashSet::new(),
+                tail_jump_emitted: false,
+                param_vars: Vec::new(),
+            };
+
+            for g in &defglobals {
+                let ty = fn_ctx
+                    .type_info
+                    .expr_types
+                    .get(g.value)
+                    .cloned()
+                    .unwrap_or(Ty::I64);
+                let val = fn_ctx.compile_expr(g.value, &ty)?;
+
+                if let Some((data_id, _)) = fn_ctx.globals.get(&g.name) {
+                    let data_id = *data_id;
+                    let gv = fn_ctx
+                        .module
+                        .declare_data_in_func(data_id, fn_ctx.builder.func);
+                    let addr = fn_ctx.builder.ins().global_value(types::I64, gv);
+                    if let Some(v) = val {
+                        let widened = fn_ctx.widen_to_i64(v, &ty);
+                        fn_ctx
+                            .builder
+                            .ins()
+                            .store(MemFlags::trusted(), widened, addr, 0);
+                    }
+                }
+            }
+
+            fn_ctx.builder.ins().return_(&[]);
+        }
+
+        builder.finalize();
+
+        let mut ctx = Context::for_function(func);
+        self.module
+            .define_function(init_id, &mut ctx)
+            .map_err(|e| CodegenError::new(format!("define __weir_init_globals: {}", e)))?;
+
+        // Store the init function ID so run_main can call it
+        self.user_fns.insert(
+            SmolStr::from("__weir_init_globals"),
+            (init_id, vec![], Ty::Unit),
+        );
+
+        Ok(())
     }
 
     pub(crate) fn declare_user_functions(&mut self, linkage: Linkage) -> Result<(), CodegenError> {
@@ -981,6 +1129,7 @@ impl<'a, M: Module> Compiler<'a, M> {
                 tagged_adts: &self.tagged_adts,
                 constructor_tags: &self.constructor_tags,
                 struct_names: &self.struct_names,
+                globals: &self.globals,
                 pending_lambdas: Vec::new(),
                 lambda_counter: &mut self.lambda_counter,
                 type_subst: type_subst.clone(),
@@ -1160,6 +1309,7 @@ impl<'a, M: Module> Compiler<'a, M> {
                 tagged_adts: &self.tagged_adts,
                 constructor_tags: &self.constructor_tags,
                 struct_names: &self.struct_names,
+                globals: &self.globals,
                 pending_lambdas: Vec::new(),
                 lambda_counter: &mut self.lambda_counter,
                 type_subst: info.type_subst.clone(),
@@ -1246,6 +1396,15 @@ impl<'a, M: Module> Compiler<'a, M> {
 
 impl Compiler<'_, JITModule> {
     fn run_main(&self) -> Result<String, CodegenError> {
+        // Run global initializers if any defglobals exist
+        if let Some((init_id, _, _)) = self.user_fns.get("__weir_init_globals") {
+            let init_ptr = self.module.get_finalized_function(*init_id);
+            unsafe {
+                let init_fn: fn() = std::mem::transmute(init_ptr);
+                init_fn();
+            }
+        }
+
         let (func_id, _, _) = self
             .user_fns
             .get("main")
@@ -1382,6 +1541,23 @@ fn find_captures(
                     walk_expr(e, ast_module, param_names, local_names, enclosing_vars, captured, seen);
                 }
             }
+            ExprKind::For { var, init, condition, body, .. } => {
+                walk_expr(*init, ast_module, param_names, local_names, enclosing_vars, captured, seen);
+                let mut inner_locals = local_names.clone();
+                inner_locals.insert(var.clone());
+                walk_expr(*condition, ast_module, param_names, &inner_locals, enclosing_vars, captured, seen);
+                for &e in body {
+                    walk_expr(e, ast_module, param_names, &inner_locals, enclosing_vars, captured, seen);
+                }
+            }
+            ExprKind::ForEach { var, iter, body, .. } => {
+                walk_expr(*iter, ast_module, param_names, local_names, enclosing_vars, captured, seen);
+                let mut inner_locals = local_names.clone();
+                inner_locals.insert(var.clone());
+                for &e in body {
+                    walk_expr(e, ast_module, param_names, &inner_locals, enclosing_vars, captured, seen);
+                }
+            }
             _ => {}
         }
     }
@@ -1413,6 +1589,8 @@ struct FnCompileCtx<'a, 'b, M: Module> {
     constructor_tags: &'a HashMap<SmolStr, ConstructorInfo>,
     /// Struct type names (from Compiler)
     struct_names: &'a HashSet<SmolStr>,
+    /// Defglobal data storage (from Compiler)
+    globals: &'a HashMap<SmolStr, (DataId, Ty)>,
     /// Lambdas collected during expression compilation, compiled after the enclosing function.
     pending_lambdas: Vec<LambdaInfo>,
     /// Counter for generating unique lambda names (shared with Compiler).
@@ -1631,6 +1809,15 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                         // Nullary constructor — emit its tag as an i64 constant
                         Ok(Some(self.builder.ins().iconst(types::I64, info.tag)))
                     }
+                } else if let Some((data_id, ty)) = self.globals.get(name) {
+                    // Defglobal: load from data section
+                    let data_id = *data_id;
+                    let ty = ty.clone();
+                    let cl_ty = self.ty_cl(&ty).unwrap_or(types::I64);
+                    let gv = self.module.declare_data_in_func(data_id, self.builder.func);
+                    let addr = self.builder.ins().global_value(types::I64, gv);
+                    let val = self.builder.ins().load(cl_ty, MemFlags::trusted(), addr, 0);
+                    Ok(Some(val))
                 } else {
                     Err(CodegenError::new(format!(
                         "undefined variable '{}' in codegen",
@@ -1733,6 +1920,50 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
 
             ExprKind::SetBang { place, value } => {
                 let place_expr = &self.ast_module.exprs[*place];
+
+                // Field assignment: (set! (.field obj) value)
+                if let ExprKind::Call { func, args } = &place_expr.kind {
+                    let func_expr = &self.ast_module.exprs[*func];
+                    if let ExprKind::FieldAccess(field_name) = &func_expr.kind {
+                        let field_name = field_name.clone();
+                        let obj_ty = self.expr_ty(args[0].value);
+                        let struct_name = match &obj_ty {
+                            Ty::Con(name, _) => name.clone(),
+                            _ => {
+                                return Err(CodegenError::new(format!(
+                                    "field assignment .{} on non-struct type {}",
+                                    field_name, obj_ty
+                                )));
+                            }
+                        };
+                        let sinfo = self.type_info.struct_defs.get(&struct_name).ok_or_else(|| {
+                            CodegenError::new(format!(
+                                "field assignment .{} on unknown struct type {}",
+                                field_name, struct_name
+                            ))
+                        })?;
+                        let field_idx = sinfo.fields.iter().position(|(n, _)| n == &field_name).ok_or_else(|| {
+                            CodegenError::new(format!(
+                                "struct {} has no field '{}'",
+                                struct_name, field_name
+                            ))
+                        })?;
+
+                        let obj_ptr = self.compile_expr(args[0].value, &obj_ty)?.ok_or_else(|| {
+                            CodegenError::new("struct field assignment on void value")
+                        })?;
+                        let val_ty = self.expr_ty(*value);
+                        let val = self.compile_expr(*value, &val_ty)?.ok_or_else(|| {
+                            CodegenError::new("field assignment value is void")
+                        })?;
+                        let widened = self.widen_to_i64(val, &val_ty);
+                        let offset = (field_idx * 8) as i32;
+                        self.builder.ins().store(MemFlags::trusted(), widened, obj_ptr, offset);
+                        return Ok(None);
+                    }
+                }
+
+                // Variable assignment: (set! x value)
                 if let ExprKind::Var(name) = &place_expr.kind {
                     let name = name.clone();
                     let val_ty = self.expr_ty(*value);
@@ -1740,10 +1971,16 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                     if let Some(v) = val {
                         if let Some((var, _)) = self.vars.get(&name) {
                             let var = *var;
-                            // NOTE: This does not update the GC shadow stack slot.
-                            // See push_gc_root() doc comment for the known limitation
-                            // when set! reassigns a heap-pointer variable.
                             self.builder.def_var(var, v);
+                        } else if let Some((data_id, gty)) = self.globals.get(&name) {
+                            // Global variable mutation
+                            let data_id = *data_id;
+                            let gty = gty.clone();
+                            let widened = self.widen_to_i64(v, &val_ty);
+                            let _ = &gty; // suppress unused warning
+                            let gv = self.module.declare_data_in_func(data_id, self.builder.func);
+                            let addr = self.builder.ins().global_value(types::I64, gv);
+                            self.builder.ins().store(MemFlags::trusted(), widened, addr, 0);
                         } else {
                             return Err(CodegenError::new(format!(
                                 "set! on undefined variable '{}'",
@@ -1842,6 +2079,146 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                 // (full thread spawning requires compiling the expr as a separate function)
                 let _inner_val = self.compile_expr(*inner, &Ty::Unit)?;
                 Ok(None) // Unit
+            }
+
+            ExprKind::For { var, init, condition, body, .. } => {
+                let var = var.clone();
+                let init = *init;
+                let condition = *condition;
+                let body = body.clone();
+
+                // Compile init value
+                let init_ty = self.expr_ty(init);
+                let init_val = self.compile_expr(init, &init_ty)?.unwrap();
+                let cl_ty = self.ty_cl(&init_ty).unwrap_or(types::I64);
+
+                // Declare loop variable
+                let loop_var = self.declare_variable(cl_ty);
+                self.builder.def_var(loop_var, init_val);
+                self.vars.insert(var, (loop_var, init_ty));
+
+                // Create blocks: header (condition check), body, exit
+                let header_block = self.builder.create_block();
+                let body_block = self.builder.create_block();
+                let exit_block = self.builder.create_block();
+
+                // Jump to header
+                self.builder.ins().jump(header_block, &[]);
+
+                // Header: evaluate condition
+                self.builder.switch_to_block(header_block);
+                let cond_ty = self.expr_ty(condition);
+                let cond_val = self.compile_expr(condition, &cond_ty)?.unwrap();
+                self.builder.ins().brif(cond_val, body_block, &[], exit_block, &[]);
+
+                // Body: evaluate body expressions, increment loop var, jump to header
+                self.builder.switch_to_block(body_block);
+                for &b in &body {
+                    let bty = self.expr_ty(b);
+                    let _ = self.compile_expr(b, &bty)?;
+                }
+                let current = self.builder.use_var(loop_var);
+                let one = self.builder.ins().iconst(cl_ty, 1);
+                let incremented = self.builder.ins().iadd(current, one);
+                self.builder.def_var(loop_var, incremented);
+                self.builder.ins().jump(header_block, &[]);
+
+                // Seal blocks
+                self.builder.seal_block(header_block);
+                self.builder.seal_block(body_block);
+                self.builder.seal_block(exit_block);
+                self.builder.switch_to_block(exit_block);
+
+                Ok(None) // for returns Unit
+            }
+
+            ExprKind::ForEach { var, iter, body, .. } => {
+                let var = var.clone();
+                let iter_id = *iter;
+                let body = body.clone();
+
+                // Compile the collection
+                let iter_ty = self.expr_ty(iter_id);
+                let vec_ptr = self.compile_expr(iter_id, &iter_ty)?.unwrap();
+
+                // Get element type
+                let elem_ty = match &iter_ty {
+                    Ty::Vector(inner) => inner.as_ref().clone(),
+                    Ty::MutVec(inner) => inner.as_ref().clone(),
+                    _ => Ty::I64,
+                };
+
+                // Get vector length
+                let len = if matches!(iter_ty, Ty::MutVec(_)) {
+                    let func_id = self.runtime_fns["mutvec_len"];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    let call = self.builder.ins().call(func_ref, &[vec_ptr]);
+                    self.builder.inst_results(call)[0]
+                } else {
+                    self.builder.ins().load(types::I64, MemFlags::trusted(), vec_ptr, 0)
+                };
+
+                // Declare index variable (i64)
+                let idx_var = self.declare_variable(types::I64);
+                let zero = self.builder.ins().iconst(types::I64, 0);
+                self.builder.def_var(idx_var, zero);
+
+                // Declare element variable
+                let elem_cl_ty = self.ty_cl(&elem_ty).unwrap_or(types::I64);
+                let elem_var = self.declare_variable(elem_cl_ty);
+                let elem_zero = self.builder.ins().iconst(elem_cl_ty, 0);
+                self.builder.def_var(elem_var, elem_zero);
+                self.vars.insert(var, (elem_var, elem_ty.clone()));
+
+                // Create blocks
+                let header_block = self.builder.create_block();
+                let body_block = self.builder.create_block();
+                let exit_block = self.builder.create_block();
+
+                self.builder.ins().jump(header_block, &[]);
+
+                // Header: check index < length
+                self.builder.switch_to_block(header_block);
+                let idx = self.builder.use_var(idx_var);
+                let cmp = self.builder.ins().icmp(IntCC::SignedLessThan, idx, len);
+                self.builder.ins().brif(cmp, body_block, &[], exit_block, &[]);
+
+                // Body: load element, set var, compile body, increment index
+                self.builder.switch_to_block(body_block);
+                let idx = self.builder.use_var(idx_var);
+                let elem_val = if matches!(iter_ty, Ty::MutVec(_)) {
+                    let func_id = self.runtime_fns["mutvec_get"];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    let call = self.builder.ins().call(func_ref, &[vec_ptr, idx]);
+                    self.builder.inst_results(call)[0]
+                } else {
+                    // Vector: ptr + (1 + idx) * 8
+                    let one = self.builder.ins().iconst(types::I64, 1);
+                    let offset_slots = self.builder.ins().iadd(idx, one);
+                    let eight = self.builder.ins().iconst(types::I64, 8);
+                    let byte_offset = self.builder.ins().imul(offset_slots, eight);
+                    let addr = self.builder.ins().iadd(vec_ptr, byte_offset);
+                    self.builder.ins().load(types::I64, MemFlags::trusted(), addr, 0)
+                };
+                let narrowed = self.narrow_from_i64(elem_val, &elem_ty);
+                self.builder.def_var(elem_var, narrowed);
+                for &b in &body {
+                    let bty = self.expr_ty(b);
+                    let _ = self.compile_expr(b, &bty)?;
+                }
+                let idx = self.builder.use_var(idx_var);
+                let one = self.builder.ins().iconst(types::I64, 1);
+                let next_idx = self.builder.ins().iadd(idx, one);
+                self.builder.def_var(idx_var, next_idx);
+                self.builder.ins().jump(header_block, &[]);
+
+                // Seal blocks
+                self.builder.seal_block(header_block);
+                self.builder.seal_block(body_block);
+                self.builder.seal_block(exit_block);
+                self.builder.switch_to_block(exit_block);
+
+                Ok(None) // for-each returns Unit
             }
 
             ExprKind::Lambda {
@@ -2182,12 +2559,43 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                         let len = self.builder.ins().load(types::I64, MemFlags::trusted(), vec_ptr, 0);
                         return Ok(Some(len));
                     }
+                    if matches!(arg_ty, Ty::MutVec(_)) {
+                        let vec_ptr = self.compile_expr(args[0].value, &arg_ty)?.unwrap();
+                        let func_id = self.runtime_fns["mutvec_len"];
+                        let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                        let call = self.builder.ins().call(func_ref, &[vec_ptr]);
+                        return Ok(Some(self.builder.inst_results(call)[0]));
+                    }
+                    if matches!(arg_ty, Ty::MutMap(_, _)) {
+                        let map_ptr = self.compile_expr(args[0].value, &arg_ty)?.unwrap();
+                        let func_id = self.runtime_fns["mutmap_len"];
+                        let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                        let call = self.builder.ins().call(func_ref, &[map_ptr]);
+                        return Ok(Some(self.builder.inst_results(call)[0]));
+                    }
                 }
                 "nth" => {
                     if args.len() != 2 {
                         return Err(CodegenError::new("nth expects exactly 2 arguments"));
                     }
                     let vec_ty = self.expr_ty(args[0].value);
+                    if let Ty::MutVec(elem_ty) = &vec_ty {
+                        let elem_ty = elem_ty.as_ref().clone();
+                        let vec_ptr = self.compile_expr(args[0].value, &vec_ty)?.unwrap();
+                        let idx_ty = self.expr_ty(args[1].value);
+                        let idx = self.compile_expr(args[1].value, &idx_ty)?.unwrap();
+                        let idx_i64 = match &idx_ty {
+                            Ty::I8 | Ty::I16 | Ty::I32 => self.builder.ins().sextend(types::I64, idx),
+                            Ty::U8 | Ty::U16 | Ty::U32 => self.builder.ins().uextend(types::I64, idx),
+                            _ => idx,
+                        };
+                        let func_id = self.runtime_fns["mutvec_get"];
+                        let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                        let call = self.builder.ins().call(func_ref, &[vec_ptr, idx_i64]);
+                        let raw = self.builder.inst_results(call)[0];
+                        let val = self.narrow_from_i64(raw, &elem_ty);
+                        return Ok(Some(val));
+                    }
                     if let Ty::Vector(elem_ty) = &vec_ty {
                         let elem_ty = elem_ty.as_ref().clone();
                         let vec_ptr = self.compile_expr(args[0].value, &vec_ty)?.unwrap();
@@ -2670,6 +3078,216 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                     let func_id = self.runtime_fns["write_file"];
                     let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
                     self.builder.ins().call(func_ref, &[path, contents]);
+                    return Ok(None);
+                }
+
+                // ── Type-name-as-cast ──
+                "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "f32" | "f64" => {
+                    let arg_ty = self.expr_ty(args[0].value);
+                    let val = self.compile_expr(args[0].value, &arg_ty)?.unwrap();
+                    // Reuse the same conversion logic as to-f64/to-i64/etc.
+                    let result = match name.as_str() {
+                        "f64" => match &arg_ty {
+                            Ty::F64 => val,
+                            Ty::F32 => self.builder.ins().fpromote(types::F64, val),
+                            Ty::I64 => self.builder.ins().fcvt_from_sint(types::F64, val),
+                            Ty::I32 | Ty::I16 | Ty::I8 => {
+                                let ext = self.builder.ins().sextend(types::I64, val);
+                                self.builder.ins().fcvt_from_sint(types::F64, ext)
+                            }
+                            Ty::U64 => self.builder.ins().fcvt_from_uint(types::F64, val),
+                            Ty::U32 | Ty::U16 | Ty::U8 => {
+                                let ext = self.builder.ins().uextend(types::I64, val);
+                                self.builder.ins().fcvt_from_uint(types::F64, ext)
+                            }
+                            _ => self.builder.ins().fcvt_from_sint(types::F64, val),
+                        },
+                        "f32" => match &arg_ty {
+                            Ty::F32 => val,
+                            Ty::F64 => self.builder.ins().fdemote(types::F32, val),
+                            Ty::I64 | Ty::I32 | Ty::I16 | Ty::I8 => {
+                                let ext = if matches!(&arg_ty, Ty::I64) { val } else { self.builder.ins().sextend(types::I64, val) };
+                                let f64_val = self.builder.ins().fcvt_from_sint(types::F64, ext);
+                                self.builder.ins().fdemote(types::F32, f64_val)
+                            }
+                            Ty::U64 | Ty::U32 | Ty::U16 | Ty::U8 => {
+                                let ext = if matches!(&arg_ty, Ty::U64) { val } else { self.builder.ins().uextend(types::I64, val) };
+                                let f64_val = self.builder.ins().fcvt_from_uint(types::F64, ext);
+                                self.builder.ins().fdemote(types::F32, f64_val)
+                            }
+                            _ => val,
+                        },
+                        "i64" => match &arg_ty {
+                            Ty::I64 => val,
+                            Ty::I32 | Ty::I16 | Ty::I8 => self.builder.ins().sextend(types::I64, val),
+                            Ty::U64 => val,
+                            Ty::U32 | Ty::U16 | Ty::U8 => self.builder.ins().uextend(types::I64, val),
+                            Ty::F64 => self.builder.ins().fcvt_to_sint_sat(types::I64, val),
+                            Ty::F32 => {
+                                let p = self.builder.ins().fpromote(types::F64, val);
+                                self.builder.ins().fcvt_to_sint_sat(types::I64, p)
+                            }
+                            _ => val,
+                        },
+                        "i32" => match &arg_ty {
+                            Ty::I32 => val,
+                            Ty::I64 => self.builder.ins().ireduce(types::I32, val),
+                            Ty::I16 | Ty::I8 => self.builder.ins().sextend(types::I32, val),
+                            Ty::U32 => val,
+                            Ty::U64 => self.builder.ins().ireduce(types::I32, val),
+                            Ty::U16 | Ty::U8 => self.builder.ins().uextend(types::I32, val),
+                            Ty::F64 => self.builder.ins().fcvt_to_sint_sat(types::I32, val),
+                            Ty::F32 => {
+                                let p = self.builder.ins().fpromote(types::F64, val);
+                                self.builder.ins().fcvt_to_sint_sat(types::I32, p)
+                            }
+                            _ => val,
+                        },
+                        "i16" => match &arg_ty {
+                            Ty::I16 => val,
+                            Ty::I64 | Ty::I32 => self.builder.ins().ireduce(types::I16, val),
+                            Ty::I8 => self.builder.ins().sextend(types::I16, val),
+                            Ty::U16 => val,
+                            Ty::U64 | Ty::U32 => self.builder.ins().ireduce(types::I16, val),
+                            Ty::U8 => self.builder.ins().uextend(types::I16, val),
+                            Ty::F64 => {
+                                let i = self.builder.ins().fcvt_to_sint_sat(types::I32, val);
+                                self.builder.ins().ireduce(types::I16, i)
+                            }
+                            _ => val,
+                        },
+                        "i8" => match &arg_ty {
+                            Ty::I8 => val,
+                            Ty::I64 | Ty::I32 | Ty::I16 => self.builder.ins().ireduce(types::I8, val),
+                            Ty::U8 => val,
+                            Ty::U64 | Ty::U32 | Ty::U16 => self.builder.ins().ireduce(types::I8, val),
+                            Ty::F64 => {
+                                let i = self.builder.ins().fcvt_to_sint_sat(types::I32, val);
+                                self.builder.ins().ireduce(types::I8, i)
+                            }
+                            _ => val,
+                        },
+                        "u64" => match &arg_ty {
+                            Ty::U64 | Ty::I64 => val,
+                            Ty::U32 | Ty::U16 | Ty::U8 => self.builder.ins().uextend(types::I64, val),
+                            Ty::I32 | Ty::I16 | Ty::I8 => self.builder.ins().sextend(types::I64, val),
+                            Ty::F64 => self.builder.ins().fcvt_to_uint_sat(types::I64, val),
+                            _ => val,
+                        },
+                        "u32" => match &arg_ty {
+                            Ty::U32 | Ty::I32 => val,
+                            Ty::U64 | Ty::I64 => self.builder.ins().ireduce(types::I32, val),
+                            Ty::U16 | Ty::U8 => self.builder.ins().uextend(types::I32, val),
+                            Ty::I16 | Ty::I8 => self.builder.ins().sextend(types::I32, val),
+                            Ty::F64 => self.builder.ins().fcvt_to_uint_sat(types::I32, val),
+                            _ => val,
+                        },
+                        "u16" => match &arg_ty {
+                            Ty::U16 | Ty::I16 => val,
+                            Ty::U64 | Ty::U32 | Ty::I64 | Ty::I32 => self.builder.ins().ireduce(types::I16, val),
+                            Ty::U8 => self.builder.ins().uextend(types::I16, val),
+                            Ty::I8 => self.builder.ins().sextend(types::I16, val),
+                            _ => val,
+                        },
+                        "u8" => match &arg_ty {
+                            Ty::U8 | Ty::I8 => val,
+                            _ => self.builder.ins().ireduce(types::I8, val),
+                        },
+                        _ => unreachable!(),
+                    };
+                    return Ok(Some(result));
+                }
+
+                // ── MutVec builtins ──
+                "mut-vec" => {
+                    let func_id = self.runtime_fns["mutvec_create"];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    let call = self.builder.ins().call(func_ref, &[]);
+                    return Ok(Some(self.builder.inst_results(call)[0]));
+                }
+                "push!" => {
+                    let vec_ty = self.expr_ty(args[0].value);
+                    let vec_ptr = self.compile_expr(args[0].value, &vec_ty)?.unwrap();
+                    let val_ty = self.expr_ty(args[1].value);
+                    let val = self.compile_expr(args[1].value, &val_ty)?.unwrap();
+                    let widened = self.widen_to_i64(val, &val_ty);
+                    let func_id = self.runtime_fns["mutvec_push"];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    let call = self.builder.ins().call(func_ref, &[vec_ptr, widened]);
+                    let new_ptr = self.builder.inst_results(call)[0];
+                    // Update the variable with the possibly-new pointer
+                    let place_expr = &self.ast_module.exprs[args[0].value];
+                    if let ExprKind::Var(vname) = &place_expr.kind {
+                        if let Some((var, _)) = self.vars.get(vname) {
+                            let var = *var;
+                            self.builder.def_var(var, new_ptr);
+                        }
+                    }
+                    return Ok(None); // Unit
+                }
+                "pop!" => {
+                    let vec_ty = self.expr_ty(args[0].value);
+                    let vec_ptr = self.compile_expr(args[0].value, &vec_ty)?.unwrap();
+                    let func_id = self.runtime_fns["mutvec_pop"];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    let call = self.builder.ins().call(func_ref, &[vec_ptr]);
+                    let raw = self.builder.inst_results(call)[0];
+                    let result = self.narrow_from_i64(raw, result_ty);
+                    return Ok(Some(result));
+                }
+
+                // ── MutMap builtins ──
+                "mut-map" => {
+                    let func_id = self.runtime_fns["mutmap_create"];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    let call = self.builder.ins().call(func_ref, &[]);
+                    return Ok(Some(self.builder.inst_results(call)[0]));
+                }
+                "map-set!" => {
+                    let map_ty = self.expr_ty(args[0].value);
+                    let map_ptr = self.compile_expr(args[0].value, &map_ty)?.unwrap();
+                    let key_ty = self.expr_ty(args[1].value);
+                    let key = self.compile_expr(args[1].value, &key_ty)?.unwrap();
+                    let key_w = self.widen_to_i64(key, &key_ty);
+                    let val_ty = self.expr_ty(args[2].value);
+                    let val = self.compile_expr(args[2].value, &val_ty)?.unwrap();
+                    let val_w = self.widen_to_i64(val, &val_ty);
+                    let func_id = self.runtime_fns["mutmap_set"];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    let call = self.builder.ins().call(func_ref, &[map_ptr, key_w, val_w]);
+                    let new_ptr = self.builder.inst_results(call)[0];
+                    // Update variable
+                    let place_expr = &self.ast_module.exprs[args[0].value];
+                    if let ExprKind::Var(vname) = &place_expr.kind {
+                        if let Some((var, _)) = self.vars.get(vname) {
+                            let var = *var;
+                            self.builder.def_var(var, new_ptr);
+                        }
+                    }
+                    return Ok(None);
+                }
+                "map-get" => {
+                    let map_ty = self.expr_ty(args[0].value);
+                    let map_ptr = self.compile_expr(args[0].value, &map_ty)?.unwrap();
+                    let key_ty = self.expr_ty(args[1].value);
+                    let key = self.compile_expr(args[1].value, &key_ty)?.unwrap();
+                    let key_w = self.widen_to_i64(key, &key_ty);
+                    let func_id = self.runtime_fns["mutmap_get"];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    let call = self.builder.ins().call(func_ref, &[map_ptr, key_w]);
+                    let raw = self.builder.inst_results(call)[0];
+                    let result = self.narrow_from_i64(raw, result_ty);
+                    return Ok(Some(result));
+                }
+                "map-remove!" => {
+                    let map_ty = self.expr_ty(args[0].value);
+                    let map_ptr = self.compile_expr(args[0].value, &map_ty)?.unwrap();
+                    let key_ty = self.expr_ty(args[1].value);
+                    let key = self.compile_expr(args[1].value, &key_ty)?.unwrap();
+                    let key_w = self.widen_to_i64(key, &key_ty);
+                    let func_id = self.runtime_fns["mutmap_remove"];
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    self.builder.ins().call(func_ref, &[map_ptr, key_w]);
                     return Ok(None);
                 }
 
@@ -4662,6 +5280,16 @@ mod tests {
     }
 
     #[test]
+    fn fixture_struct_field_mutation() {
+        let compiled = run_fixture_compiled("struct-field-mutation");
+        let interpreted = run_fixture_interpreted("struct-field-mutation");
+        assert_eq!(
+            compiled, interpreted,
+            "struct-field-mutation: compiler and interpreter disagree"
+        );
+    }
+
+    #[test]
     fn fixture_macros() {
         let compiled = run_fixture_compiled("macros");
         let interpreted = run_fixture_interpreted("macros");
@@ -4791,6 +5419,21 @@ mod tests {
     #[test]
     fn fixture_aot_let_mutation() {
         fixture_oracle_all("codegen-let-mutation");
+    }
+
+    #[test]
+    fn fixture_aot_struct_field_mutation() {
+        fixture_oracle_all("struct-field-mutation");
+    }
+
+    #[test]
+    fn fixture_aot_for_loops() {
+        fixture_oracle_all("for-loops");
+    }
+
+    #[test]
+    fn fixture_aot_defglobal() {
+        fixture_oracle_all("defglobal");
     }
 
     // ── Dev mode (indirect dispatch) tests ───────────────────────
@@ -6494,5 +7137,137 @@ mod tests {
                 i
             );
         }
+    }
+
+    // ── For / ForEach oracle tests ─────────────────────────────────
+
+    #[test]
+    fn oracle_for_loop_basic() {
+        oracle_test(
+            "(defn main () : Unit
+               (for (i 0 (< i 5))
+                 (println i)))",
+        );
+    }
+
+    #[test]
+    fn oracle_for_loop_accumulate() {
+        oracle_test(
+            "(defn main () : Unit
+               (let ((mut sum 0))
+                 (for (i 0 (< i 10))
+                   (set! sum (+ sum i)))
+                 (println sum)))",
+        );
+    }
+
+    #[test]
+    fn oracle_for_each() {
+        oracle_test(
+            "(defn main () : Unit
+               (let ((xs [10 20 30]))
+                 (for-each (x xs)
+                   (println x))))",
+        );
+    }
+
+    #[test]
+    fn oracle_for_nested() {
+        oracle_test(
+            "(defn main () : Unit
+               (let ((mut total 0))
+                 (for (i 0 (< i 3))
+                   (for (j 0 (< j 4))
+                     (set! total (+ total 1))))
+                 (println total)))",
+        );
+    }
+
+    // ── Type-name-as-cast oracle tests ─────────────────────────────
+
+    #[test]
+    fn oracle_cast_i64_to_f64() {
+        oracle_test(
+            "(defn main () : Unit
+               (println (f64 42)))",
+        );
+    }
+
+    #[test]
+    fn oracle_cast_f64_to_i64() {
+        oracle_test(
+            "(defn main () : Unit
+               (println (i64 3.7)))",
+        );
+    }
+
+    #[test]
+    fn oracle_cast_i64_to_i32() {
+        oracle_test(
+            "(defn main () : Unit
+               (println (i32 100)))",
+        );
+    }
+
+    // ── Defglobal oracle tests ─────────────────────────────────────
+
+    #[test]
+    fn oracle_defglobal_immutable() {
+        oracle_test(
+            "(defglobal *x* : i64 42)
+             (defn main () : Unit
+               (println *x*))",
+        );
+    }
+
+    #[test]
+    fn oracle_defglobal_mutable() {
+        oracle_test(
+            "(defglobal mut *counter* : i64 0)
+             (defn main () : Unit
+               (set! *counter* 10)
+               (println *counter*))",
+        );
+    }
+
+    #[test]
+    fn oracle_defglobal_with_for() {
+        oracle_test(
+            "(defglobal *limit* : i64 5)
+             (defglobal mut *sum* : i64 0)
+             (defn main () : Unit
+               (for (i 0 (< i *limit*))
+                 (set! *sum* (+ *sum* i)))
+               (println *sum*))",
+        );
+    }
+
+    // ── MutVec oracle tests ────────────────────────────────────────
+
+    #[test]
+    fn oracle_mutvec_basic() {
+        oracle_test(
+            "(defn main () : Unit
+               (let ((mut v (mut-vec)))
+                 (push! v 10)
+                 (push! v 20)
+                 (push! v 30)
+                 (println (len v))
+                 (println (nth v 0))
+                 (println (nth v 2))))",
+        );
+    }
+
+    #[test]
+    fn oracle_mutvec_pop() {
+        oracle_test(
+            "(defn main () : Unit
+               (let ((mut v (mut-vec)))
+                 (push! v 1)
+                 (push! v 2)
+                 (push! v 3)
+                 (println (pop! v))
+                 (println (len v))))",
+        );
     }
 }

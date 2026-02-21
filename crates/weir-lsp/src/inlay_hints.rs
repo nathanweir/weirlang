@@ -36,6 +36,9 @@ pub fn inlay_hints(
                     collect_defn_hints(method, module, type_result, line_index, &range, &mut hints);
                 }
             }
+            Item::Defglobal(g) => {
+                collect_expr_hints(g.value, module, type_result, line_index, &range, &mut hints);
+            }
             _ => {}
         }
     }
@@ -263,6 +266,21 @@ fn collect_expr_hints(
         ExprKind::Target { branches } => {
             for (_name, expr) in branches {
                 collect_expr_hints(*expr, module, type_result, line_index, range, hints);
+            }
+        }
+
+        ExprKind::For { init, condition, body, .. } => {
+            collect_expr_hints(*init, module, type_result, line_index, range, hints);
+            collect_expr_hints(*condition, module, type_result, line_index, range, hints);
+            for &b in body {
+                collect_expr_hints(b, module, type_result, line_index, range, hints);
+            }
+        }
+
+        ExprKind::ForEach { iter, body, .. } => {
+            collect_expr_hints(*iter, module, type_result, line_index, range, hints);
+            for &b in body {
+                collect_expr_hints(b, module, type_result, line_index, range, hints);
             }
         }
 

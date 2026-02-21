@@ -102,6 +102,8 @@ pub enum Value {
         fields: Vec<(SmolStr, Value)>,
     },
     Builtin(SmolStr),
+    MutVec(Rc<RefCell<Vec<Value>>>),
+    MutMap(Rc<RefCell<Vec<(Value, Value)>>>),
     Atom(Rc<RefCell<Value>>),
     Channel(Rc<ChannelPair>),
     /// FFI function resolved via dlsym
@@ -181,6 +183,32 @@ impl fmt::Display for Value {
                 }
                 write!(f, ")")
             }
+            Value::MutVec(inner) => {
+                let elems = inner.borrow();
+                write!(f, "[mut")?;
+                for (i, e) in elems.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " ")?;
+                    } else {
+                        write!(f, " ")?;
+                    }
+                    write!(f, "{}", e)?;
+                }
+                write!(f, "]")
+            }
+            Value::MutMap(inner) => {
+                let pairs = inner.borrow();
+                write!(f, "{{mut")?;
+                for (i, (k, v)) in pairs.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " ")?;
+                    } else {
+                        write!(f, " ")?;
+                    }
+                    write!(f, "{} {}", k, v)?;
+                }
+                write!(f, "}}")
+            }
             Value::Builtin(name) => write!(f, "<builtin {}>", name),
             Value::Atom(inner) => {
                 let val = inner.borrow();
@@ -221,6 +249,8 @@ impl PartialEq for Value {
                 },
             ) => a_name == b_name && a_args == b_args,
             (Value::Vector(a), Value::Vector(b)) => a == b,
+            (Value::MutVec(a), Value::MutVec(b)) => Rc::ptr_eq(a, b),
+            (Value::MutMap(a), Value::MutMap(b)) => Rc::ptr_eq(a, b),
             (Value::Atom(a), Value::Atom(b)) => Rc::ptr_eq(a, b),
             (Value::Channel(a), Value::Channel(b)) => Rc::ptr_eq(a, b),
             (
@@ -391,6 +421,10 @@ impl<'a> Interpreter<'a> {
             "time-ms",
             // Terminal I/O
             "term-init", "term-restore", "read-key",
+            // Mutable collections
+            "mut-vec", "push!", "pop!", "mut-map", "map-set!", "map-get", "map-remove!",
+            // Type casts
+            "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64",
         ];
         for name in builtins {
             self.global_env.define(
@@ -412,6 +446,7 @@ impl<'a> Interpreter<'a> {
             Item::Instance(d) => self.process_instance(d),
             Item::Import(_) | Item::Declare(_) => Ok(()),
             Item::ExternC(ext) => self.process_extern_c(ext),
+            Item::Defglobal(g) => self.process_defglobal(g),
         }
     }
 
@@ -492,6 +527,12 @@ impl<'a> Interpreter<'a> {
         Ok(())
     }
 
+    fn process_defglobal(&mut self, g: &Defglobal) -> Result<(), InterpError> {
+        let val = self.eval_expr(&self.global_env.clone(), g.value)?;
+        self.global_env.define(g.name.clone(), val, g.is_mut);
+        Ok(())
+    }
+
     fn process_extern_c(&mut self, ext: &ExternC) -> Result<(), InterpError> {
         for decl in &ext.declarations {
             // Resolve type annotation names for parameters and return type
@@ -563,6 +604,8 @@ impl<'a> Interpreter<'a> {
             Value::Unit => SmolStr::new("Unit"),
             Value::Vector(_) => SmolStr::new("Vector"),
             Value::Map(_) => SmolStr::new("Map"),
+            Value::MutVec(_) => SmolStr::new("MutVec"),
+            Value::MutMap(_) => SmolStr::new("MutMap"),
             Value::Constructor { type_name, .. } => type_name.clone(),
             Value::StructInstance { type_name, .. } => type_name.clone(),
             _ => SmolStr::new("<unknown>"),
@@ -794,6 +837,56 @@ impl<'a> Interpreter<'a> {
 
             ExprKind::SetBang { place, value } => {
                 let place_expr = &self.module.exprs[*place];
+
+                // Field assignment: (set! (.field obj) value)
+                if let ExprKind::Call { func, args } = &place_expr.kind {
+                    let func_expr = &self.module.exprs[*func];
+                    if let ExprKind::FieldAccess(field) = &func_expr.kind {
+                        let field = field.clone();
+                        if args.is_empty() {
+                            return Err(InterpError::with_span(
+                                "field assignment requires an object argument",
+                                span,
+                            ));
+                        }
+                        // The object must be a variable so we can write back
+                        let obj_expr = &self.module.exprs[args[0].value];
+                        if let ExprKind::Var(name) = &obj_expr.kind {
+                            let val = self.eval_expr(env, *value)?;
+                            let obj = env.lookup(name).ok_or_else(|| {
+                                InterpError::with_span(
+                                    format!("undefined variable '{}'", name),
+                                    span,
+                                )
+                            })?;
+                            if let Value::StructInstance { type_name, mut fields } = obj {
+                                let found = fields.iter_mut().find(|(n, _)| n == &field);
+                                if let Some((_, ref mut fval)) = found {
+                                    *fval = val;
+                                } else {
+                                    return Err(InterpError::with_span(
+                                        format!("struct {} has no field '{}'", type_name, field),
+                                        span,
+                                    ));
+                                }
+                                env.set(name, Value::StructInstance { type_name, fields })?;
+                                return Ok(Value::Unit);
+                            } else {
+                                return Err(InterpError::with_span(
+                                    format!("cannot set field .{} on non-struct value", field),
+                                    span,
+                                ));
+                            }
+                        } else {
+                            return Err(InterpError::with_span(
+                                "field assignment target must be a variable",
+                                span,
+                            ));
+                        }
+                    }
+                }
+
+                // Variable assignment: (set! x value)
                 if let ExprKind::Var(name) = &place_expr.kind {
                     let val = self.eval_expr(env, *value)?;
                     env.set(name, val)?;
@@ -895,6 +988,59 @@ impl<'a> Interpreter<'a> {
                     "target forms must be resolved before interpretation",
                     span,
                 ))
+            }
+
+            ExprKind::For { var, init, condition, body, .. } => {
+                let var = var.clone();
+                let init = *init;
+                let condition = *condition;
+                let body = body.clone();
+
+                let init_val = self.eval_expr(env, init)?;
+                let loop_env = env.child();
+                loop_env.define(var.clone(), init_val, true);
+                loop {
+                    let cond = self.eval_expr(&loop_env, condition)?;
+                    if !cond.is_truthy() {
+                        break;
+                    }
+                    self.eval_body(&loop_env, &body)?;
+                    // Increment loop variable by 1
+                    let current = loop_env.lookup(&var).unwrap();
+                    let next = match current {
+                        Value::Int(n) => Value::Int(n + 1),
+                        Value::Float(n) => Value::Float(n + 1.0),
+                        _ => return Err(InterpError::with_span(
+                            "for loop variable must be numeric",
+                            span,
+                        )),
+                    };
+                    loop_env.set(&var, next)?;
+                }
+                Ok(Value::Unit)
+            }
+
+            ExprKind::ForEach { var, iter, body, .. } => {
+                let var = var.clone();
+                let iter_id = *iter;
+                let body = body.clone();
+
+                let iter_val = self.eval_expr(env, iter_id)?;
+                let elems = match iter_val {
+                    Value::Vector(elems) => elems,
+                    Value::MutVec(inner) => inner.borrow().clone(),
+                    _ => return Err(InterpError::with_span(
+                        format!("for-each requires a vector, got {}", iter_val),
+                        span,
+                    )),
+                };
+                let loop_env = env.child();
+                loop_env.define(var.clone(), Value::Unit, true);
+                for elem in elems {
+                    loop_env.set(&var, elem)?;
+                    self.eval_body(&loop_env, &body)?;
+                }
+                Ok(Value::Unit)
             }
         }
     }
@@ -1627,6 +1773,8 @@ impl<'a> Interpreter<'a> {
                     Value::Vector(v) => Ok(Value::Int(v.len() as i64)),
                     Value::Map(m) => Ok(Value::Int(m.len() as i64)),
                     Value::String(s) => Ok(Value::Int(s.len() as i64)),
+                    Value::MutVec(v) => Ok(Value::Int(v.borrow().len() as i64)),
+                    Value::MutMap(m) => Ok(Value::Int(m.borrow().len() as i64)),
                     _ => Err(InterpError::with_span(
                         format!("len not supported for {}", args[0]),
                         span,
@@ -1646,6 +1794,18 @@ impl<'a> Interpreter<'a> {
                         } else {
                             Err(InterpError::with_span(
                                 format!("index {} out of bounds (len {})", i, v.len()),
+                                span,
+                            ))
+                        }
+                    }
+                    (Value::MutVec(v), Value::Int(i)) => {
+                        let vec = v.borrow();
+                        let idx = *i as usize;
+                        if idx < vec.len() {
+                            Ok(vec[idx].clone())
+                        } else {
+                            Err(InterpError::with_span(
+                                format!("index {} out of bounds (len {})", i, vec.len()),
                                 span,
                             ))
                         }
@@ -1691,6 +1851,8 @@ impl<'a> Interpreter<'a> {
                     Value::Atom(_) => "Atom",
                     Value::Channel(_) => "Channel",
                     Value::ExternFn { .. } => "ExternFn",
+                    Value::MutVec(_) => "MutVec",
+                    Value::MutMap(_) => "MutMap",
                 };
                 Ok(Value::String(type_name.to_string()))
             }
@@ -2137,6 +2299,127 @@ impl<'a> Interpreter<'a> {
                 }
                 // In interpreter mode, return -1 (no key)
                 Ok(Value::Int(-1))
+            }
+
+            // ── Mutable collections ──
+            "mut-vec" => {
+                if !args.is_empty() {
+                    return Err(InterpError::with_span("mut-vec takes no arguments", span));
+                }
+                Ok(Value::MutVec(Rc::new(RefCell::new(Vec::new()))))
+            }
+            "push!" => {
+                if args.len() != 2 {
+                    return Err(InterpError::with_span("push! requires 2 arguments", span));
+                }
+                match &args[0] {
+                    Value::MutVec(v) => {
+                        v.borrow_mut().push(args[1].clone());
+                        Ok(Value::Unit)
+                    }
+                    _ => Err(InterpError::with_span("push! expects a MutVec", span)),
+                }
+            }
+            "pop!" => {
+                if args.len() != 1 {
+                    return Err(InterpError::with_span("pop! requires 1 argument", span));
+                }
+                match &args[0] {
+                    Value::MutVec(v) => {
+                        match v.borrow_mut().pop() {
+                            Some(val) => Ok(val),
+                            None => Err(InterpError::with_span("pop! on empty MutVec", span)),
+                        }
+                    }
+                    _ => Err(InterpError::with_span("pop! expects a MutVec", span)),
+                }
+            }
+            "mut-map" => {
+                if !args.is_empty() {
+                    return Err(InterpError::with_span("mut-map takes no arguments", span));
+                }
+                Ok(Value::MutMap(Rc::new(RefCell::new(Vec::new()))))
+            }
+            "map-set!" => {
+                if args.len() != 3 {
+                    return Err(InterpError::with_span("map-set! requires 3 arguments", span));
+                }
+                match &args[0] {
+                    Value::MutMap(m) => {
+                        let mut map = m.borrow_mut();
+                        let key = args[1].clone();
+                        let val = args[2].clone();
+                        // Update existing or insert
+                        if let Some(entry) = map.iter_mut().find(|(k, _)| *k == key) {
+                            entry.1 = val;
+                        } else {
+                            map.push((key, val));
+                        }
+                        Ok(Value::Unit)
+                    }
+                    _ => Err(InterpError::with_span("map-set! expects a MutMap", span)),
+                }
+            }
+            "map-get" => {
+                if args.len() != 2 {
+                    return Err(InterpError::with_span("map-get requires 2 arguments", span));
+                }
+                match &args[0] {
+                    Value::MutMap(m) => {
+                        let map = m.borrow();
+                        let key = &args[1];
+                        match map.iter().find(|(k, _)| k == key) {
+                            Some((_, v)) => Ok(v.clone()),
+                            None => Err(InterpError::with_span(
+                                format!("key not found in MutMap: {}", key),
+                                span,
+                            )),
+                        }
+                    }
+                    _ => Err(InterpError::with_span("map-get expects a MutMap", span)),
+                }
+            }
+            "map-remove!" => {
+                if args.len() != 2 {
+                    return Err(InterpError::with_span("map-remove! requires 2 arguments", span));
+                }
+                match &args[0] {
+                    Value::MutMap(m) => {
+                        let mut map = m.borrow_mut();
+                        let key = &args[1];
+                        map.retain(|(k, _)| k != key);
+                        Ok(Value::Unit)
+                    }
+                    _ => Err(InterpError::with_span("map-remove! expects a MutMap", span)),
+                }
+            }
+
+            // ── Type-name-as-cast ──
+            "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "f32" | "f64" => {
+                if args.len() != 1 {
+                    return Err(InterpError::with_span(
+                        format!("{} requires 1 argument", name),
+                        span,
+                    ));
+                }
+                match name {
+                    "f64" | "f32" => match &args[0] {
+                        Value::Int(n) => Ok(Value::Float(*n as f64)),
+                        Value::Float(n) => Ok(Value::Float(*n)),
+                        _ => Err(InterpError::with_span(
+                            format!("{} expects a numeric argument", name),
+                            span,
+                        )),
+                    },
+                    _ => match &args[0] {
+                        Value::Int(n) => Ok(Value::Int(*n)),
+                        Value::Float(n) => Ok(Value::Int(*n as i64)),
+                        _ => Err(InterpError::with_span(
+                            format!("{} expects a numeric argument", name),
+                            span,
+                        )),
+                    },
+                }
             }
 
             _ => Err(InterpError::with_span(

@@ -40,6 +40,9 @@ pub fn extract_exports(module: &Module) -> HashSet<SmolStr> {
             Item::Declare(d) => {
                 exports.insert(d.name.clone());
             }
+            Item::Defglobal(g) => {
+                exports.insert(g.name.clone());
+            }
             Item::Instance(_) | Item::Import(_) => {}
         }
     }

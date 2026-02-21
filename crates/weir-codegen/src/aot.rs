@@ -519,7 +519,12 @@ int64_t weir_read_key(void) {
     return n <= 0 ? -1 : (int64_t)c;
 }
 
-int main(void) { weir_main(); return 0; }
+extern void __weir_init_globals(void) __attribute__((weak));
+int main(void) {
+    if (__weir_init_globals) __weir_init_globals();
+    weir_main();
+    return 0;
+}
 "#;
 
 pub fn compile_to_object(
@@ -539,9 +544,11 @@ pub fn compile_to_object(
 
     let mut compiler = Compiler::new(module, type_info, obj_module);
     compiler.declare_runtime_helpers()?;
+    compiler.declare_globals()?;
     // Export main as weir_main so C runtime can call it; others are local
     compiler.declare_user_functions_aot()?;
     compiler.compile_user_functions()?;
+    compiler.compile_global_inits()?;
 
     let product = compiler.module.finish();
     product

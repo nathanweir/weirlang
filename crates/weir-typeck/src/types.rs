@@ -36,6 +36,10 @@ pub enum Ty {
     Channel(Box<Ty>),
     /// Higher-kinded type application: F applied to args
     App(Box<Ty>, Vec<Ty>),
+    /// Mutable vector: (MutVec i32)
+    MutVec(Box<Ty>),
+    /// Mutable map: (MutMap String i32)
+    MutMap(Box<Ty>, Box<Ty>),
     /// Raw pointer (for FFI). Contents are opaque to Weir.
     Ptr,
     /// Error sentinel — prevents cascading errors
@@ -87,6 +91,8 @@ impl fmt::Display for Ty {
                 }
                 write!(f, ")")
             }
+            Ty::MutVec(elem) => write!(f, "(MutVec {})", elem),
+            Ty::MutMap(k, v) => write!(f, "(MutMap {} {})", k, v),
             Ty::Var(id) => write!(f, "?{}", id),
             Ty::Ptr => write!(f, "Ptr"),
             Ty::Error => write!(f, "<error>"),
