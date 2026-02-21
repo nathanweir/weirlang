@@ -411,18 +411,18 @@ Matches the CL version: each frame, systems and scene code push `Sprite` structs
 **Goal:** Upgrade `weir-opengl` from OpenGL 2.1 immediate mode to 3.3 core with textures, mouse input, and camera.
 
 **Work items:**
-- [ ] Download `stb_image.h` into weir-opengl directory
-- [ ] Upgrade `gl_init` to request OpenGL 3.3 core profile
-- [ ] Add internal shader compilation (vertex + fragment, 3 render modes)
-- [ ] Add VAO/VBO/EBO setup for single-quad rendering
-- [ ] Replace `glBegin`/`glEnd` in `gl_draw_rect` and `gl_draw_text` with shader-based draws
-- [ ] Add `gl_load_texture` (stb_image), `gl_bind_texture`, `gl_delete_texture`
-- [ ] Add `gl_draw_sprite`, `gl_draw_sprite_uv`, `gl_draw_sprite_tinted`
-- [ ] Add `gl_draw_rect_alpha`
-- [ ] Add GLFW mouse callbacks, `gl_mouse_x/y`, `gl_mouse_button`, `gl_mouse_button_pressed`, `gl_mouse_scroll_y`
-- [ ] Add `gl_set_camera`, `gl_reset_camera`, `gl_set_viewport`, `gl_reset_viewport`
-- [ ] Update `lib.weir` with all new extern declarations
-- [ ] Verify Tetris demo still works (backwards compatibility)
+- [x] Download `stb_image.h` into weir-opengl directory
+- [x] Upgrade `gl_init` to request OpenGL 3.3 core profile
+- [x] Add internal shader compilation (vertex + fragment, 3 render modes)
+- [x] Add VAO/VBO/EBO setup for single-quad rendering
+- [x] Replace `glBegin`/`glEnd` in `gl_draw_rect` and `gl_draw_text` with shader-based draws
+- [x] Add `gl_load_texture` (stb_image), `gl_bind_texture`, `gl_delete_texture`
+- [x] Add `gl_draw_sprite`, `gl_draw_sprite_uv`, `gl_draw_sprite_tinted`
+- [x] Add `gl_draw_rect_alpha`
+- [x] Add GLFW mouse callbacks, `gl_mouse_x/y`, `gl_mouse_button`, `gl_mouse_button_pressed`, `gl_mouse_scroll_y`
+- [x] Add `gl_set_camera`, `gl_reset_camera`, `gl_set_viewport`, `gl_reset_viewport`
+- [x] Update `lib.weir` with all new extern declarations
+- [x] Verify Tetris demo still works (backwards compatibility)
 - [ ] Write a minimal texture test (load PNG, draw sprite, screenshot, compare)
 
 **Verification:** Tetris demo runs unchanged. New test loads a texture and draws it at known position; screenshot matches expected output.
@@ -432,14 +432,14 @@ Matches the CL version: each frame, systems and scene code push `Sprite` structs
 **Goal:** Window opens, game loop runs, scene switching works, empty scenes render colored backgrounds.
 
 **Work items:**
-- [ ] Create `advguild/weir.pkg` with weir-opengl dependency
-- [ ] `src/globals.weir` — scene state, viewport constants (2048x1536), game clock
-- [ ] `src/types.weir` — Scene ADT, all game enums
-- [ ] `src/input.weir` — keyboard/mouse wrappers around weir-opengl functions
-- [ ] `src/main.weir` — 3-phase game loop skeleton, `init-game-world`, scene dispatch
-- [ ] Scene switch mechanism: `defglobal mut *scene-switch-requested*`
-- [ ] Stub scene modules: `city.weir`, `dungeon.weir`, `combat.weir`, `world-map.weir` (each renders a solid color)
-- [ ] Key binding: 1/2/3/4 to switch scenes, ESC to quit
+- [x] Create `advguild/weir.pkg` with weir-opengl dependency
+- [x] `src/globals.weir` — scene state, viewport constants (2048x1536), game clock
+- [x] `src/types.weir` — Scene ADT, all game enums
+- [x] `src/input.weir` — keyboard/mouse wrappers around weir-opengl functions
+- [x] `src/main.weir` — 3-phase game loop skeleton, `init-game-world`, scene dispatch
+- [x] Scene switch mechanism: `defglobal mut *scene-switch-pending*`
+- [x] Stub scene modules: `city.weir`, `dungeon.weir`, `combat.weir`, `world-map.weir` (each renders a solid color)
+- [x] Key binding: 1/2/3/4 to switch scenes, ESC to quit
 
 **Verification:** Window opens at 2048x1536. Pressing 1-4 switches between differently colored screens. ESC exits cleanly. 60fps confirmed via `gl_time_ms` delta logging.
 
