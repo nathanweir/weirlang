@@ -33,11 +33,12 @@ impl WasmCompiler<'_> {
                     let compiled_wt = self.compile_expr(binding.value, func);
                     // Use the actual compiled type if the type checker type maps to None
                     let wt = self.wasm_ty(&val_ty).or(compiled_wt);
-                    if let Some(local_idx) = self.locals.get(&binding.name).copied() {
+                    let local_idx = if let Some(local_idx) = self.locals.get(&binding.name).copied() {
                         match wt {
                             Some(_) => func.instruction(&Instruction::LocalSet(local_idx)),
                             None => func.instruction(&Instruction::Drop),
                         };
+                        local_idx
                     } else {
                         // Allocate a new local
                         let local_wt = wt.unwrap_or(ValType::I64);
@@ -47,6 +48,14 @@ impl WasmCompiler<'_> {
                         self.locals.insert(binding.name.clone(), idx);
                         if wt.is_some() {
                             func.instruction(&Instruction::LocalSet(idx));
+                        }
+                        idx
+                    };
+                    // Push pointer-typed let-bindings onto shadow stack for GC
+                    if crate::types::is_gc_traceable(&val_ty, Some(&self.struct_names)) {
+                        func.instruction(&Instruction::LocalGet(local_idx));
+                        if let Some(&push_idx) = self.runtime_fn_indices.get("weir_shadow_push") {
+                            func.instruction(&Instruction::Call(push_idx));
                         }
                     }
                 }
@@ -299,11 +308,40 @@ impl WasmCompiler<'_> {
             }
 
             ExprKind::SetBang { place, value } => {
+                let place_expr = &self.ast_module.exprs[*place];
+
+                // Field assignment: (set! (.field obj) value)
+                if let ExprKind::Call { func: callee, args } = &place_expr.kind {
+                    let callee_expr = &self.ast_module.exprs[*callee];
+                    if let ExprKind::FieldAccess(field) = &callee_expr.kind {
+                        let obj_ty = self.expr_ty(args[0].value);
+                        if let Some(offset) = self.get_field_offset(&obj_ty, field) {
+                            // Compile struct pointer
+                            self.compile_expr(args[0].value, func);
+                            // Compile value
+                            let val_ty = self.expr_ty(*value);
+                            self.compile_expr(*value, func);
+                            // Emit store matching the field type
+                            let field_wt = self.wasm_ty(&val_ty).unwrap_or(ValType::I32);
+                            match field_wt {
+                                ValType::I64 => func.instruction(&Instruction::I64Store(memarg(offset as u64))),
+                                ValType::F64 => func.instruction(&Instruction::F64Store(memarg(offset as u64))),
+                                ValType::F32 => func.instruction(&Instruction::F32Store(memarg(offset as u64))),
+                                _ => func.instruction(&Instruction::I32Store(memarg(offset as u64))),
+                            };
+                        }
+                        return None;
+                    }
+                }
+
+                // Variable assignment: (set! x value)
                 let val_ty = self.expr_ty(*value);
                 self.compile_expr(*value, func);
                 if let ExprKind::Var(name) = &self.ast_module.exprs[*place].kind {
                     if let Some(&local_idx) = self.locals.get(name) {
                         func.instruction(&Instruction::LocalSet(local_idx));
+                    } else if let Some(&(global_idx, _)) = self.user_globals.get(name) {
+                        func.instruction(&Instruction::GlobalSet(global_idx));
                     }
                 }
                 let _ = val_ty;
@@ -317,10 +355,19 @@ impl WasmCompiler<'_> {
                     Ty::I64
                 };
 
-                // Call vec_alloc(len)
+                // Call vec_alloc(len, shape)
                 let len = elems.len() as i64;
                 func.instruction(&Instruction::I64Const(len));
-                func.instruction(&Instruction::I64Const(0)); // shape
+                // shape_id: 0 for scalar elements, 1 for pointer elements
+                let vec_shape: i64 = if crate::types::is_gc_traceable(
+                    &elem_ty,
+                    Some(&self.struct_names),
+                ) {
+                    1
+                } else {
+                    0
+                };
+                func.instruction(&Instruction::I64Const(vec_shape));
                 if let Some(&idx) = self.runtime_fn_indices.get("weir_gc_vec_alloc") {
                     func.instruction(&Instruction::Call(idx));
                 }
@@ -385,6 +432,162 @@ impl WasmCompiler<'_> {
             ExprKind::Target { .. } => {
                 // Should have been resolved during expansion
                 None
+            }
+
+            ExprKind::For { var, init, condition, body, .. } => {
+                // Compile init expression and store in a local
+                let init_ty = self.expr_ty(*init);
+                let init_wt = self.compile_expr(*init, func);
+                let var_wt = init_wt.unwrap_or(ValType::I64);
+
+                let var_local = self.next_local;
+                self.next_local += 1;
+                self.local_types.push(var_wt);
+                self.locals.insert(var.clone(), var_local);
+                func.instruction(&Instruction::LocalSet(var_local));
+
+                // block $exit { loop $header {
+                //   condition; i32.eqz; br_if $exit;
+                //   body; var = var + 1; br $header;
+                // } }
+                func.instruction(&Instruction::Block(BlockType::Empty));
+                func.instruction(&Instruction::Loop(BlockType::Empty));
+                self.tco_block_depth += 2;
+
+                // Compile condition
+                self.compile_expr(*condition, func);
+                let cond_ty = self.expr_ty(*condition);
+                if self.wasm_ty(&cond_ty) == Some(ValType::I64) {
+                    func.instruction(&Instruction::I32WrapI64);
+                }
+                func.instruction(&Instruction::I32Eqz);
+                func.instruction(&Instruction::BrIf(1)); // br_if $exit
+
+                // Compile body, drop results
+                for (i, &e) in body.iter().enumerate() {
+                    let result = self.compile_expr(e, func);
+                    if i < body.len() - 1 && result.is_some() {
+                        func.instruction(&Instruction::Drop);
+                    } else if i == body.len() - 1 && result.is_some() {
+                        func.instruction(&Instruction::Drop);
+                    }
+                }
+
+                // Increment var by 1
+                func.instruction(&Instruction::LocalGet(var_local));
+                match var_wt {
+                    ValType::I64 => {
+                        func.instruction(&Instruction::I64Const(1));
+                        func.instruction(&Instruction::I64Add);
+                    }
+                    ValType::I32 => {
+                        func.instruction(&Instruction::I32Const(1));
+                        func.instruction(&Instruction::I32Add);
+                    }
+                    _ => {
+                        func.instruction(&Instruction::I64Const(1));
+                        func.instruction(&Instruction::I64Add);
+                    }
+                }
+                func.instruction(&Instruction::LocalSet(var_local));
+
+                func.instruction(&Instruction::Br(0)); // br $header
+                self.tco_block_depth -= 2;
+                func.instruction(&Instruction::End); // end loop
+                func.instruction(&Instruction::End); // end block
+
+                let _ = init_ty;
+                None // Unit
+            }
+
+            ExprKind::ForEach { var, iter, body, .. } => {
+                // Compile iter expression (must be Vector or MutVec)
+                let iter_ty = self.expr_ty(*iter);
+                self.compile_expr(*iter, func);
+
+                // Store vector pointer in a local
+                let vec_local = self.next_local;
+                self.next_local += 1;
+                self.local_types.push(ValType::I32);
+                func.instruction(&Instruction::LocalSet(vec_local));
+
+                // Index local (i64)
+                let idx_local = self.next_local;
+                self.next_local += 1;
+                self.local_types.push(ValType::I64);
+                func.instruction(&Instruction::I64Const(0));
+                func.instruction(&Instruction::LocalSet(idx_local));
+
+                // Get element type for narrowing
+                let elem_ty = match &iter_ty {
+                    Ty::Vector(et) => et.as_ref().clone(),
+                    Ty::MutVec(et) => et.as_ref().clone(),
+                    _ => Ty::I64,
+                };
+                let elem_wt = self.wasm_ty(&elem_ty).unwrap_or(ValType::I64);
+
+                // Var local for the element
+                let var_local = self.next_local;
+                self.next_local += 1;
+                self.local_types.push(elem_wt);
+                self.locals.insert(var.clone(), var_local);
+
+                // block $exit { loop $header {
+                //   idx >= vec_len → br_if $exit;
+                //   var = vec[idx]; body; idx++; br $header;
+                // } }
+                func.instruction(&Instruction::Block(BlockType::Empty));
+                func.instruction(&Instruction::Loop(BlockType::Empty));
+                self.tco_block_depth += 2;
+
+                // Load vec length
+                func.instruction(&Instruction::LocalGet(vec_local));
+                if let Some(&idx) = self.runtime_fn_indices.get("weir_vec_len") {
+                    func.instruction(&Instruction::Call(idx));
+                }
+                // Compare: idx >= length (I64LeS produces i32 directly)
+                func.instruction(&Instruction::LocalGet(idx_local));
+                func.instruction(&Instruction::I64LeS); // length <= idx → i32
+                func.instruction(&Instruction::BrIf(1)); // br_if $exit
+
+                // Load element: vec_get(vec, idx)
+                func.instruction(&Instruction::LocalGet(vec_local));
+                func.instruction(&Instruction::LocalGet(idx_local));
+                if let Some(&idx) = self.runtime_fn_indices.get("weir_vec_get") {
+                    func.instruction(&Instruction::Call(idx));
+                }
+                // Narrow from i64 if needed
+                match elem_wt {
+                    ValType::I32 => { func.instruction(&Instruction::I32WrapI64); }
+                    ValType::F64 => { func.instruction(&Instruction::F64ReinterpretI64); }
+                    ValType::F32 => {
+                        func.instruction(&Instruction::I32WrapI64);
+                        func.instruction(&Instruction::F32ReinterpretI32);
+                    }
+                    _ => { /* i64, no conversion */ }
+                }
+                func.instruction(&Instruction::LocalSet(var_local));
+
+                // Compile body, drop results
+                for &e in body {
+                    let result = self.compile_expr(e, func);
+                    if result.is_some() {
+                        func.instruction(&Instruction::Drop);
+                    }
+                }
+
+                // Increment index
+                func.instruction(&Instruction::LocalGet(idx_local));
+                func.instruction(&Instruction::I64Const(1));
+                func.instruction(&Instruction::I64Add);
+                func.instruction(&Instruction::LocalSet(idx_local));
+
+                func.instruction(&Instruction::Br(0)); // br $header
+                self.tco_block_depth -= 2;
+                func.instruction(&Instruction::End); // end loop
+                func.instruction(&Instruction::End); // end block
+
+                None // Unit
             }
         }
     }
@@ -455,6 +658,12 @@ impl WasmCompiler<'_> {
         // Check locals
         if let Some(&idx) = self.locals.get(name) {
             func.instruction(&Instruction::LocalGet(idx));
+            return self.wasm_ty(ty);
+        }
+
+        // Check user globals (defglobal)
+        if let Some(&(global_idx, ref _gty)) = self.user_globals.get(name) {
+            func.instruction(&Instruction::GlobalGet(global_idx));
             return self.wasm_ty(ty);
         }
 
@@ -539,21 +748,32 @@ impl WasmCompiler<'_> {
                 // Save compiled args into temp locals (they're on the stack from above)
                 let mut field_locals = Vec::new();
                 for (i, (_fname, fty)) in sinfo.fields.iter().enumerate().rev() {
-                    // Args are on stack in forward order, so we pop in reverse
                     let _ = i;
                     let fwt = self.wasm_ty(fty).unwrap_or(ValType::I64);
                     let local_idx = self.next_local;
                     self.next_local += 1;
                     self.local_types.push(fwt);
-                    field_locals.push((local_idx, fwt));
+                    field_locals.push((local_idx, fwt, fty.clone()));
                     func.instruction(&Instruction::LocalSet(local_idx));
                 }
                 field_locals.reverse();
 
+                // Push pointer-typed field temps onto shadow stack before alloc
+                for (local_idx, _fwt, ref fty) in &field_locals {
+                    if crate::types::is_gc_traceable(fty, Some(&self.struct_names)) {
+                        func.instruction(&Instruction::LocalGet(*local_idx));
+                        if let Some(&push_idx) = self.runtime_fn_indices.get("weir_shadow_push") {
+                            func.instruction(&Instruction::Call(push_idx));
+                        }
+                    }
+                }
+
                 // Allocate: weir_gc_alloc(size, shape)
                 let alloc_size = (num_fields * 8) as i32;
                 func.instruction(&Instruction::I32Const(alloc_size));
-                func.instruction(&Instruction::I64Const(0)); // shape descriptor
+                // Pass shape_id in low 16 bits of shape parameter
+                let shape_id = self.shape_ids.get(name).copied().unwrap_or(0) as i64;
+                func.instruction(&Instruction::I64Const(shape_id));
                 if let Some(&alloc_idx) = self.runtime_fn_indices.get("weir_gc_alloc") {
                     func.instruction(&Instruction::Call(alloc_idx));
                 }
@@ -565,10 +785,10 @@ impl WasmCompiler<'_> {
                 func.instruction(&Instruction::LocalSet(ptr_local));
 
                 // Store each field at its offset
-                for (i, (local_idx, fwt)) in field_locals.iter().enumerate() {
+                for (i, &(local_idx, fwt, ref _fty)) in field_locals.iter().enumerate() {
                     let offset = (i * 8) as u64;
                     func.instruction(&Instruction::LocalGet(ptr_local));
-                    func.instruction(&Instruction::LocalGet(*local_idx));
+                    func.instruction(&Instruction::LocalGet(local_idx));
                     // Widen to i64 for storage if the field is i32/f32
                     match fwt {
                         ValType::I32 => {
@@ -1105,6 +1325,138 @@ impl WasmCompiler<'_> {
                 Some(Some(ValType::I64))
             }
 
+            // Type-name-as-cast: (f64 x), (i32 x), etc.
+            "i8" | "i16" | "i32" | "u8" | "u16" | "u32" | "i64" | "u64" | "f32" | "f64" => {
+                if args.len() != 1 { return None; }
+                let arg_ty = self.expr_ty(args[0].value);
+                let arg_wt = self.compile_expr(args[0].value, func);
+                self.compile_type_cast(name, &arg_ty, arg_wt, func)
+            }
+
+            // Explicit conversion builtins (same logic as type-name-as-cast)
+            "to-f64" => {
+                if args.len() != 1 { return None; }
+                let arg_ty = self.expr_ty(args[0].value);
+                let arg_wt = self.compile_expr(args[0].value, func);
+                self.compile_type_cast("f64", &arg_ty, arg_wt, func)
+            }
+            "to-f32" => {
+                if args.len() != 1 { return None; }
+                let arg_ty = self.expr_ty(args[0].value);
+                let arg_wt = self.compile_expr(args[0].value, func);
+                self.compile_type_cast("f32", &arg_ty, arg_wt, func)
+            }
+            "to-i64" => {
+                if args.len() != 1 { return None; }
+                let arg_ty = self.expr_ty(args[0].value);
+                let arg_wt = self.compile_expr(args[0].value, func);
+                self.compile_type_cast("i64", &arg_ty, arg_wt, func)
+            }
+            "to-i32" => {
+                if args.len() != 1 { return None; }
+                let arg_ty = self.expr_ty(args[0].value);
+                let arg_wt = self.compile_expr(args[0].value, func);
+                self.compile_type_cast("i32", &arg_ty, arg_wt, func)
+            }
+
+            "len" => {
+                if args.len() != 1 { return None; }
+                let arg_ty = self.expr_ty(args[0].value);
+                self.compile_expr(args[0].value, func);
+                match &arg_ty {
+                    Ty::Str => {
+                        if let Some(&idx) = self.runtime_fn_indices.get("weir_string_length") {
+                            func.instruction(&Instruction::Call(idx));
+                        }
+                    }
+                    _ => {
+                        // Vector, MutVec — all use weir_vec_len
+                        if let Some(&idx) = self.runtime_fn_indices.get("weir_vec_len") {
+                            func.instruction(&Instruction::Call(idx));
+                        }
+                    }
+                }
+                Some(Some(ValType::I64))
+            }
+
+            "mut-vec" => {
+                // Create empty MutVec — for WASM, use vec_alloc with 0 elements
+                func.instruction(&Instruction::I64Const(0)); // length 0
+                func.instruction(&Instruction::I64Const(0)); // shape 0 (scalar)
+                if let Some(&idx) = self.runtime_fn_indices.get("weir_gc_vec_alloc") {
+                    func.instruction(&Instruction::Call(idx));
+                }
+                Some(Some(ValType::I32))
+            }
+
+            "push!" => {
+                // push!(vec, val) — append to mutable vector, update the binding
+                if args.len() != 2 { return None; }
+                self.compile_expr(args[0].value, func);
+                self.compile_expr(args[1].value, func);
+                // Widen val to i64 if needed
+                let val_ty = self.expr_ty(args[1].value);
+                let val_wt = self.wasm_ty(&val_ty);
+                if val_wt == Some(ValType::I32) {
+                    func.instruction(&Instruction::I64ExtendI32U);
+                }
+                if let Some(&idx) = self.runtime_fn_indices.get("weir_vec_append") {
+                    func.instruction(&Instruction::Call(idx));
+                }
+                // Store new pointer back into the variable
+                let vec_expr = &self.ast_module.exprs[args[0].value];
+                if let ExprKind::Var(vname) = &vec_expr.kind {
+                    if let Some(&local_idx) = self.locals.get(vname) {
+                        func.instruction(&Instruction::LocalSet(local_idx));
+                    } else if let Some(&(global_idx, _)) = self.user_globals.get(vname) {
+                        func.instruction(&Instruction::GlobalSet(global_idx));
+                    }
+                } else {
+                    func.instruction(&Instruction::Drop);
+                }
+                Some(None) // Unit
+            }
+
+            "pop!" => {
+                // pop!(vec) — pop last element from mutable vector
+                if args.len() != 1 { return None; }
+                self.compile_expr(args[0].value, func);
+                // Get length, subtract 1, use as index to get last element
+                // Then decrement length
+                // For now, use vec_get(vec, len-1) as a simplified version
+                // (We don't have a dedicated pop runtime fn in WASM)
+                let ptr_local = self.next_local;
+                self.next_local += 1;
+                self.local_types.push(ValType::I32);
+                func.instruction(&Instruction::LocalSet(ptr_local));
+
+                // Get length
+                func.instruction(&Instruction::LocalGet(ptr_local));
+                if let Some(&idx) = self.runtime_fn_indices.get("weir_vec_len") {
+                    func.instruction(&Instruction::Call(idx));
+                }
+                let len_local = self.next_local;
+                self.next_local += 1;
+                self.local_types.push(ValType::I64);
+                func.instruction(&Instruction::I64Const(1));
+                func.instruction(&Instruction::I64Sub);
+                func.instruction(&Instruction::LocalSet(len_local));
+
+                // Get element at len-1
+                func.instruction(&Instruction::LocalGet(ptr_local));
+                func.instruction(&Instruction::LocalGet(len_local));
+                if let Some(&idx) = self.runtime_fn_indices.get("weir_vec_get") {
+                    func.instruction(&Instruction::Call(idx));
+                }
+
+                // Narrow result if needed
+                let result_wt = self.wasm_ty(result_ty).unwrap_or(ValType::I64);
+                if result_wt == ValType::I32 {
+                    func.instruction(&Instruction::I32WrapI64);
+                }
+                Some(Some(result_wt))
+            }
+
             _ => None, // Not a builtin
         }
     }
@@ -1156,5 +1508,68 @@ impl WasmCompiler<'_> {
 
         // Tail calls don't produce a result (the br is unconditional)
         None
+    }
+
+    /// Emit instructions to initialize all defglobal values (called at start of main).
+    pub(crate) fn compile_global_inits(&mut self, func: &mut Function) {
+        let defglobals: Vec<(SmolStr, weir_ast::ExprId)> = self
+            .ast_module
+            .items
+            .iter()
+            .filter_map(|(item, _)| {
+                if let weir_ast::Item::Defglobal(g) = item {
+                    Some((g.name.clone(), g.value))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for (name, value_id) in defglobals {
+            if let Some(&(global_idx, _)) = self.user_globals.get(&name) {
+                let compiled_wt = self.compile_expr(value_id, func);
+                if compiled_wt.is_some() {
+                    func.instruction(&Instruction::GlobalSet(global_idx));
+                }
+            }
+        }
+    }
+
+    /// Emit WASM type conversion instructions for type-name-as-cast.
+    fn compile_type_cast(
+        &self,
+        target: &str,
+        arg_ty: &Ty,
+        arg_wt: Option<ValType>,
+        func: &mut Function,
+    ) -> Option<Option<ValType>> {
+        let target_wt = match target {
+            "i8" | "u8" | "i16" | "u16" | "i32" | "u32" => ValType::I32,
+            "i64" | "u64" => ValType::I64,
+            "f32" => ValType::F32,
+            "f64" => ValType::F64,
+            _ => return None,
+        };
+
+        let src_wt = arg_wt.unwrap_or(ValType::I64);
+
+        match (src_wt, target_wt) {
+            (ValType::I64, ValType::I32) => { func.instruction(&Instruction::I32WrapI64); }
+            (ValType::I32, ValType::I64) => { func.instruction(&Instruction::I64ExtendI32S); }
+            (ValType::I64, ValType::F64) => { func.instruction(&Instruction::F64ConvertI64S); }
+            (ValType::I64, ValType::F32) => { func.instruction(&Instruction::F32ConvertI64S); }
+            (ValType::I32, ValType::F64) => { func.instruction(&Instruction::F64ConvertI32S); }
+            (ValType::I32, ValType::F32) => { func.instruction(&Instruction::F32ConvertI32S); }
+            (ValType::F64, ValType::I64) => { func.instruction(&Instruction::I64TruncF64S); }
+            (ValType::F64, ValType::I32) => { func.instruction(&Instruction::I32TruncF64S); }
+            (ValType::F32, ValType::I64) => { func.instruction(&Instruction::I64TruncF32S); }
+            (ValType::F32, ValType::I32) => { func.instruction(&Instruction::I32TruncF32S); }
+            (ValType::F64, ValType::F32) => { func.instruction(&Instruction::F32DemoteF64); }
+            (ValType::F32, ValType::F64) => { func.instruction(&Instruction::F64PromoteF32); }
+            _ => { /* same type, no-op */ }
+        }
+
+        let _ = arg_ty;
+        Some(Some(target_wt))
     }
 }

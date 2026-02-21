@@ -22,12 +22,12 @@ use weir_typeck::TypeCheckResult;
 use weir_ast::tco;
 
 use runtime::{
-    emit_bool_to_str, emit_f64_to_str, emit_gc_alloc, emit_gc_str_alloc, emit_gc_str_dup,
-    emit_gc_vec_alloc, emit_i64_to_str, emit_noop, emit_random_int, emit_random_seed,
-    emit_shadow_pop, emit_shadow_push, emit_str_cmp, emit_str_concat, emit_str_eq,
-    emit_string_contains, emit_string_length, emit_string_ref, emit_substring, emit_vec_append,
-    emit_vec_get, emit_vec_len, emit_vec_set, emit_vec_set_nth, GC_HEAP_START, INITIAL_PAGES,
-    JS_IMPORTS,
+    emit_bool_to_str, emit_f64_to_str, emit_gc_alloc, emit_gc_collect, emit_gc_str_alloc,
+    emit_gc_str_dup, emit_gc_vec_alloc, emit_i64_to_str, emit_noop, emit_random_int,
+    emit_random_seed, emit_shadow_pop, emit_shadow_push, emit_str_cmp, emit_str_concat,
+    emit_str_eq, emit_string_contains, emit_string_length, emit_string_ref, emit_substring,
+    emit_vec_append, emit_vec_get, emit_vec_len, emit_vec_set, emit_vec_set_nth, GC_HEAP_START,
+    INITIAL_PAGES, JS_IMPORTS,
 };
 use types::{ty_to_wasm, TaggedAdt};
 
@@ -70,14 +70,14 @@ const RUNTIME_FNS: &[RuntimeFn] = &[
         name: "weir_gc_alloc",
         params: &[ValType::I32, ValType::I64],
         results: &[ValType::I32],
-        extra_locals: &[ValType::I32],
+        extra_locals: &[ValType::I32, ValType::I32],
         emitter: emit_gc_alloc,
     },
     RuntimeFn {
         name: "weir_gc_vec_alloc",
         params: &[ValType::I64, ValType::I64],
         results: &[ValType::I32],
-        extra_locals: &[ValType::I32, ValType::I32],
+        extra_locals: &[ValType::I32, ValType::I32, ValType::I32],
         emitter: emit_gc_vec_alloc,
     },
     RuntimeFn {
@@ -91,7 +91,7 @@ const RUNTIME_FNS: &[RuntimeFn] = &[
         name: "weir_gc_str_dup",
         params: &[ValType::I32],
         results: &[ValType::I32],
-        extra_locals: &[ValType::I32, ValType::I32, ValType::I32],
+        extra_locals: &[ValType::I32, ValType::I32, ValType::I32, ValType::I32],
         emitter: emit_gc_str_dup,
     },
     RuntimeFn {
@@ -126,7 +126,7 @@ const RUNTIME_FNS: &[RuntimeFn] = &[
         name: "weir_str_concat",
         params: &[ValType::I32, ValType::I32],
         results: &[ValType::I32],
-        extra_locals: &[ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+        extra_locals: &[ValType::I32, ValType::I32, ValType::I32, ValType::I32, ValType::I32, ValType::I32],
         emitter: emit_str_concat,
     },
     RuntimeFn {
@@ -155,14 +155,14 @@ const RUNTIME_FNS: &[RuntimeFn] = &[
         name: "weir_vec_set_nth",
         params: &[ValType::I32, ValType::I64, ValType::I64],
         results: &[ValType::I32],
-        extra_locals: &[ValType::I64, ValType::I32, ValType::I64],
+        extra_locals: &[ValType::I64, ValType::I32, ValType::I64, ValType::I32, ValType::I32],
         emitter: emit_vec_set_nth,
     },
     RuntimeFn {
         name: "weir_vec_append",
         params: &[ValType::I32, ValType::I64],
         results: &[ValType::I32],
-        extra_locals: &[ValType::I64, ValType::I32, ValType::I64],
+        extra_locals: &[ValType::I64, ValType::I32, ValType::I64, ValType::I32, ValType::I32],
         emitter: emit_vec_append,
     },
     RuntimeFn {
@@ -244,6 +244,22 @@ const RUNTIME_FNS: &[RuntimeFn] = &[
         extra_locals: &[ValType::I32, ValType::I32, ValType::I32, ValType::I32, ValType::I32],
         emitter: emit_string_contains,
     },
+    RuntimeFn {
+        name: "weir_gc_collect",
+        params: &[ValType::I32], // shape_table_addr
+        results: &[],
+        extra_locals: &[
+            ValType::I32, // local 1: scan_ptr / current obj ptr
+            ValType::I32, // local 2: worklist_ptr (top of worklist)
+            ValType::I32, // local 3: header_word (low 32 bits of header)
+            ValType::I32, // local 4: data_size
+            ValType::I32, // local 5: child_ptr
+            ValType::I64, // local 6: bitmask / temp i64
+            ValType::I32, // local 7: field_idx
+            ValType::I32, // local 8: prev_ptr (for free list)
+        ],
+        emitter: emit_gc_collect,
+    },
 ];
 
 // ── WasmCompiler ─────────────────────────────────────────────────
@@ -280,6 +296,18 @@ pub struct WasmCompiler<'a> {
     string_data: Vec<u8>,
     string_offsets: HashMap<String, u32>,
     data_offset: u32,
+
+    // GC shape table: maps struct name → shape ID (index into shape table)
+    shape_ids: HashMap<SmolStr, u16>,
+    // Shape bitmasks stored in order of shape ID
+    shape_bitmasks: Vec<u64>,
+    // Address of shape table in linear memory (set after string interning)
+    shape_table_addr: u32,
+
+    // User globals (defglobal): name → (wasm global index, type)
+    user_globals: HashMap<SmolStr, (u32, Ty)>,
+    // Next available wasm global index (after built-in globals 0-4)
+    next_global_index: u32,
 }
 
 impl<'a> WasmCompiler<'a> {
@@ -316,6 +344,28 @@ impl<'a> WasmCompiler<'a> {
             }
         }
 
+        // Generate shape bitmasks for each struct type.
+        // Bit N = 1 means field N is a GC-traceable heap pointer.
+        let mut shape_ids = HashMap::new();
+        let mut shape_bitmasks = Vec::new();
+        for (item, _) in &ast_module.items {
+            if let Item::Defstruct(d) = item {
+                let shape_id = shape_bitmasks.len() as u16;
+                shape_ids.insert(d.name.clone(), shape_id);
+                let mut bitmask: u64 = 0;
+                if let Some(sinfo) = type_info.struct_defs.get(&d.name) {
+                    for (i, (_fname, fty)) in sinfo.fields.iter().enumerate() {
+                        if i < 64
+                            && types::is_gc_traceable(fty, Some(&struct_names))
+                        {
+                            bitmask |= 1u64 << i;
+                        }
+                    }
+                }
+                shape_bitmasks.push(bitmask);
+            }
+        }
+
         Self {
             ast_module,
             type_info,
@@ -336,6 +386,11 @@ impl<'a> WasmCompiler<'a> {
             string_data: Vec::new(),
             string_offsets: HashMap::new(),
             data_offset: runtime::STATIC_DATA_START,
+            shape_ids,
+            shape_bitmasks,
+            shape_table_addr: 0,
+            user_globals: HashMap::new(),
+            next_global_index: 5, // globals 0-4 are built-in
         }
     }
 
@@ -455,7 +510,7 @@ impl<'a> WasmCompiler<'a> {
         });
         exports.export("memory", ExportKind::Memory, 0);
 
-        // Globals: heap pointer, shadow stack pointer, wasm state
+        // Globals: heap pointer, shadow stack pointer, wasm state, RNG state, free list head
         globals.global(
             GlobalType {
                 val_type: ValType::I32,
@@ -480,6 +535,48 @@ impl<'a> WasmCompiler<'a> {
             },
             &wasm_encoder::ConstExpr::i32_const(0),
         );
+        // Global 3: RNG state (i64, mutable) — relocated from memory at 0x10000
+        globals.global(
+            GlobalType {
+                val_type: ValType::I64,
+                mutable: true,
+                shared: false,
+            },
+            &wasm_encoder::ConstExpr::i64_const(0),
+        );
+        // Global 4: Free list head (i32, mutable, init 0 = empty)
+        globals.global(
+            GlobalType {
+                val_type: ValType::I32,
+                mutable: true,
+                shared: false,
+            },
+            &wasm_encoder::ConstExpr::i32_const(0),
+        );
+
+        // User globals (defglobal)
+        for (item, _) in &self.ast_module.items {
+            if let Item::Defglobal(g) = item {
+                let ty = self.type_info.expr_types.get(g.value).cloned().unwrap_or(Ty::I64);
+                let wasm_vt = self.wasm_ty(&ty).unwrap_or(ValType::I64);
+                globals.global(
+                    GlobalType {
+                        val_type: wasm_vt,
+                        mutable: true,
+                        shared: false,
+                    },
+                    &match wasm_vt {
+                        ValType::I32 => wasm_encoder::ConstExpr::i32_const(0),
+                        ValType::F32 => wasm_encoder::ConstExpr::f32_const(0.0),
+                        ValType::F64 => wasm_encoder::ConstExpr::f64_const(0.0),
+                        _ => wasm_encoder::ConstExpr::i64_const(0),
+                    },
+                );
+                let idx = self.next_global_index;
+                self.next_global_index += 1;
+                self.user_globals.insert(g.name.clone(), (idx, ty));
+            }
+        }
 
         // Function table (for closures / call_indirect)
         tables.table(TableType {
@@ -659,6 +756,19 @@ impl<'a> WasmCompiler<'a> {
                 let tail_positions = tco::mark_tail_positions(&d.body, &self.ast_module.exprs);
                 let needs_tco = tco::has_self_tail_calls(&d.body, &d.name, &self.ast_module.exprs);
 
+                // Determine which params are pointer-typed (need shadow stack push)
+                let pointer_param_indices: Vec<u32> = if let Some(ft) = fn_ty {
+                    ft.param_types
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, t)| types::is_gc_traceable(t, Some(&self.struct_names)))
+                        .map(|(i, _)| i as u32)
+                        .collect()
+                } else {
+                    vec![]
+                };
+                let needs_shadow_stack = !pointer_param_indices.is_empty();
+
                 // Helper: set up parameter locals and TCO state
                 let setup = |compiler: &mut Self| {
                     compiler.reset_locals();
@@ -666,6 +776,20 @@ impl<'a> WasmCompiler<'a> {
                         compiler.locals.insert(param.name.clone(), i as u32);
                     }
                     compiler.next_local = param_count;
+                    // Reserve locals for shadow stack prologue/epilogue if needed
+                    if needs_shadow_stack {
+                        let saved_sp_idx = compiler.next_local;
+                        compiler.next_local += 1;
+                        compiler.local_types.push(ValType::I32);
+                        compiler.locals.insert(SmolStr::new("$saved_shadow_sp"), saved_sp_idx);
+                        // Reserve a local for stashing the return value during epilogue
+                        if let Some(ret_vt) = expected_result {
+                            let ret_stash_idx = compiler.next_local;
+                            compiler.next_local += 1;
+                            compiler.local_types.push(ret_vt);
+                            compiler.locals.insert(SmolStr::new("$ret_stash"), ret_stash_idx);
+                        }
+                    }
                     if needs_tco {
                         compiler.current_fn_name = Some(d.name.clone());
                         compiler.tail_positions = tail_positions.clone();
@@ -680,12 +804,24 @@ impl<'a> WasmCompiler<'a> {
                 // Pass 1: discover locals
                 setup(&mut self);
                 let mut dummy = wasm_encoder::Function::new(vec![]);
+                // Emit dummy prologue to keep local indices consistent
+                if needs_shadow_stack {
+                    let saved_sp_idx = *self.locals.get("$saved_shadow_sp").unwrap();
+                    dummy.instruction(&wasm_encoder::Instruction::GlobalGet(runtime::GLOBAL_SHADOW_SP));
+                    dummy.instruction(&wasm_encoder::Instruction::LocalSet(saved_sp_idx));
+                    for &pi in &pointer_param_indices {
+                        dummy.instruction(&wasm_encoder::Instruction::LocalGet(pi));
+                        if let Some(&idx) = self.runtime_fn_indices.get("weir_shadow_push") {
+                            dummy.instruction(&wasm_encoder::Instruction::Call(idx));
+                        }
+                    }
+                }
+                if name == "main" {
+                    self.compile_global_inits(&mut dummy);
+                }
                 self.compile_body(&body, &mut dummy);
 
                 // Capture the extra locals discovered
-                // Note: local_types does NOT include params (they're implicit),
-                // so we use all entries — each one corresponds to a local beyond
-                // the param_count offset.
                 let extra_locals: Vec<(u32, ValType)> = self.local_types
                     .iter()
                     .map(|vt| (1, *vt))
@@ -694,6 +830,37 @@ impl<'a> WasmCompiler<'a> {
                 // Pass 2: compile for real with locals declared
                 setup(&mut self);
                 let mut func = wasm_encoder::Function::new(extra_locals);
+
+                // Shadow stack prologue: save SP, push pointer params
+                let saved_sp_idx = if needs_shadow_stack {
+                    let idx = *self.locals.get("$saved_shadow_sp").unwrap();
+                    func.instruction(&wasm_encoder::Instruction::GlobalGet(runtime::GLOBAL_SHADOW_SP));
+                    func.instruction(&wasm_encoder::Instruction::LocalSet(idx));
+                    for &pi in &pointer_param_indices {
+                        func.instruction(&wasm_encoder::Instruction::LocalGet(pi));
+                        if let Some(&call_idx) = self.runtime_fn_indices.get("weir_shadow_push") {
+                            func.instruction(&wasm_encoder::Instruction::Call(call_idx));
+                        }
+                    }
+                    Some(idx)
+                } else {
+                    None
+                };
+
+                // GC trigger: call weir_gc_collect at the top of weir-frame
+                if name == "weir-frame" {
+                    if let Some(&gc_idx) = self.runtime_fn_indices.get("weir_gc_collect") {
+                        func.instruction(&wasm_encoder::Instruction::I32Const(
+                            self.shape_table_addr as i32,
+                        ));
+                        func.instruction(&wasm_encoder::Instruction::Call(gc_idx));
+                    }
+                }
+
+                // Initialize defglobal values at the start of main
+                if name == "main" {
+                    self.compile_global_inits(&mut func);
+                }
 
                 if needs_tco {
                     // Wrap body in a loop for tail-call optimization
@@ -735,6 +902,21 @@ impl<'a> WasmCompiler<'a> {
                         func.instruction(&wasm_encoder::Instruction::Drop);
                     }
                 }
+
+                // Shadow stack epilogue: restore SP
+                if let Some(sp_idx) = saved_sp_idx {
+                    if expected_result.is_some() {
+                        let ret_local = *self.locals.get("$ret_stash").unwrap();
+                        func.instruction(&wasm_encoder::Instruction::LocalSet(ret_local));
+                        func.instruction(&wasm_encoder::Instruction::LocalGet(sp_idx));
+                        func.instruction(&wasm_encoder::Instruction::GlobalSet(runtime::GLOBAL_SHADOW_SP));
+                        func.instruction(&wasm_encoder::Instruction::LocalGet(ret_local));
+                    } else {
+                        func.instruction(&wasm_encoder::Instruction::LocalGet(sp_idx));
+                        func.instruction(&wasm_encoder::Instruction::GlobalSet(runtime::GLOBAL_SHADOW_SP));
+                    }
+                }
+
                 func.instruction(&wasm_encoder::Instruction::End); // end function
 
                 // Clear TCO state
@@ -750,7 +932,13 @@ impl<'a> WasmCompiler<'a> {
             }
         }
 
-        // ── Pass 6: Data section (string literals) ───────────────
+        // ── Pass 6: Data section (string literals + shape table) ──
+
+        // Append shape table bitmasks after interned strings
+        self.shape_table_addr = runtime::STATIC_DATA_START + self.string_data.len() as u32;
+        for &bitmask in &self.shape_bitmasks {
+            self.string_data.extend_from_slice(&bitmask.to_le_bytes());
+        }
 
         if !self.string_data.is_empty() {
             data.active(
@@ -1260,5 +1448,87 @@ mod tests {
         // Basic sanity checks
         assert!(wasm_bytes.len() > 5000, "WASM binary too small: {} bytes", wasm_bytes.len());
         assert_eq!(&wasm_bytes[..4], b"\x00asm", "Missing WASM magic header");
+    }
+
+    #[test]
+    fn struct_field_mutation_validates() {
+        compile_and_validate(r#"
+            (defstruct Point (x : i32) (y : i32))
+            (defn main () : Unit
+              (let ((mut p (Point :x 1 :y 2)))
+                (set! (.x p) 42)
+                (println (.x p))))
+        "#);
+    }
+
+    #[test]
+    fn gc_stress_test_validates() {
+        // A program that allocates many structs in a loop via weir-frame.
+        // The GC should trigger at each frame boundary and reclaim dead objects.
+        compile_and_validate(r#"
+            (defstruct Point (x : i64) (y : i64))
+
+            (defn make-points ((n : i64) (acc : i64)) : i64
+              (if (= n 0) acc
+                (let ((p (Point n (* n 2))))
+                  (make-points (- n 1) (+ acc (.x p))))))
+
+            (defn weir-frame () : Unit
+              (let ((total (make-points 100 0)))
+                (println (str "Total: " total))))
+
+            (defn main () : Unit
+              (weir-frame))
+        "#);
+    }
+
+    #[test]
+    fn for_loop_validates() {
+        compile_and_validate(r#"
+            (defn main () : Unit
+              (for (i 0 (< i 10))
+                (println i)))
+        "#);
+    }
+
+    #[test]
+    fn for_each_validates() {
+        compile_and_validate(r#"
+            (defn main () : Unit
+              (let ((xs [1 2 3]))
+                (for-each (x xs)
+                  (println x))))
+        "#);
+    }
+
+    #[test]
+    fn defglobal_validates() {
+        compile_and_validate(r#"
+            (defglobal *limit* : i64 10)
+            (defglobal mut *count* : i64 0)
+            (defn main () : Unit
+              (set! *count* *limit*)
+              (println *count*))
+        "#);
+    }
+
+    #[test]
+    fn type_cast_validates() {
+        compile_and_validate(r#"
+            (defn main () : Unit
+              (println (f64 42))
+              (println (i64 3.14)))
+        "#);
+    }
+
+    #[test]
+    fn mutvec_validates() {
+        compile_and_validate(r#"
+            (defn main () : Unit
+              (let ((mut v (mut-vec)))
+                (push! v 1)
+                (push! v 2)
+                (println (len v))))
+        "#);
     }
 }

@@ -38,7 +38,7 @@ pub fn ty_to_wasm(
         Ty::Str | Ty::Ptr => Some(ValType::I32),
 
         // Heap-allocated types — pointer to linear memory
-        Ty::Vector(_) | Ty::Map(_, _) | Ty::Atom(_) | Ty::Channel(_) => Some(ValType::I32),
+        Ty::Vector(_) | Ty::Map(_, _) | Ty::MutVec(_) | Ty::MutMap(_, _) | Ty::Atom(_) | Ty::Channel(_) => Some(ValType::I32),
 
         // Function type (closure pointer)
         Ty::Fn(_, _) => Some(ValType::I32),
@@ -82,6 +82,25 @@ pub fn is_heap_pointer(ty: &Ty) -> bool {
             | Ty::Channel(_)
             | Ty::App(_, _)
     )
+}
+
+/// Check if a type is a GC-traceable heap pointer in WASM.
+///
+/// Like `is_heap_pointer` but also checks `Ty::Con(name, _)` against known
+/// struct names. Used by shape table generation and shadow stack decisions.
+pub fn is_gc_traceable(ty: &Ty, struct_names: Option<&HashSet<SmolStr>>) -> bool {
+    match ty {
+        Ty::Str | Ty::Vector(_) | Ty::Map(_, _) | Ty::Fn(_, _) | Ty::Atom(_)
+        | Ty::Channel(_) | Ty::App(_, _) => true,
+        Ty::Con(name, _) => {
+            if let Some(structs) = struct_names {
+                structs.contains(name)
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
 }
 
 /// Return the size in bytes of a WASM value type.
