@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use tower_lsp::lsp_types::Url;
 use weir_ast::Item;
@@ -32,6 +32,8 @@ pub struct WorkspaceFileInfo {
 pub struct WorkspaceIndex {
     pub root: PathBuf,
     pub files: HashMap<Url, WorkspaceFileInfo>,
+    /// Canonical paths to `weir.pkg` files we've already resolved.
+    resolved_packages: HashSet<PathBuf>,
 }
 
 impl WorkspaceIndex {
@@ -39,6 +41,7 @@ impl WorkspaceIndex {
         Self {
             root,
             files: HashMap::new(),
+            resolved_packages: HashSet::new(),
         }
     }
 
@@ -110,6 +113,67 @@ impl WorkspaceIndex {
     /// Get the LineIndex for a file, if indexed.
     pub fn line_index_for(&self, uri: &Url) -> Option<&LineIndex> {
         self.files.get(uri).map(|f| &f.line_index)
+    }
+
+    /// Find the nearest `weir.pkg` by walking up from `file_path`.
+    fn find_package_manifest(file_path: &Path) -> Option<PathBuf> {
+        let mut dir = file_path.parent()?;
+        loop {
+            let candidate = dir.join("weir.pkg");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+            dir = dir.parent()?;
+        }
+    }
+
+    /// If the file belongs to a package we haven't indexed yet,
+    /// resolve the package and index all its source files.
+    /// Returns true if new files were indexed.
+    pub fn ensure_package_indexed(&mut self, file_path: &Path) -> bool {
+        let manifest_path = match Self::find_package_manifest(file_path) {
+            Some(p) => p,
+            None => return false,
+        };
+
+        let canonical = match std::fs::canonicalize(&manifest_path) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+
+        if self.resolved_packages.contains(&canonical) {
+            return false;
+        }
+
+        self.resolved_packages.insert(canonical.clone());
+
+        let project = match weir_pkg::resolve_project(&canonical) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+
+        let mut indexed_any = false;
+        for module in &project.modules {
+            let uri = match Url::from_file_path(&module.source_path) {
+                Ok(u) => u,
+                Err(_) => continue,
+            };
+
+            // Don't overwrite files that are already open (they have fresher content)
+            if self.files.get(&uri).is_some_and(|f| f.is_open) {
+                continue;
+            }
+
+            let text = match std::fs::read_to_string(&module.source_path) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+
+            self.analyze_file(uri, &text, false);
+            indexed_any = true;
+        }
+
+        indexed_any
     }
 }
 

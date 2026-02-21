@@ -2182,6 +2182,7 @@ dependencies = [
  "weir-lexer",
  "weir-macros",
  "weir-parser",
+ "weir-pkg",
  "weir-typeck",
 ]
 

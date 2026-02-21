@@ -184,17 +184,25 @@ impl LanguageServer for WeirLspBackend {
                 )
                 .await;
 
-            for path in paths {
-                let uri = match Url::from_file_path(&path) {
+            for path in &paths {
+                let uri = match Url::from_file_path(path) {
                     Ok(u) => u,
                     Err(_) => continue,
                 };
-                let text = match std::fs::read_to_string(&path) {
+                let text = match std::fs::read_to_string(path) {
                     Ok(t) => t,
                     Err(_) => continue,
                 };
                 let mut ws = workspace.write().await;
                 ws.analyze_file(uri, &text, false);
+            }
+
+            // Resolve any packages found among the workspace files
+            {
+                let mut ws = workspace.write().await;
+                for path in &paths {
+                    ws.ensure_package_indexed(path);
+                }
             }
 
             client
@@ -212,6 +220,13 @@ impl LanguageServer for WeirLspBackend {
         let text = params.text_document.text.clone();
         let doc = Document::new(params.text_document.text, params.text_document.version);
         self.documents.lock().unwrap().insert(uri.clone(), doc);
+
+        // Index package siblings before analysis so external_names is complete
+        if let Ok(path) = uri.to_file_path() {
+            let mut ws = self.workspace.write().await;
+            ws.ensure_package_indexed(&path);
+        }
+
         self.analyze_and_publish(uri.clone()).await;
         self.update_workspace_symbols(uri, &text, true);
     }

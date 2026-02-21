@@ -80,6 +80,8 @@ Tracks what's implemented in `crates/weir-lsp/`, known limitations, and candidat
 
 ### Workspace Index (`workspace.rs`)
 - Discovers all `.weir` files recursively (skips hidden dirs, target, node_modules)
+- Package-aware: resolves `weir.pkg` manifests to index all package source files (including dependencies outside the workspace root)
+- On-demand package discovery: opening any file triggers indexing of its entire package
 - Per-file symbol index with name, kind, span, URI
 - Tracks open/closed file status
 - Per-file LineIndex for correct span-to-LSP-range mapping
