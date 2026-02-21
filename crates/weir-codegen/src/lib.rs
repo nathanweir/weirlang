@@ -3221,6 +3221,12 @@ impl<M: Module> FnCompileCtx<'_, '_, M> {
                         if let Some((var, _)) = self.vars.get(vname) {
                             let var = *var;
                             self.builder.def_var(var, new_ptr);
+                        } else if let Some((data_id, _)) = self.globals.get(vname) {
+                            // Global variable: store new pointer back
+                            let data_id = *data_id;
+                            let gv = self.module.declare_data_in_func(data_id, self.builder.func);
+                            let addr = self.builder.ins().global_value(types::I64, gv);
+                            self.builder.ins().store(MemFlags::trusted(), new_ptr, addr, 0);
                         }
                     }
                     return Ok(None); // Unit

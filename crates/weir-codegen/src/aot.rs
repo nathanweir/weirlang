@@ -519,6 +519,64 @@ int64_t weir_read_key(void) {
     return n <= 0 ? -1 : (int64_t)c;
 }
 
+/* ── MutVec (mutable vector) ── */
+/* Layout: [capacity: i64, length: i64, elem_0, elem_1, ...] */
+
+#define MUTVEC_INITIAL_CAPACITY 8
+
+int64_t weir_mutvec_create(void) {
+    int64_t cap = MUTVEC_INITIAL_CAPACITY;
+    size_t total = (size_t)(2 + cap) * 8;
+    int64_t *data = (int64_t*)calloc(1, total);
+    data[0] = cap;   /* capacity */
+    data[1] = 0;     /* length */
+    return (int64_t)(intptr_t)data;
+}
+
+int64_t weir_mutvec_push(int64_t ptr, int64_t val) {
+    int64_t *data = (int64_t*)(intptr_t)ptr;
+    int64_t cap = data[0];
+    int64_t len = data[1];
+    if (len >= cap) {
+        int64_t new_cap = cap * 2;
+        size_t old_total = (size_t)(2 + cap) * 8;
+        size_t new_total = (size_t)(2 + new_cap) * 8;
+        data = (int64_t*)realloc(data, new_total);
+        memset((char*)data + old_total, 0, new_total - old_total);
+        data[0] = new_cap;
+        data[1] = len + 1;
+        data[2 + len] = val;
+        return (int64_t)(intptr_t)data;
+    }
+    data[1] = len + 1;
+    data[2 + len] = val;
+    return ptr;
+}
+
+int64_t weir_mutvec_pop(int64_t ptr) {
+    int64_t *data = (int64_t*)(intptr_t)ptr;
+    int64_t len = data[1];
+    if (len <= 0) return 0;
+    int64_t val = data[2 + len - 1];
+    data[1] = len - 1;
+    return val;
+}
+
+int64_t weir_mutvec_get(int64_t ptr, int64_t idx) {
+    int64_t *data = (int64_t*)(intptr_t)ptr;
+    return data[2 + idx];
+}
+
+void weir_mutvec_set(int64_t ptr, int64_t idx, int64_t val) {
+    int64_t *data = (int64_t*)(intptr_t)ptr;
+    data[2 + idx] = val;
+}
+
+int64_t weir_mutvec_len(int64_t ptr) {
+    int64_t *data = (int64_t*)(intptr_t)ptr;
+    return data[1];
+}
+
 extern void __weir_init_globals(void) __attribute__((weak));
 int main(void) {
     if (__weir_init_globals) __weir_init_globals();
